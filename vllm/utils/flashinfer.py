@@ -160,7 +160,7 @@ def supports_trtllm_attention() -> tuple[bool, Optional[str]]:
     env_value = envs.VLLM_USE_TRTLLM_ATTENTION
 
     # Requires SM100 and NVIDIA artifactory to be accessible to download cubins
-    if not (current_platform.is_device_capability(100)
+    if not (current_platform.has_device_capability(100)
             and has_nvidia_artifactory()):
         return False, env_value
 

@@ -31,7 +31,7 @@ def kernel_warmup(worker: "Worker"):
         deep_gemm_warmup(model, max_tokens)
 
     # FlashInfer autotune for Blackwell (SM 10.0) GPUs
-    if has_flashinfer() and current_platform.is_device_capability(100):
+    if has_flashinfer() and current_platform.has_device_capability(100):
         flashinfer_autotune(worker.model_runner)
 
 

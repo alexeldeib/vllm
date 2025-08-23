@@ -37,7 +37,7 @@ def _swizzle_mxfp4(quant_tensor, scale, num_warps):
             layout.make_default_matmul_mxfp4_w_scale_layout(
                 mx_axis=1, num_warps=num_warps))
     if current_platform.is_cuda() and \
-        current_platform.is_device_capability(100):
+        current_platform.has_device_capability(100):
         constraints = {
             "is_persistent": True,
             "epilogue_subtile": 1,

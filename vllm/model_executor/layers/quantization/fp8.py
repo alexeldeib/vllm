@@ -529,7 +529,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             logger.debug_once("Model is not block quantized. Not using "
                               "CutlassBlockScaledGroupedGemm kernels")
         elif (current_platform.is_cuda()
-              and current_platform.is_device_capability(100)):
+              and current_platform.has_device_capability(100)):
             logger.info_once(
                 "Using CutlassBlockScaledGroupedGemm kernels for Fp8MoEMethod."
             )

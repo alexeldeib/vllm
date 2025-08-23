@@ -149,7 +149,7 @@ class CudaPlatformBase(Platform):
 
             if envs.VLLM_ATTENTION_BACKEND is None:
                 # Default case
-                if cls.is_device_capability(100):
+                if cls.has_device_capability(100):
                     # Blackwell => Force CutlassMLA.
                     use_cutlass_mla = True
                     # TODO: This does not work, because the
@@ -224,7 +224,7 @@ class CudaPlatformBase(Platform):
             # TODO(lucas): refactor to be more concise
             #  we should probably consider factoring out V1 here
             if selected_backend == _Backend.CUTLASS_MLA or (
-                    cls.is_device_capability(100) and selected_backend is None
+                    cls.has_device_capability(100) and selected_backend is None
                     and block_size == 128):
                 if use_v1:
                     logger.info_once("Using Cutlass MLA backend on V1 engine.")
@@ -298,7 +298,7 @@ class CudaPlatformBase(Platform):
 
             # Default backends for V1 engine
             # Prefer FlashInfer for Blackwell GPUs if installed
-            if cls.is_device_capability(100):
+            if cls.has_device_capability(100):
                 if is_default_backend_supported := is_attn_backend_supported(
                         FLASHINFER_V1, head_size, dtype):
                     from vllm.v1.attention.backends.utils import (
@@ -491,7 +491,7 @@ class CudaPlatformBase(Platform):
             # Default to CutlassMLA for blackwell,
             # FlashMLA otherwise
             if attention_backend is None:
-                if cls.is_device_capability(100):
+                if cls.has_device_capability(100):
                     attention_backend = "CUTLASS_MLA"
                 else:
                     attention_backend = "FLASHMLA"
@@ -507,7 +507,7 @@ class CudaPlatformBase(Platform):
                 attention_backend = "FLASH_ATTN_VLLM_V1"
 
             # All Blackwell backends support fp8
-            if cls.is_device_capability(100):
+            if cls.has_device_capability(100):
                 supported = True
             elif attention_backend == "FLASH_ATTN_VLLM_V1":
                 if fp8_attention:

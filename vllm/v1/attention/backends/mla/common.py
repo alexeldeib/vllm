@@ -380,12 +380,12 @@ def use_flashinfer_prefill() -> bool:
     # For blackwell default to flashinfer prefill if its available since
     # it is faster than FA2.
     return (flashinfer_available and not envs.VLLM_USE_CUDNN_PREFILL
-            and current_platform.is_device_capability(100))
+            and current_platform.has_device_capability(100))
 
 
 def use_cudnn_prefill() -> bool:
     return (flashinfer_available and envs.VLLM_USE_CUDNN_PREFILL
-            and current_platform.is_device_capability(100)
+            and current_platform.has_device_capability(100)
             and has_nvidia_artifactory())
 
 
