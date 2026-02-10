@@ -13,6 +13,7 @@ from vllm.model_executor.model_loader.bitsandbytes_loader import BitsAndBytesMod
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 from vllm.model_executor.model_loader.dummy_loader import DummyModelLoader
 from vllm.model_executor.model_loader.gguf_loader import GGUFModelLoader
+from vllm.model_executor.model_loader.nccl_loader import NCCLWeightLoader
 from vllm.model_executor.model_loader.runai_streamer_loader import (
     RunaiModelStreamerLoader,
 )
@@ -36,6 +37,7 @@ LoadFormats = Literal[
     "fastsafetensors",
     "gguf",
     "mistral",
+    "nccl",
     "npcache",
     "pt",
     "runai_streamer",
@@ -149,6 +151,7 @@ __all__ = [
     "GGUFModelLoader",
     "DefaultModelLoader",
     "DummyModelLoader",
+    "NCCLWeightLoader",
     "RunaiModelStreamerLoader",
     "ShardedStateLoader",
     "TensorizerLoader",
