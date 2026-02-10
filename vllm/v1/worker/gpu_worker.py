@@ -290,6 +290,28 @@ class Worker(WorkerBase):
             tag="weights"
         ) and set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model(eep_scale_up=eep_scale_up)
+        self._maybe_start_weight_server()
+
+    def _maybe_start_weight_server(self) -> None:
+        """Start weight server daemon if enabled via env var."""
+        if not envs.VLLM_WEIGHT_SERVER_ENABLED:
+            return
+
+        from vllm.distributed.weight_transfer.weight_server import WeightServer
+
+        model = self.model_runner.model
+        port = envs.VLLM_WEIGHT_SERVER_PORT
+        node_index = int(os.environ.get("LWS_WORKER_INDEX", "0"))
+
+        self._weight_server = WeightServer(
+            model=model,
+            device=self.device.index or 0,
+            tp_rank=self.local_rank,
+            port=port,
+            is_available_fn=lambda: not getattr(self, "_is_sleeping", False),
+            node_index=node_index,
+        )
+        self._weight_server.start()
 
     def update_config(self, overrides: dict[str, Any]) -> None:
         self.model_runner.update_config(overrides)
@@ -1019,6 +1041,8 @@ class Worker(WorkerBase):
 
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
+        if weight_server := getattr(self, "_weight_server", None):
+            weight_server.stop()
 
 
 def init_worker_distributed_environment(

@@ -231,6 +231,8 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
+    VLLM_WEIGHT_SERVER_ENABLED: bool = False
+    VLLM_WEIGHT_SERVER_PORT: int = 29520
 
 
 def get_default_cache_root():
@@ -1537,6 +1539,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Disable PDL for LoRA, as enabling PDL with LoRA on SM100 causes
     # Triton compilation to fail.
     "VLLM_LORA_DISABLE_PDL": lambda: bool(int(os.getenv("VLLM_LORA_DISABLE_PDL", "0"))),
+    # Enable weight server daemon in each TP worker.
+    # After load_model(), each worker spawns a thread that serves its
+    # model parameters to new vLLM instances via NCCL P2P.
+    "VLLM_WEIGHT_SERVER_ENABLED": lambda: bool(
+        int(os.getenv("VLLM_WEIGHT_SERVER_ENABLED", "0"))
+    ),
+    # Base port for weight server control channels.
+    # Control ports: base + tp_rank, NCCL ports: base + 100 + tp_rank.
+    "VLLM_WEIGHT_SERVER_PORT": lambda: int(
+        os.getenv("VLLM_WEIGHT_SERVER_PORT", "29520")
+    ),
 }
 
 
@@ -1661,6 +1674,8 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ASSETS_CACHE_MODEL_CLEAN",
         "VLLM_WORKER_MULTIPROC_METHOD",
         "VLLM_ENABLE_V1_MULTIPROCESSING",
+        "VLLM_WEIGHT_SERVER_ENABLED",
+        "VLLM_WEIGHT_SERVER_PORT",
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
         "VLLM_CPU_KVCACHE_SPACE",
         "VLLM_CPU_OMP_THREADS_BIND",
