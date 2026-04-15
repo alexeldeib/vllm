@@ -79,6 +79,12 @@ class RequestFuncInput:
     request_id: str | None = None
 
 
+def _get_cached_tokens(usage: dict) -> int:
+    """Extract cached token count from usage.prompt_tokens_details."""
+    details = usage.get("prompt_tokens_details") or {}
+    return details.get("cached_tokens", 0) or 0
+
+
 @dataclass
 class RequestFuncOutput:
     """The output of the request function including metrics."""
@@ -91,6 +97,7 @@ class RequestFuncOutput:
     itl: list[float] = field(default_factory=list)  # list of inter-token latencies
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
+    cached_tokens: int = 0  # from usage.prompt_tokens_details.cached_tokens
     error: str = ""
     start_time: float = 0.0
     input_audio_duration: float = 0.0  # in seconds
@@ -239,6 +246,7 @@ async def async_request_openai_completions(
                                 output.output_tokens = usage.get("completion_tokens")
                                 if (pt := usage.get("prompt_tokens")) is not None:
                                     output.prompt_len = pt
+                                output.cached_tokens = _get_cached_tokens(usage)
                 if first_chunk_received:
                     output.success = True
                 else:
@@ -362,6 +370,7 @@ async def async_request_openai_chat_completions(
                                 output.output_tokens = usage.get("completion_tokens")
                                 if (pt := usage.get("prompt_tokens")) is not None:
                                     output.prompt_len = pt
+                                output.cached_tokens = _get_cached_tokens(usage)
 
                             most_recent_timestamp = timestamp
 
@@ -474,6 +483,7 @@ async def async_request_openai_audio(
                                     output.output_tokens = usage.get(
                                         "completion_tokens"
                                     )
+                                    output.cached_tokens = _get_cached_tokens(usage)
 
                                 most_recent_timestamp = timestamp
 
@@ -518,6 +528,7 @@ async def _run_pooling_request(
                 output.success = True
                 output.generated_text = ""
                 output.prompt_len = usage.get("prompt_tokens", 0)
+                output.cached_tokens = _get_cached_tokens(usage)
             else:
                 output.success = False
                 output.error = response.reason or ""

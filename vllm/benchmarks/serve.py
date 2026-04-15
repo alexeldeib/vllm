@@ -173,6 +173,7 @@ class BenchmarkMetrics:
     failed: int
     total_input: int
     total_output: int
+    total_cached: int
     request_throughput: float
     request_goodput: float
     output_throughput: float
@@ -412,6 +413,7 @@ def calculate_metrics(
     """
     actual_output_lens: list[int] = []
     total_input = 0
+    total_cached = 0
     completed = 0
     good_completed = 0
     itls: list[float] = []
@@ -440,6 +442,7 @@ def calculate_metrics(
                     )
             actual_output_lens.append(output_len)
             total_input += outputs[i].prompt_len
+            total_cached += outputs[i].cached_tokens
             tpot = 0
             if output_len > 1:
                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
@@ -564,6 +567,7 @@ def calculate_metrics(
         failed=len(failed_outputs),
         total_input=total_input,
         total_output=sum(actual_output_lens),
+        total_cached=total_cached,
         request_throughput=completed / dur_s,
         request_goodput=good_completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
@@ -935,6 +939,8 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("Request rate configured (RPS):", request_rate))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+    if isinstance(metrics, BenchmarkMetrics):
+        print("{:<40} {:<10}".format("Total cached tokens:", metrics.total_cached))
     if isinstance(metrics, BenchmarkMetrics) and tokenizer:
         print("{:<40} {:<10}".format("Total generated tokens:", metrics.total_output))
     print(
@@ -986,6 +992,7 @@ async def benchmark(
             "failed": metrics.failed,
             "total_input_tokens": metrics.total_input,
             "total_output_tokens": metrics.total_output,
+            "total_cached_tokens": metrics.total_cached,
             "request_throughput": metrics.request_throughput,
             "request_goodput": metrics.request_goodput if goodput_config_dict else None,
             "output_throughput": metrics.output_throughput,
