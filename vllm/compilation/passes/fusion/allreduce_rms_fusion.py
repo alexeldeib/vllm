@@ -12,6 +12,7 @@ from torch._higher_order_ops.auto_functionalize import auto_functionalized
 from torch._inductor.pattern_matcher import PatternMatcherPass
 
 import vllm.ir.ops
+from vllm import envs
 from vllm.compilation.passes.fusion.rms_quant_fusion import (
     _rms_input_weight_dtype_match,
 )
@@ -242,7 +243,7 @@ class FlashInferFusedAllReduceParams:
         max_token_num: int = 1024,
     ) -> None:
         self.world_size = world_size
-        self.launch_with_pdl = True
+        self.launch_with_pdl = envs.VLLM_FLASHINFER_ALLREDUCE_PDL
         self.fp32_acc = True
         self.max_token_num = max_token_num
 

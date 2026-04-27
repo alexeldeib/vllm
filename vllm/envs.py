@@ -181,6 +181,7 @@ if TYPE_CHECKING:
         "latency"
     )
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
+    VLLM_FLASHINFER_ALLREDUCE_PDL: bool = True
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_MSGPACK_ZERO_COPY_THRESHOLD: int = 256
@@ -1381,6 +1382,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_FLASHINFER_ALLREDUCE_BACKEND",
         "auto",
         ["auto", "trtllm", "mnnvl"],
+    ),
+    # Whether FlashInfer TRTLLM fused allreduce should use programmatic
+    # dependent launch.
+    "VLLM_FLASHINFER_ALLREDUCE_PDL": lambda: bool(
+        int(os.getenv("VLLM_FLASHINFER_ALLREDUCE_PDL", "1"))
     ),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(

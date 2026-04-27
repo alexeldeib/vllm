@@ -9,7 +9,10 @@ import vllm.envs as envs
 from tests.compile.backend import TestBackend
 from tests.utils import TestFP8Layer, has_module_attribute, multi_gpu_test
 from vllm._custom_ops import cutlass_scaled_fp4_mm, scaled_fp4_quant
-from vllm.compilation.passes.fusion.allreduce_rms_fusion import AllReduceFusionPass
+from vllm.compilation.passes.fusion.allreduce_rms_fusion import (
+    AllReduceFusionPass,
+    FlashInferFusedAllReduceParams,
+)
 from vllm.compilation.passes.utility.fix_functionalization import (
     FixFunctionalizationPass,
 )
@@ -38,6 +41,30 @@ from vllm.utils.system_utils import update_environment_variables
 from vllm.utils.torch_utils import set_random_seed
 
 DEVICE_TYPE = current_platform.device_type
+
+
+def _clear_envs_cache() -> None:
+    if hasattr(envs.__getattr__, "cache_clear"):
+        envs.__getattr__.cache_clear()
+
+
+@pytest.fixture
+def clear_envs_cache(monkeypatch):
+    _clear_envs_cache()
+    yield
+    _clear_envs_cache()
+
+
+def test_flashinfer_fused_allreduce_pdl_env_knob(monkeypatch, clear_envs_cache):
+    params = FlashInferFusedAllReduceParams(world_size=4, max_token_num=8192)
+    assert params.launch_with_pdl
+
+    monkeypatch.setenv("VLLM_FLASHINFER_ALLREDUCE_PDL", "0")
+    _clear_envs_cache()
+
+    params = FlashInferFusedAllReduceParams(world_size=4, max_token_num=8192)
+    assert not params.launch_with_pdl
+    assert params.get_trtllm_fused_allreduce_kwargs()["launch_with_pdl"] is False
 
 
 class TestAllReduceRMSNormModel(torch.nn.Module):
