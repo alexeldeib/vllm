@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import json
+import os
 import threading
 import time
 from collections import defaultdict
@@ -813,6 +815,14 @@ class GPUModelRunner(
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self._ddtree_attn_bias: torch.Tensor | None = None
+        self._spec_decode_debug_metrics = (
+            os.environ.get("SPEC_DECODE_DEBUG_METRICS") == "1"
+        )
+        self._spec_decode_debug_metrics_file = os.environ.get(
+            "SPEC_DECODE_DEBUG_METRICS_FILE"
+        )
+        self._spec_decode_debug_context: dict[str, Any] | None = None
+        self._spec_decode_debug_step = 0
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
         self._num_valid_draft_tokens: torch.Tensor | None = None
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
@@ -1887,9 +1897,10 @@ class GPUModelRunner(
                 for i, depth in enumerate(tree_metadata.node_depths, start=1):
                     positions_np[req_start + i] = base_pos + depth
 
-            self._ddtree_attn_bias = make_batched_ddtree_attention_bias(
-                ddtree_metadata_by_req, device=self.device
-            )
+            with self._spec_debug_timer("ddtree_attention_bias"):
+                self._ddtree_attn_bias = make_batched_ddtree_attention_bias(
+                    ddtree_metadata_by_req, device=self.device
+                )
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -3836,6 +3847,55 @@ class GPUModelRunner(
 
         return accepted_counts
 
+    def _spec_debug_enabled(self) -> bool:
+        if not self._spec_decode_debug_metrics:
+            return False
+        spec_config = self.speculative_config
+        if spec_config is None:
+            return False
+        return spec_config.use_dflash() or spec_config.use_ddtree()
+
+    def _spec_debug_sync(self) -> None:
+        if self._spec_debug_enabled() and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    @contextmanager
+    def _spec_debug_timer(self, name: str):
+        if (
+            not self._spec_debug_enabled()
+            or self._spec_decode_debug_context is None
+        ):
+            yield
+            return
+
+        self._spec_debug_sync()
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._spec_debug_sync()
+            elapsed_ms = (time.perf_counter() - start) * 1000
+            context = self._spec_decode_debug_context
+            if context is not None:
+                timers = context.setdefault("timers_ms", {})
+                timers[name] = timers.get(name, 0.0) + elapsed_ms
+
+    def _spec_debug_record(self, **values: Any) -> None:
+        context = self._spec_decode_debug_context
+        if context is not None:
+            context.update(values)
+
+    def _spec_debug_emit(self, event: dict[str, Any]) -> None:
+        event["event"] = "spec_decode_debug_metrics"
+        event["pid"] = os.getpid()
+        line = json.dumps(event, sort_keys=True)
+        if self._spec_decode_debug_metrics_file:
+            with open(self._spec_decode_debug_metrics_file, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.write("\n")
+        else:
+            logger.info("SPEC_DECODE_DEBUG_METRICS %s", line)
+
     @contextmanager
     def synchronize_input_prep(self):
         if self.prepare_inputs_event is None:
@@ -4226,10 +4286,48 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
-                scheduler_output,
-                num_scheduled_tokens_np,
+            debug_spec_active = (
+                self._spec_debug_enabled()
+                and bool(scheduler_output.scheduled_spec_decode_tokens)
             )
+            if debug_spec_active:
+                spec_config = self.speculative_config
+                assert spec_config is not None
+                self._spec_decode_debug_context = {
+                    "step": self._spec_decode_debug_step,
+                    "method": spec_config.method,
+                    "num_reqs": num_reqs,
+                    "req_ids": list(req_ids),
+                    "scheduled_tokens": [int(x) for x in num_scheduled_tokens_np],
+                    "total_scheduled_tokens": int(num_tokens_unpadded),
+                    "timers_ms": {},
+                }
+            else:
+                self._spec_decode_debug_context = None
+
+            with self._spec_debug_timer("prepare_inputs"):
+                logits_indices, spec_decode_metadata = self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                )
+            if (
+                self._spec_decode_debug_context is not None
+                and spec_decode_metadata is not None
+            ):
+                self._spec_debug_record(
+                    draft_tokens=list(map(int, spec_decode_metadata.num_draft_tokens))
+                )
+                if spec_decode_metadata.ddtree_metadata is not None:
+                    self._spec_debug_record(
+                        tree_nodes=[
+                            len(m.node_depths) if m is not None else 0
+                            for m in spec_decode_metadata.ddtree_metadata
+                        ],
+                        tree_max_depths=[
+                            m.max_depth if m is not None else 0
+                            for m in spec_decode_metadata.ddtree_metadata
+                        ],
+                    )
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
@@ -4385,33 +4483,37 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+        with self._spec_debug_timer("target_forward"):
+            with (
+                set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    cudagraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    ubatch_slices=ubatch_slices_padded,
+                    slot_mapping=slot_mappings,
+                    skip_compiled=has_encoder_input,
+                ),
+                record_function_or_nullcontext("gpu_model_runner: forward"),
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    defer_finalize=defer_kv_connector_finalize,
+                ) as kv_connector_output,
+            ):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+        with (
+            record_function_or_nullcontext("gpu_model_runner: postprocess"),
+            self._spec_debug_timer("postprocess_logits"),
+        ):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -4535,7 +4637,10 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
+        with (
+            record_function_or_nullcontext("gpu_model_runner: sample"),
+            self._spec_debug_timer("sample"),
+        ):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(
@@ -4559,19 +4664,25 @@ class GPUModelRunner(
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
-                    sampled_token_ids,
-                    self.input_batch.sampling_metadata,
-                    hidden_states,
-                    sample_hidden_states,
-                    aux_hidden_states,
-                    spec_decode_metadata,
-                    spec_decode_common_attn_metadata,
-                    slot_mappings,
-                    sampler_output.ddtree_accepted_node_indices,
-                )
-                self._copy_draft_token_ids_to_cpu(scheduler_output)
+                with self._spec_debug_timer("draft_total"):
+                    self._draft_token_ids = self.propose_draft_token_ids(
+                        scheduler_output,
+                        sampled_token_ids,
+                        self.input_batch.sampling_metadata,
+                        hidden_states,
+                        sample_hidden_states,
+                        aux_hidden_states,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                        slot_mappings,
+                        sampler_output.ddtree_accepted_node_indices,
+                    )
+                if isinstance(self.drafter, DDTreeProposer):
+                    self._spec_debug_record(
+                        ddtree_propose=self.drafter.take_last_ddtree_debug_metrics()
+                    )
+                with self._spec_debug_timer("draft_copy_to_cpu"):
+                    self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
@@ -4652,7 +4763,10 @@ class GPUModelRunner(
                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
-        with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+        with (
+            record_function_or_nullcontext("gpu_model_runner: bookkeep"),
+            self._spec_debug_timer("bookkeep"),
+        ):
             (
                 num_nans_in_logits,
                 logprobs_lists,
@@ -4669,11 +4783,12 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
-        ddtree_num_accepted_tokens = self._compact_ddtree_accepted_kv_cache(
-            scheduler_output,
-            spec_decode_metadata,
-            sampler_output,
-        )
+        with self._spec_debug_timer("ddtree_kv_compact"):
+            ddtree_num_accepted_tokens = self._compact_ddtree_accepted_kv_cache(
+                scheduler_output,
+                spec_decode_metadata,
+                sampler_output,
+            )
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -4715,6 +4830,20 @@ class GPUModelRunner(
                 cudagraph_stats=cudagraph_stats,
                 ddtree_num_accepted_tokens=ddtree_num_accepted_tokens,
             )
+
+        if self._spec_decode_debug_context is not None:
+            generated_lengths = [len(tokens) for tokens in valid_sampled_token_ids]
+            accepted_lengths = [max(0, length - 1) for length in generated_lengths]
+            self._spec_debug_record(
+                async_scheduling=bool(self.use_async_scheduling),
+                generated_lengths=generated_lengths,
+                accepted_lengths=accepted_lengths,
+                accepted_node_indices=sampler_output.ddtree_accepted_node_indices,
+                ddtree_compacted_tokens=ddtree_num_accepted_tokens,
+            )
+            self._spec_debug_emit(self._spec_decode_debug_context)
+            self._spec_decode_debug_step += 1
+            self._spec_decode_debug_context = None
 
         if not self.use_async_scheduling:
             return output
@@ -5023,12 +5152,13 @@ class GPUModelRunner(
                     "sampled_token_ids should be a python list when"
                     "padded-batch is disabled or DDTree is active."
                 )
-                next_token_ids = self.drafter.prepare_next_token_ids_cpu(
-                    sampled_token_ids,
-                    self.requests,
-                    self.input_batch,
-                    scheduler_output.num_scheduled_tokens,
-                )
+                with self._spec_debug_timer("drafter_prepare_sampled_tokens"):
+                    next_token_ids = self.drafter.prepare_next_token_ids_cpu(
+                        sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        scheduler_output.num_scheduled_tokens,
+                    )
             else:
                 # When using padded-batch, the sampled_token_ids should be
                 # the gpu tensor of sampled tokens for each request, of shape
@@ -5038,14 +5168,15 @@ class GPUModelRunner(
                     "sampled_token_ids should be a torch.Tensor when"
                     "padded-batch is enabled."
                 )
-                next_token_ids, valid_sampled_tokens_count = (
-                    self.drafter.prepare_next_token_ids_padded(
-                        sampled_token_ids,
-                        self.requests,
-                        self.input_batch,
-                        self.discard_request_mask.gpu,
+                with self._spec_debug_timer("drafter_prepare_sampled_tokens"):
+                    next_token_ids, valid_sampled_tokens_count = (
+                        self.drafter.prepare_next_token_ids_padded(
+                            sampled_token_ids,
+                            self.requests,
+                            self.input_batch,
+                            self.discard_request_mask.gpu,
+                        )
                     )
-                )
                 self._copy_valid_sampled_token_count(
                     next_token_ids, valid_sampled_tokens_count
                 )
@@ -5090,23 +5221,25 @@ class GPUModelRunner(
                                 "DDTree drafter input preparation requires "
                                 f"DDTreeProposer, got {type(self.drafter).__name__}"
                             )
-                        common_attn_metadata, token_indices = (
-                            self.drafter.prepare_ddtree_inputs(
-                                common_attn_metadata,
-                                sampled_token_ids,
-                                spec_decode_metadata.num_draft_tokens,
-                                ddtree_accepted_node_indices,
-                                spec_decode_metadata.ddtree_metadata,
+                        with self._spec_debug_timer("drafter_prepare_inputs"):
+                            common_attn_metadata, token_indices = (
+                                self.drafter.prepare_ddtree_inputs(
+                                    common_attn_metadata,
+                                    sampled_token_ids,
+                                    spec_decode_metadata.num_draft_tokens,
+                                    ddtree_accepted_node_indices,
+                                    spec_decode_metadata.ddtree_metadata,
+                                )
                             )
-                        )
                     else:
-                        common_attn_metadata, token_indices = (
-                            self.drafter.prepare_inputs(
-                                common_attn_metadata,
-                                sampled_token_ids,
-                                spec_decode_metadata.num_draft_tokens,
+                        with self._spec_debug_timer("drafter_prepare_inputs"):
+                            common_attn_metadata, token_indices = (
+                                self.drafter.prepare_inputs(
+                                    common_attn_metadata,
+                                    sampled_token_ids,
+                                    spec_decode_metadata.num_draft_tokens,
+                                )
                             )
-                        )
                     target_token_ids = self.input_ids.gpu[token_indices]
                     target_positions = self._get_positions(token_indices)
                     if self.use_aux_hidden_state_outputs:
@@ -5117,15 +5250,16 @@ class GPUModelRunner(
                     else:
                         target_hidden_states = hidden_states[token_indices]
                 else:
-                    (
-                        common_attn_metadata,
-                        token_indices_to_sample,
-                        num_rejected_tokens_gpu,
-                    ) = self.drafter.prepare_inputs_padded(
-                        common_attn_metadata,
-                        spec_decode_metadata,
-                        valid_sampled_tokens_count,
-                    )
+                    with self._spec_debug_timer("drafter_prepare_inputs"):
+                        (
+                            common_attn_metadata,
+                            token_indices_to_sample,
+                            num_rejected_tokens_gpu,
+                        ) = self.drafter.prepare_inputs_padded(
+                            common_attn_metadata,
+                            spec_decode_metadata,
+                            valid_sampled_tokens_count,
+                        )
                     total_num_tokens = common_attn_metadata.num_actual_tokens
                     # When padding the batch, token_indices is just a range
                     target_token_ids = self.input_ids.gpu[:total_num_tokens]
@@ -5146,18 +5280,19 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
-            draft_token_ids = self.drafter.propose(
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                token_indices_to_sample=token_indices_to_sample,
-                sampling_metadata=sampling_metadata,
-                common_attn_metadata=common_attn_metadata,
-                mm_embed_inputs=mm_embed_inputs,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                slot_mappings=slot_mappings,
-            )
+            with self._spec_debug_timer("draft_model_propose"):
+                draft_token_ids = self.drafter.propose(
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    token_indices_to_sample=token_indices_to_sample,
+                    sampling_metadata=sampling_metadata,
+                    common_attn_metadata=common_attn_metadata,
+                    mm_embed_inputs=mm_embed_inputs,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    slot_mappings=slot_mappings,
+                )
 
         return draft_token_ids
 

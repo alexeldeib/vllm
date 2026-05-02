@@ -48,6 +48,10 @@ standard full-attention DDTree path:
   non-tree rows keep contiguous prompt hidden states for the drafter context.
 - Batched top-k/logprob transfer for tree construction, reducing one CPU sync
   per request to one CPU transfer per DDTree batch.
+- CPU-side dense tree-bias construction with one host-to-device transfer per
+  batch, avoiding the earlier many-small-GPU-write path.
+- Optional speculative-decode JSONL debug metrics and an offline no-delay
+  DFlash vs DDTree benchmark harness.
 - Triton qq-bias cleanup for the vector logical mask warning seen in the GB200
   smoke tests.
 
@@ -72,6 +76,9 @@ All current correctness checks use greedy decoding, Qwen3-8B target weights, and
 | Current clean CI image | Target-only greedy vs DDTree+DFlash greedy, same prompts, token IDs | Exact match |
 | Current clean CI image | 4-request Qwen3-8B + DFlash/DDTree generate, `TREE_ATTN`, budget 32 | Passed |
 | Current clean CI image | Same-shape warmed DFlash vs DDTree+DFlash timing smoke | Passed |
+| Current clean CI image + monkeypatch | `benchmark_ddtree_dflash.py`, C=4 budget sweep, no debug sync | Passed |
+| Current clean CI image + monkeypatch | `benchmark_ddtree_dflash.py`, C=8 and C=16 no-delay points | Passed |
+| Current clean CI image + monkeypatch | Stage-timer run with acceptance metrics for DFlash and DDTree budgets 32/64 | Passed |
 | Earlier clean CI image | 48-token target/TREE vs DFlash vs DDTree, budget 32 | Exact token ID match |
 | Earlier clean CI image | 128-token DFlash vs DDTree, budget 64 | Exact token ID match with DFlash |
 
@@ -88,41 +95,70 @@ nodes instead of recomputing them.
 
 ## Measured Performance
 
-These are smoke-test numbers, not final serving economics. The current primary
-measurement is from the clean CI image on GB200, eager mode, Qwen3-8B target,
-`z-lab/Qwen3-8B-DFlash-b16` drafter, `max_num_seqs=4`,
-`max_num_batched_tokens=4096`, four prompts per batch, and `max_tokens=64`. Both
-rows force the target verifier through `TREE_ATTN` to avoid comparing different
-target attention backends.
+The current primary measurement is from the clean CI image on GB200 with the
+latest branch source monkeypatched into the pod. The target is Qwen3-8B, the
+drafter is `z-lab/Qwen3-8B-DFlash-b16`, target attention is forced through
+`TREE_ATTN` for every mode, `enforce_eager=True`, `max_tokens=128`,
+`max_num_batched_tokens=8192`, and async scheduling is disabled for both DFlash
+and DDTree. The workload is an offline no-delay prompt replay with varied
+synthetic prompts, not the full K2.5 Rebench trace.
 
-The script warms each mode with the same batch shape before measuring three
-distinct prompt groups. This avoids the misleading first-shape overhead seen in
-single-pass smoke timings and avoids measuring a repeated identical prompt set.
+The no-debug throughput runs do not collect acceptance metrics and do not insert
+per-stage CUDA synchronizations:
 
-| Mode | Budget | Median output tokens | Median elapsed generation time | Median output tokens/s | Delta vs DFlash |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| DFlash, `TREE_ATTN` target | n/a | 256 | 1.0605s | 241.40 | n/a |
-| DDTree+DFlash, `TREE_ATTN` target | 32 | 256 | 1.0022s | 255.44 | +5.8% |
+| Concurrency | Mode | Budget | Output tokens | Output tokens/s | Speedup vs target/TREE | Delta vs DFlash |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 4 | Target only, `TREE_ATTN` | n/a | 1,024 | 158.84 | 1.00x | n/a |
+| 4 | DFlash, `TREE_ATTN` target | n/a | 1,024 | 281.14 | 1.77x | n/a |
+| 4 | DDTree+DFlash | 16 | 1,024 | 361.95 | 2.28x | +28.7% |
+| 4 | DDTree+DFlash | 32 | 1,024 | 380.84 | 2.40x | +35.5% |
+| 4 | DDTree+DFlash | 64 | 1,024 | 401.31 | 2.53x | +42.7% |
+| 4 | DDTree+DFlash | 128 | 1,024 | 377.80 | 2.38x | +34.4% |
+| 8 | Target only, `TREE_ATTN` | n/a | 2,048 | 308.04 | 1.00x | n/a |
+| 8 | DFlash, `TREE_ATTN` target | n/a | 2,048 | 525.25 | 1.71x | n/a |
+| 8 | DDTree+DFlash | 32 | 2,048 | 590.20 | 1.92x | +12.4% |
+| 8 | DDTree+DFlash | 64 | 2,048 | 489.12 | 1.59x | -6.9% |
+| 16 | Target only, `TREE_ATTN` | n/a | 4,096 | 590.57 | 1.00x | n/a |
+| 16 | DFlash, `TREE_ATTN` target | n/a | 4,096 | 1,020.30 | 1.73x | n/a |
+| 16 | DDTree+DFlash | 32 | 4,096 | 1,161.69 | 1.97x | +13.9% |
 
-This result should be interpreted as a strong integration smoke signal, not as a
-serving SLO claim. It benefits from accepted-KV compaction and a small synthetic
-prompt set, while DFlash still has async scheduling enabled and DDTree currently
-does not. The correct next performance step is a Rebench-shaped workload: full
-trace shape, no artificial request-count truncation, and a DFlash vs
-DDTree+DFlash comparison with only the speculative method and tree budget
-changed.
+This is the corrected answer to the earlier "+5.8%" result. The +5.8% number
+came from a small 64-token warmed smoke with no budget sweep and an older
+GPU-side dense-bias builder. It was a useful integration check, but not a useful
+headline for the algorithm. With the production batching path, accepted-KV
+compaction, async disabled for both modes, and the CPU-built tree-bias
+optimization, DDTree now shows +35% to +43% over DFlash at C=4 and remains
+positive at C=8/C=16 for budget 32.
 
-The measured samples were:
+The C=8 budget-64 loss is expected from DDTree's budget tradeoff: a larger tree
+raises accepted-prefix length, but verifier, drafter, tree-build, and metadata
+cost can dominate under batching. The current best budget is workload-dependent:
+budget 64 wins in this C=4 offline sweep, while budget 32 is safer at C=8 and
+C=16.
 
-| Mode | Samples |
-| --- | --- |
-| DFlash, `TREE_ATTN` target | `1.3977s/256tok/183.16tps`, `1.0562s/256tok/242.39tps`, `1.0605s/256tok/241.40tps` |
-| DDTree+DFlash, `TREE_ATTN` target | `1.0022s/256tok/255.44tps`, `0.9659s/256tok/265.05tps`, `1.0049s/256tok/254.76tps` |
+The stage-timer run below uses CUDA synchronizations, so absolute throughput is
+slightly different from no-debug throughput. It is useful for decomposition:
 
-An earlier one-pass monkeypatch smoke, using only a tiny warmup prompt, reported
-`155.83` output tokens/s for DFlash and `236.50` output tokens/s for
-DDTree+DFlash (+51.8%). That number was useful as an integration signal but is
-too warmup-sensitive to use as the headline comparison.
+| Mode | Budget | Output tokens/s | Mean acceptance length | Target forward ms | Draft propose ms | Tree CPU build ms | Tree bias ms | KV compact ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| DFlash, `TREE_ATTN` target | n/a | 275.36 | 2.73 | 24.53 | 4.72 | n/a | n/a | 0.01 |
+| DDTree+DFlash | 32 | 375.08 | 4.06 | 24.40 | 5.89 | 0.78 | 0.48 | 2.45 |
+| DDTree+DFlash | 64 | 402.07 | 4.29 | 24.12 | 6.66 | 1.52 | 0.92 | 2.47 |
+
+The previous timer run, before CPU-built tree bias, showed `ddtree_attention_bias`
+around 3.2 ms for budget 32 and 6.9 ms for budget 64. After the optimization,
+that drops to 0.48 ms and 0.92 ms respectively. The remaining optimization
+stack is now target/drafter scheduling, accepted-KV compaction, CPU tree build
+at larger budgets, and async scheduling/CUDAGraph compatibility.
+
+The public DDTree site reports speedups relative to autoregressive decoding, not
+DDTree-vs-DFlash deltas. One visible example is HumanEval on Qwen3-30B-MoE at
+T=0.0: 8.22x for DDTree and 6.09x for DFlash relative to autoregressive
+decoding, which is a +35.0% DDTree-over-DFlash delta after normalization. The
+new C=4 budget-32 result is in that range, and budget 64 is higher on this
+synthetic profile. Higher-concurrency serving is still lower than that because
+this vLLM path pays dynamic metadata, KV compaction, and tree-build overheads
+inside a batched serving loop.
 
 Earlier clean-image single-request smoke numbers, before batched accepted-KV
 compaction, were:
@@ -166,17 +202,21 @@ What changed with this patch:
 
 - The old single-active-request DDTree limitation is removed for standard
   full-attention `TREE_ATTN` verification.
-- A Qwen3-style batched DDTree serving-profile test is now technically possible.
+- A Qwen3-style batched DDTree no-delay comparison now runs at C=4, C=8, and
+  C=16 in the offline harness, with positive DDTree-over-DFlash deltas for the
+  best tested budget at each concurrency.
 - The actual K2.5 no-delay sweep is still blocked because K2.5 uses MLA/HND/fp8
   KV cache, not the standard full-attention `TREE_ATTN` cache path implemented
   here.
 
 The closest honest workload ladder is now:
 
-1. Run an offline or server-backed Qwen3 full-trace replay shape with
-   `max_num_seqs` swept above 1, comparing DFlash vs DDTree+DFlash.
-2. Add stage timers and acceptance counters to decompose draft forward, tree
-   build, verifier forward, sampler walk, KV compaction, and next-draft prep.
+1. Run a server-backed Qwen3 full-trace replay shape with `max_num_seqs` swept
+   through the AIPerf-style range, comparing DFlash vs DDTree+DFlash with the
+   same prompt trace.
+2. Keep stage timers and acceptance counters enabled for selected samples to
+   decompose draft forward, tree build, verifier forward, sampler walk, KV
+   compaction, and next-draft prep.
 3. Validate the public Kimi K2.5 DFlash drafter with DFlash alone.
 4. Implement MLA tree verification and MLA accepted-KV compaction.
 5. Then rerun the real K2.5 AIPerf no-delay sweep at `C=4,8,16,32,48`.
@@ -190,7 +230,7 @@ earlier correctness-first branch.
 | --- | --- | --- | --- |
 | DFlash proposal logits | Uses DFlash logits | Uses DFlash logits | Matched for Qwen3 DFlash path |
 | Tree construction | Heap-based prefix-closed tree after top-k | Same algorithm; top-k/logprob transfer is batched across requests | Mostly matched, still CPU heap |
-| Tree visibility | Root/ancestor/self mask | Batched 3D per-request dense qq-bias | Matched for full attention |
+| Tree visibility | Root/ancestor/self mask | Batched 3D per-request dense qq-bias, now built on CPU and copied once per batch | Matched for full attention |
 | Target verification | One target pass over tree | One target pass over batched trees through `TREE_ATTN` | Matched for full attention |
 | Greedy tree walk | Greedy walk over target posterior | Greedy walk, now records accepted node indices | Matched for greedy |
 | Accepted KV reuse | Retains accepted verified nodes | Compacts accepted nodes from scratch paged-KV slots to canonical slots | Matched for standard full-attention, no context parallelism |
@@ -202,9 +242,11 @@ earlier correctness-first branch.
 
 The remaining CPU sync is now less severe: tree construction still moves top-k
 data to CPU for heap expansion, but it does so once per batch rather than once
-per request. A fully GPU-resident tree builder and sampler would still help, but
-the larger upstream parity gap, accepted-KV retention, is now closed for the
-standard full-attention path.
+per request. Dense tree-bias construction no longer launches many small GPU
+writes. A fully GPU-resident tree builder and sampler would still help,
+especially for larger budgets and higher concurrency, but the larger upstream
+parity gap, accepted-KV retention, is now closed for the standard full-attention
+path.
 
 ## Current Architecture Limits
 
@@ -343,14 +385,16 @@ Short term:
 1. Keep this vLLM branch focused on Qwen3/full-attention DDTree and land the
    batched accepted-KV implementation cleanly.
 2. Keep using the current multi-arch `vllm-tensorizer` image for clean-image
-   review and validation.
-3. Run a Qwen3 no-delay Rebench-shaped comparison for DFlash vs DDTree+DFlash at
-   C=1 and then a small concurrency sweep.
-4. Add stage timers and acceptance counters before optimizing further.
+   review and validation, then rebuild it at the latest branch head.
+3. Run a Qwen3 no-delay Rebench-shaped server comparison for DFlash vs
+   DDTree+DFlash across the full C sweep.
+4. Use the new stage timers and acceptance counters to choose budget defaults per
+   workload instead of assuming one static budget is best everywhere.
 
 Medium term:
 
-1. Preallocate/reuse tree bias and metadata buffers to reduce allocation churn.
+1. Preallocate/reuse DDTree metadata buffers and benchmark non-eager execution
+   once the dynamic shapes are bucketed.
 2. Move tree expansion and/or tree walk closer to GPU-resident execution if
    timers show CPU sync is material after compaction.
 3. Validate non-eager execution and decide whether DDTree can safely use

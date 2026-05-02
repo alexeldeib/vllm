@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import heapq
+import os
+import time
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -241,7 +244,9 @@ def make_ddtree_attention_bias(
 ) -> torch.Tensor:
     """Build the dense root/ancestor/self attention bias for one DDTree."""
     tree_len = len(metadata.node_depths) + 1
-    bias = torch.full((tree_len, tree_len), -torch.inf, device=device, dtype=dtype)
+    build_on_cpu = device.type == "cuda"
+    bias_device = torch.device("cpu") if build_on_cpu else device
+    bias = torch.full((tree_len, tree_len), -torch.inf, device=bias_device, dtype=dtype)
     bias[:, 0] = 0
     bias.fill_diagonal_(0)
 
@@ -249,6 +254,8 @@ def make_ddtree_attention_bias(
         while parent:
             bias[node_index, parent] = 0
             parent = metadata.parents[parent - 1]
+    if build_on_cpu:
+        return bias.to(device, non_blocking=True)
     return bias
 
 
@@ -270,10 +277,14 @@ def make_batched_ddtree_attention_bias(
     max_tree_len = max(
         (len(m.node_depths) + 1 if m is not None else 1) for m in metadata
     )
+    build_on_cpu = device.type == "cuda"
+    bias_device = torch.device("cpu") if build_on_cpu else device
+    pin_memory = build_on_cpu and is_pin_memory_available()
     batched_bias = torch.zeros(
         (len(metadata), max_tree_len, max_tree_len),
-        device=device,
+        device=bias_device,
         dtype=dtype,
+        pin_memory=pin_memory,
     )
 
     for req_index, tree_metadata in enumerate(metadata):
@@ -288,6 +299,8 @@ def make_batched_ddtree_attention_bias(
             while parent:
                 req_bias[node_index, parent] = 0
                 parent = tree_metadata.parents[parent - 1]
+    if build_on_cpu:
+        return batched_bias.to(device, non_blocking=True)
     return batched_bias
 
 
@@ -377,6 +390,12 @@ class DDTreeProposer(DFlashProposer):
         assert spec_config is not None
         self.tree_budget = spec_config.get_ddtree_tree_budget()
         self._last_ddtree_metadata: list[DDTreeRequestMetadata] | None = None
+        self._last_ddtree_debug_metrics: dict[str, Any] | None = None
+        self._debug_metrics = os.environ.get("SPEC_DECODE_DEBUG_METRICS") == "1"
+
+    def _debug_sync(self) -> None:
+        if self._debug_metrics and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
     def propose_ddtree_from_logits(
         self,
@@ -384,17 +403,27 @@ class DDTreeProposer(DFlashProposer):
         batch_size: int,
     ) -> list[list[int]]:
         draft_logits = logits.view(batch_size, self.num_speculative_tokens, -1)
+        self._last_ddtree_debug_metrics = None
         if draft_logits.shape[-1] == 0 or self.tree_budget <= 0:
             empty = DDTreeRequestMetadata([], [], 0)
             self._last_ddtree_metadata = [empty for _ in range(batch_size)]
             return [[] for _ in range(batch_size)]
 
         topk = min(self.tree_budget, draft_logits.shape[-1])
+
+        self._debug_sync()
+        topk_start = time.perf_counter()
         logprobs = torch.log_softmax(draft_logits.float(), dim=-1)
         top_logprobs, top_token_ids = torch.topk(logprobs, k=topk, dim=-1)
+        self._debug_sync()
+        topk_ms = (time.perf_counter() - topk_start) * 1000
+
+        transfer_start = time.perf_counter()
         top_logprobs_cpu = top_logprobs.detach().cpu()
         top_token_ids_cpu = top_token_ids.detach().cpu()
+        transfer_ms = (time.perf_counter() - transfer_start) * 1000
 
+        build_start = time.perf_counter()
         all_token_ids: list[list[int]] = []
         all_metadata: list[DDTreeRequestMetadata] = []
         for req_index in range(batch_size):
@@ -405,13 +434,31 @@ class DDTreeProposer(DFlashProposer):
             )
             all_token_ids.append(draft.token_ids)
             all_metadata.append(draft.metadata)
+        build_ms = (time.perf_counter() - build_start) * 1000
         self._last_ddtree_metadata = all_metadata
+        if self._debug_metrics:
+            self._last_ddtree_debug_metrics = {
+                "tree_budget": self.tree_budget,
+                "batch_size": batch_size,
+                "horizon": self.num_speculative_tokens,
+                "topk": topk,
+                "tree_nodes": [len(tokens) for tokens in all_token_ids],
+                "tree_max_depths": [metadata.max_depth for metadata in all_metadata],
+                "tree_topk_ms": topk_ms,
+                "tree_transfer_ms": transfer_ms,
+                "tree_cpu_build_ms": build_ms,
+            }
         return all_token_ids
 
     def take_last_ddtree_metadata(self) -> list[DDTreeRequestMetadata] | None:
         metadata = self._last_ddtree_metadata
         self._last_ddtree_metadata = None
         return metadata
+
+    def take_last_ddtree_debug_metrics(self) -> dict[str, Any] | None:
+        metrics = self._last_ddtree_debug_metrics
+        self._last_ddtree_debug_metrics = None
+        return metrics
 
     def prepare_ddtree_inputs(
         self,

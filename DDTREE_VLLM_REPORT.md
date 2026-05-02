@@ -155,84 +155,43 @@ Unsupported or not yet validated:
 
 ## Performance Results
 
-Current batched accepted-KV-compaction smoke on the GB200 clean CI image,
-Qwen3-8B target, `z-lab/Qwen3-8B-DFlash-b16` drafter, `max_num_seqs=4`, four
-prompts per batch, `max_tokens=64`, and target verifier forced through
-`TREE_ATTN` for both modes. The script warms each mode with the same batch shape
-before measuring three distinct prompt groups.
+Current focused results are in `DDTREE_DFLASH_PERF_REPORT.md`. The corrected
+headline is no longer the earlier +5.8% warmed smoke. That smoke used a small
+64-token prompt shape, no tree-budget sweep, and the older GPU-side dense-bias
+builder. It was useful as a clean-image integration check, but not as an
+algorithmic performance result.
 
-| Mode | Budget | Median output tokens | Median elapsed generation time | Median output tokens/s | Delta vs DFlash |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| DFlash, `TREE_ATTN` target | n/a | 256 | 1.0605s | 241.40 | n/a |
-| DDTree+DFlash, `TREE_ATTN` target | 32 | 256 | 1.0022s | 255.44 | +5.8% |
+The current GB200 no-delay offline sweep uses Qwen3-8B, `z-lab/Qwen3-8B-DFlash-b16`,
+`TREE_ATTN` for every target verifier, `enforce_eager=True`,
+`max_num_batched_tokens=8192`, `max_tokens=128`, and async scheduling disabled
+for both DFlash and DDTree. The latest branch source was monkeypatched into the
+clean CI image for this sweep.
 
-This is a smoke result, not a serving benchmark, but it confirms that batched
-verification plus accepted-KV compaction works end-to-end from the built image
-and is modestly faster than DFlash on this warmed four-request profile. DFlash
-still has async scheduling enabled while DDTree disables it, so this is not
-stacking every possible DDTree optimization.
+| Concurrency | Mode | Budget | Output tokens/s | Delta vs DFlash |
+| ---: | --- | ---: | ---: | ---: |
+| 4 | DFlash, `TREE_ATTN` target | n/a | 281.14 | n/a |
+| 4 | DDTree+DFlash | 32 | 380.84 | +35.5% |
+| 4 | DDTree+DFlash | 64 | 401.31 | +42.7% |
+| 8 | DFlash, `TREE_ATTN` target | n/a | 525.25 | n/a |
+| 8 | DDTree+DFlash | 32 | 590.20 | +12.4% |
+| 16 | DFlash, `TREE_ATTN` target | n/a | 1,020.30 | n/a |
+| 16 | DDTree+DFlash | 32 | 1,161.69 | +13.9% |
 
-Measured samples:
+The timer run at C=4 shows why the result moved: after changing dense tree-bias
+construction from many small GPU writes to CPU construction plus one device
+copy, `ddtree_attention_bias` is about 0.48 ms at budget 32 and 0.92 ms at
+budget 64. Mean acceptance length rises from 2.73 for DFlash to 4.06 for
+DDTree budget 32 and 4.29 for DDTree budget 64. The remaining costs to optimize
+are target/drafter scheduling, accepted-KV compaction, CPU tree build at larger
+budgets, and non-eager execution.
 
-| Mode | Samples |
-| --- | --- |
-| DFlash, `TREE_ATTN` target | `1.3977s/256tok/183.16tps`, `1.0562s/256tok/242.39tps`, `1.0605s/256tok/241.40tps` |
-| DDTree+DFlash, `TREE_ATTN` target | `1.0022s/256tok/255.44tps`, `0.9659s/256tok/265.05tps`, `1.0049s/256tok/254.76tps` |
-
-An earlier one-pass monkeypatch smoke reported `155.83` output tokens/s for
-DFlash and `236.50` output tokens/s for DDTree+DFlash (+51.8%). That run used
-only a tiny warmup prompt and is too warmup-sensitive to use as the headline
-comparison.
-
-The following historical numbers are single-request smoke measurements from a
-single GB200 pod with `enforce_eager=True`, `max_num_seqs=1`, and one prompt.
-They are useful for relative integration validation, not as final serving
-benchmarks.
-
-Prompt: `List three properties of a binary tree in one sentence.`
-
-48 generated tokens:
-
-| Mode | Tokens/s | Notes |
-| --- | ---: | --- |
-| Target only, default backend | 25.15 | Non-spec baseline |
-| Target only, `TREE_ATTN` | 24.18 | Same token IDs as default target |
-| DFlash, `num_speculative_tokens=8` | 7.30 | Known-good DFlash setup |
-| DDTree, budget 32 | 8.93 | Exact token-id match with target/TREE and DFlash |
-| DDTree, default budget | 9.04 | No explicit `ddtree_tree_budget`; defaulted to 32 |
-
-DDTree budget 32 improved the 48-token smoke by about 22% over DFlash. The
-no-explicit-budget run improved by about 24% over DFlash.
-
-128 generated tokens:
-
-| Mode | Budget | Tokens/s | Delta vs DFlash | Correctness note |
-| --- | ---: | ---: | ---: | --- |
-| Target only, `TREE_ATTN` | n/a | 34.11 | n/a | Baseline |
-| DFlash | n/a | 18.71 | n/a | Diverged from target at index 112 |
-| DDTree | 16 | 20.08 | +7.3% | Exact match with DFlash |
-| DDTree | 32 | 20.20 | +8.0% | Exact match with DFlash |
-| DDTree | 64 | 20.84 | +11.4% | Exact match with DFlash |
-
-Earlier clean CI image results from
-`ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-be7262e-74f6f52790887fb0729dde13928a12cb3d0a2dad`
-on `ddtree-vllm-ci`:
-
-| Mode | Budget | Tokens | Tokens/s | Delta vs DFlash | Correctness note |
-| --- | ---: | ---: | ---: | ---: | --- |
-| Target only, `TREE_ATTN` | n/a | 48 | 13.64 | n/a | Baseline |
-| DFlash | n/a | 48 | 6.04 | n/a | Exact match with target/TREE |
-| DDTree | 32 | 48 | 8.59 | +42.3% | Exact match with target/TREE and DFlash |
-| DFlash | n/a | 128 | 17.08 | n/a | Baseline for longer speculative smoke |
-| DDTree | 64 | 128 | 20.90 | +22.4% | Exact match with DFlash |
-
-The public DDTree results at https://liranringel.github.io/ddtree/ report much
-larger expected end-to-end speedups in optimized benchmarking, with DDTree
-typically improving over DFlash by increasing accepted-prefix lengths. The site
-shows examples such as HumanEval on Qwen3-30B-MoE improving from 6.09x with
-DFlash to 8.22x with DDTree relative to autoregressive decoding, and multiple
-Qwen3 benchmark/model combinations in the roughly 3x to 8x range relative to
-autoregressive decoding.
+The public DDTree site reports speedups relative to autoregressive decoding, not
+DDTree-vs-DFlash deltas. Its visible HumanEval Qwen3-30B-MoE T=0.0 example is
+8.22x for DDTree and 6.09x for DFlash relative to autoregressive decoding,
+which normalizes to a +35.0% DDTree-over-DFlash delta. The current C=4 budget-32
+vLLM result is now in that range; higher-concurrency serving remains more
+overhead-sensitive and needs the Rebench-shaped server sweep before making SLO
+claims.
 
 ## Current Limitations
 
