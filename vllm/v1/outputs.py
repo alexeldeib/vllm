@@ -3,6 +3,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any
 from typing import TYPE_CHECKING, NamedTuple, TypeAlias
 
 import numpy as np
@@ -221,6 +222,8 @@ class DraftTokenIds:
     req_ids: list[str]
     # num_reqs x num_draft_tokens
     draft_token_ids: list[list[int]]
+    # Optional per-request metadata used by dynamic speculation methods.
+    draft_token_metadata: list[Any] | None = None
 
 
 def make_empty_encoder_model_runner_output(

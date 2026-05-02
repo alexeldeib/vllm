@@ -184,7 +184,10 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
         common_attn_metadata: CommonAttentionMetadata,
         fast_build: bool = False,
     ) -> TreeAttentionMetadata:
-        decode_threshold = self.tree_attn_bias.shape[0]
+        tree_attn_bias = common_attn_metadata.tree_attn_bias
+        if tree_attn_bias is None:
+            tree_attn_bias = self.tree_attn_bias
+        decode_threshold = tree_attn_bias.shape[0]
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata, decode_threshold=decode_threshold
@@ -211,7 +214,7 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
             seq_lens=kv_seqlens,
             block_table=block_table,
             slot_mapping=slot_mapping,
-            tree_attn_bias=self.tree_attn_bias,
+            tree_attn_bias=tree_attn_bias,
         )
 
     def build_for_drafting(

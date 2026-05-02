@@ -397,6 +397,9 @@ class CommonAttentionMetadata:
     has positions available so that builders can pre-compute position-dependent
     metadata (e.g. C128A topk indices for DeepSeek V4)."""
 
+    tree_attn_bias: torch.Tensor | None = None
+    """Optional dynamic tree attention bias for speculative tree verification."""
+
     is_prefilling: torch.Tensor | None = None
     """(batch_size,) bool tensor: True if request is still in prefill phase
     (num_computed_tokens < num_prompt_tokens). Used by some backends to

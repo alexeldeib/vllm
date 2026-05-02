@@ -125,6 +125,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
@@ -165,6 +166,11 @@ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.ddtree import (
+    DDTreeProposer,
+    ddtree_greedy_sample,
+    make_ddtree_attention_bias,
+)
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
@@ -520,6 +526,7 @@ class GPUModelRunner(
                 | NgramProposerGPU
                 | SuffixDecodingProposer
                 | EagleProposer
+                | DDTreeProposer
                 | DFlashProposer
                 | DraftModelProposer
                 | MedusaProposer
@@ -552,6 +559,17 @@ class GPUModelRunner(
                 self._ngram_pinned_val_buf = torch.zeros(
                     self.max_num_reqs, dtype=torch.int32, pin_memory=True
                 )
+            elif self.speculative_config.use_ddtree():
+                if (
+                    self.vllm_config.attention_config.backend
+                    != AttentionBackendEnum.TREE_ATTN
+                ):
+                    raise ValueError(
+                        "DDTree target verification requires "
+                        "attention_backend='TREE_ATTN' for the target model."
+                    )
+                self.drafter = DDTreeProposer(self.vllm_config, self.device, self)
+                self.use_aux_hidden_state_outputs = True
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -793,6 +811,7 @@ class GPUModelRunner(
 
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
+        self._ddtree_attn_bias: torch.Tensor | None = None
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
         self._num_valid_draft_tokens: torch.Tensor | None = None
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
@@ -1816,11 +1835,24 @@ class GPUModelRunner(
             num_scheduled_tokens, self.query_pos.np
         )
 
-        # Get positions.
-        positions_np = (
+        ddtree_scheduled_metadata = (
+            scheduler_output.scheduled_spec_decode_metadata
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_ddtree()
+            )
+            else None
+        )
+        self._ddtree_attn_bias = None
+
+        # Storage positions are unique KV-cache slots assigned by the scheduler.
+        # DDTree may use different model positions because siblings at the same
+        # depth share RoPE positions while still needing unique scratch slots.
+        storage_positions_np = (
             self.input_batch.num_computed_tokens_cpu[req_indices]
             + self.query_pos.np[: cu_num_tokens[-1]]
         )
+        positions_np = storage_positions_np
 
         # Calculate M-RoPE positions.
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
@@ -1832,12 +1864,36 @@ class GPUModelRunner(
         if self.uses_xdrope_dim > 0:
             self._calc_xdrope_positions(scheduler_output)
 
+        if ddtree_scheduled_metadata:
+            if num_reqs != 1 or len(ddtree_scheduled_metadata) != 1:
+                raise NotImplementedError(
+                    "DDTree currently supports one scheduled request per step."
+                )
+            req_id = next(iter(ddtree_scheduled_metadata))
+            tree_metadata = ddtree_scheduled_metadata[req_id]
+            req_idx = self.input_batch.req_id_to_index[req_id]
+            req_start = 0 if req_idx == 0 else int(cu_num_tokens[req_idx - 1])
+            num_sched = int(num_scheduled_tokens[req_idx])
+            if len(tree_metadata.node_depths) + 1 != num_sched:
+                raise ValueError(
+                    "DDTree metadata does not match scheduled token count: "
+                    f"{len(tree_metadata.node_depths) + 1} != {num_sched}"
+                )
+            positions_np = storage_positions_np.copy()
+            base_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
+            positions_np[req_start] = base_pos
+            for i, depth in enumerate(tree_metadata.node_depths, start=1):
+                positions_np[req_start + i] = base_pos + depth
+            self._ddtree_attn_bias = make_ddtree_attention_bias(
+                tree_metadata, device=self.device
+            )
+
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
         # -> [0, 1, M, M + 1, M + 2, M + 3, M + 4, 2 * M, 2 * M + 1, 2 * M + 2]
         # where M is the max_model_len.
         token_indices = (
-            positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
+            storage_positions_np + req_indices * self.input_batch.token_ids_cpu.shape[1]
         )
         token_indices_tensor = torch.from_numpy(token_indices)
 
@@ -1996,10 +2052,20 @@ class GPUModelRunner(
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         self.num_scheduled_tokens.copy_to_gpu(num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
-        self.positions[:total_num_scheduled_tokens] = (
-            self.num_computed_tokens[req_indices_gpu].to(torch.int64)
-            + self.query_pos.gpu[:total_num_scheduled_tokens]
-        )
+        if ddtree_scheduled_metadata:
+            model_positions = torch.from_numpy(positions_np).to(
+                self.device, non_blocking=True
+            )
+            self.positions[:total_num_scheduled_tokens].copy_(model_positions)
+            slot_positions = torch.from_numpy(storage_positions_np).to(
+                self.device, non_blocking=True
+            )
+        else:
+            self.positions[:total_num_scheduled_tokens] = (
+                self.num_computed_tokens[req_indices_gpu].to(torch.int64)
+                + self.query_pos.gpu[:total_num_scheduled_tokens]
+            )
+            slot_positions = self.positions[:total_num_scheduled_tokens]
         self.seq_lens[:num_reqs] = (
             self.num_computed_tokens[:num_reqs] + num_scheduled_tokens_gpu
         )
@@ -2008,7 +2074,7 @@ class GPUModelRunner(
         self.input_batch.block_table.compute_slot_mapping(
             num_reqs,
             self.query_start_loc.gpu[: num_reqs + 1],
-            self.positions[:total_num_scheduled_tokens],
+            slot_positions,
         )
 
         # Copy the tensors to the GPU.
@@ -2070,9 +2136,16 @@ class GPUModelRunner(
                     >= self.input_batch.num_prompt_tokens[req_idx]
                 ):
                     num_decode_draft_tokens[req_idx] = draft_len
-            spec_decode_metadata = self._calc_spec_decode_metadata(
-                num_draft_tokens, cu_num_tokens
-            )
+            if ddtree_scheduled_metadata:
+                spec_decode_metadata = self._calc_ddtree_spec_decode_metadata(
+                    num_draft_tokens,
+                    cu_num_tokens,
+                    ddtree_scheduled_metadata,
+                )
+            else:
+                spec_decode_metadata = self._calc_spec_decode_metadata(
+                    num_draft_tokens, cu_num_tokens
+                )
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
             # For DECODE only cuda graph of some attention backends (e.g., GDN).
@@ -2196,6 +2269,7 @@ class GPUModelRunner(
             causal=True,
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
+            tree_attn_bias=self._ddtree_attn_bias,
         )
 
         if self.dcp_world_size > 1:
@@ -2671,6 +2745,71 @@ class GPUModelRunner(
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+        )
+
+    def _calc_ddtree_spec_decode_metadata(
+        self,
+        num_draft_tokens: np.ndarray,
+        cu_num_scheduled_tokens: np.ndarray,
+        ddtree_scheduled_metadata: dict[str, Any],
+    ) -> SpecDecodeMetadata:
+        # DDTree needs logits at the root and every tree node. The normal chain
+        # sampler only needs draft-token target logits plus one bonus index.
+        num_sampled_tokens = num_draft_tokens + 1
+        cu_num_sampled_tokens = self._get_cumsum_and_arange(
+            num_sampled_tokens, self._arange_scratch, cumsum_dtype=np.int32
+        )
+        logits_indices = np.repeat(
+            cu_num_scheduled_tokens - num_sampled_tokens, num_sampled_tokens
+        )
+        logits_indices += self._arange_scratch[: cu_num_sampled_tokens[-1]]
+
+        cu_num_draft_tokens = self._get_cumsum_and_arange(
+            num_draft_tokens, self._arange_scratch, cumsum_dtype=np.int32
+        )
+        draft_token_indices = np.repeat(
+            cu_num_sampled_tokens - num_sampled_tokens + 1, num_draft_tokens
+        )
+        draft_token_indices += self._arange_scratch[: cu_num_draft_tokens[-1]]
+
+        logits_indices_gpu = torch.from_numpy(logits_indices).to(
+            self.device, non_blocking=True
+        )
+        draft_token_indices_gpu = torch.from_numpy(draft_token_indices).to(
+            self.device, non_blocking=True
+        )
+        draft_token_ids = self.input_ids.gpu[logits_indices_gpu][
+            draft_token_indices_gpu
+        ]
+
+        target_logits_indices = torch.arange(
+            int(cu_num_sampled_tokens[-1]),
+            dtype=torch.int32,
+            device=self.device,
+        )
+        bonus_logits_indices = torch.from_numpy(cu_num_sampled_tokens - 1).to(
+            self.device, non_blocking=True
+        )
+
+        ordered_metadata = []
+        for req_id in self.input_batch.req_ids:
+            metadata = ddtree_scheduled_metadata.get(req_id)
+            if metadata is not None:
+                ordered_metadata.append(metadata)
+
+        return SpecDecodeMetadata(
+            draft_token_ids=draft_token_ids,
+            num_draft_tokens=num_draft_tokens.tolist(),
+            cu_num_draft_tokens=torch.from_numpy(cu_num_draft_tokens).to(
+                self.device, non_blocking=True
+            ),
+            cu_num_sampled_tokens=torch.from_numpy(cu_num_sampled_tokens).to(
+                self.device, non_blocking=True
+            ),
+            target_logits_indices=target_logits_indices,
+            bonus_logits_indices=bonus_logits_indices,
+            logits_indices=logits_indices_gpu,
+            ddtree_metadata=ordered_metadata,
         )
 
     def _prepare_kv_sharing_fast_prefill(
@@ -3380,6 +3519,14 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
             )
 
+        if spec_decode_metadata.ddtree_metadata is not None:
+            assert logits is not None
+            return ddtree_greedy_sample(
+                spec_decode_metadata,
+                logits,
+                sampling_metadata,
+            )
+
         # Update spec_token_ids with real draft tokens from pre step only when
         # output_token_ids is needed (penalties or bad_words are in use).
         if self.use_async_scheduling and self._draft_token_req_ids is not None:
@@ -3938,6 +4085,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                force_eager=bool(scheduler_output.scheduled_spec_decode_metadata),
             )
 
             logger.debug(
@@ -4275,6 +4423,7 @@ class GPUModelRunner(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
+                    | DDTreeProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer,
                 )
@@ -4461,7 +4610,10 @@ class GPUModelRunner(
         if not self.num_spec_tokens or not self._draft_token_req_ids:
             return None
         draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
-        return DraftTokenIds(req_ids, draft_token_ids)
+        draft_token_metadata = None
+        if isinstance(self.drafter, DDTreeProposer):
+            draft_token_metadata = self.drafter.take_last_ddtree_metadata()
+        return DraftTokenIds(req_ids, draft_token_ids, draft_token_metadata)
 
     def _copy_draft_token_ids_to_cpu(
         self, scheduler_output: "SchedulerOutput", zeros_only: bool = False
@@ -4556,6 +4708,17 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
+        if (
+            spec_config.use_ddtree()
+            and spec_decode_metadata is not None
+            and spec_decode_metadata.ddtree_metadata is not None
+        ):
+            # The correctness-first DDTree path verifies into scratch future slots
+            # and lets the next engine step recompute the accepted path
+            # canonically. Do not propose another tree until that catch-up step
+            # has produced target hidden states for the latest committed token.
+            return [[] for _ in self.input_batch.req_ids]
+
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -4668,11 +4831,13 @@ class GPUModelRunner(
 
         elif (
             spec_config.use_eagle()
+            or spec_config.use_ddtree()
             or spec_config.use_dflash()
             or spec_config.uses_draft_model()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter,
+                EagleProposer | DFlashProposer | DDTreeProposer | DraftModelProposer,
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -5594,6 +5759,7 @@ class GPUModelRunner(
                     self.drafter,
                     EagleProposer
                     | DFlashProposer
+                    | DDTreeProposer
                     | DraftModelProposer
                     | ExtractHiddenStatesProposer,
                 )
@@ -6396,7 +6562,8 @@ class GPUModelRunner(
             or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter,
+                EagleProposer | DFlashProposer | DDTreeProposer | DraftModelProposer,
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -6449,7 +6616,10 @@ class GPUModelRunner(
         ):
             assert isinstance(
                 self.drafter,
-                EagleProposer | DFlashProposer | ExtractHiddenStatesProposer,
+                EagleProposer
+                | DFlashProposer
+                | DDTreeProposer
+                | ExtractHiddenStatesProposer,
             )
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 

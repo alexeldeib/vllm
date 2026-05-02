@@ -52,7 +52,7 @@ MTPModelTypes = Literal[
     "hy_v3_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
-DFlashModelTypes = Literal["dflash"]
+DFlashModelTypes = Literal["dflash", "ddtree"]
 EagleModelTypes = Literal[
     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
 ]
@@ -152,6 +152,11 @@ class SpeculativeConfig:
     in parallel rather than sequentially. This can improve performance but
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
+
+    ddtree_tree_budget: int | None = Field(default=None, ge=1)
+    """Maximum number of dynamic DDTree draft nodes per request. Only used when
+    method is ``ddtree``. If unspecified, defaults to
+    ``4 * num_speculative_tokens``."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -635,7 +640,7 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "ddtree"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -646,7 +651,8 @@ class SpeculativeConfig:
                 elif "eagle3" in self.draft_model_config.model.lower():
                     self.method = "eagle3"
                 elif "dflash" in self.draft_model_config.model.lower():
-                    self.method = "dflash"
+                    if self.method != "ddtree":
+                        self.method = "dflash"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
@@ -679,7 +685,7 @@ class SpeculativeConfig:
                     )
 
                 # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "ddtree"):
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
                     from vllm.transformers_utils.configs.speculators import (
                         SpeculatorsConfig,
@@ -699,7 +705,7 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.method == "dflash":
+                if self.method in ("dflash", "ddtree"):
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -985,7 +991,7 @@ class SpeculativeConfig:
             "gemma4",
         ]
         if (
-            self.method in ("eagle3", "extract_hidden_states", "dflash")
+            self.method in ("eagle3", "extract_hidden_states", "dflash", "ddtree")
             and self.target_model_config
             and not any(
                 supported_model in self.target_model_config.hf_text_config.model_type
@@ -1033,10 +1039,17 @@ class SpeculativeConfig:
         return slots_per_req
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp", "dflash")
+        return self.method in ("eagle", "eagle3", "mtp", "dflash", "ddtree")
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def use_ddtree(self) -> bool:
+        return self.method == "ddtree"
+
+    def get_ddtree_tree_budget(self) -> int:
+        assert self.num_speculative_tokens is not None
+        return self.ddtree_tree_budget or 4 * self.num_speculative_tokens
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

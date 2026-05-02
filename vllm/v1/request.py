@@ -142,6 +142,7 @@ class Request:
         self.discard_latest_async_tokens = False
 
         self.spec_token_ids: list[int] = []
+        self.spec_token_metadata = None
         self.num_computed_tokens = 0
         self.cache_salt: str | None = cache_salt
 

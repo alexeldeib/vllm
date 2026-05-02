@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import numpy as np
@@ -214,6 +214,9 @@ class SchedulerOutput:
     # freed from the encoder cache.
     free_encoder_mm_hashes: list[str]
 
+    # req_id -> method-specific metadata for the scheduled spec tokens.
+    scheduled_spec_decode_metadata: dict[str, Any] | None = None
+
     # Request IDs that are preempted in this step.
     # Only used for v2 model runner.
     preempted_req_ids: set[str] | None = None
@@ -248,6 +251,7 @@ class SchedulerOutput:
             num_scheduled_tokens={},
             total_num_scheduled_tokens=0,
             scheduled_spec_decode_tokens={},
+            scheduled_spec_decode_metadata=None,
             scheduled_encoder_inputs={},
             num_common_prefix_blocks=[],
             finished_req_ids=set(),

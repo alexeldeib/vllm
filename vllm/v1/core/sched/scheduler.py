@@ -219,6 +219,10 @@ class Scheduler(SchedulerInterface):
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
+                if speculative_config.use_ddtree():
+                    self.num_lookahead_tokens = (
+                        speculative_config.get_ddtree_tree_budget()
+                    )
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
 
@@ -378,6 +382,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
+        scheduled_spec_decode_metadata: dict[str, object] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -534,10 +539,15 @@ class Scheduler(SchedulerInterface):
                     if len(spec_token_ids) > num_scheduled_spec_tokens:
                         spec_token_ids = spec_token_ids[:num_scheduled_spec_tokens]
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
+                    if request.spec_token_metadata is not None:
+                        scheduled_spec_decode_metadata[request.request_id] = (
+                            request.spec_token_metadata
+                        )
 
                 # New spec tokens will be set in `update_draft_token_ids` before the
                 # next step when applicable.
                 request.spec_token_ids = []
+                request.spec_token_metadata = None
 
             # Encoder-related.
             if encoder_inputs_to_schedule:
@@ -913,6 +923,7 @@ class Scheduler(SchedulerInterface):
             num_scheduled_tokens=num_scheduled_tokens,
             total_num_scheduled_tokens=total_num_scheduled_tokens,
             scheduled_spec_decode_tokens=scheduled_spec_decode_tokens,
+            scheduled_spec_decode_metadata=scheduled_spec_decode_metadata or None,
             scheduled_encoder_inputs=scheduled_encoder_inputs,
             num_common_prefix_blocks=num_common_prefix_blocks,
             preempted_req_ids={req.request_id for req in preempted_reqs},
@@ -964,6 +975,7 @@ class Scheduler(SchedulerInterface):
         request.num_computed_tokens = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
+        request.spec_token_metadata = None
         request.num_preemptions += 1
         if self.log_stats:
             request.record_event(EngineCoreEventType.PREEMPTED, timestamp)
@@ -1357,7 +1369,17 @@ class Scheduler(SchedulerInterface):
             if scheduled_spec_token_ids and generated_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
                 num_accepted = len(generated_token_ids) - 1
-                num_rejected = num_draft_tokens - num_accepted
+                if (
+                    scheduler_output.scheduled_spec_decode_metadata
+                    and req_id in scheduler_output.scheduled_spec_decode_metadata
+                ):
+                    # Correctness-first DDTree writes verifier nodes into scratch
+                    # future slots and lets the next step recompute the accepted
+                    # path canonically, so none of the tree nodes are counted as
+                    # permanently computed here.
+                    num_rejected = num_draft_tokens
+                else:
+                    num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
                 # tokens and rejections. If some tokens are rejected,
@@ -1662,9 +1684,9 @@ class Scheduler(SchedulerInterface):
                 self.encoder_cache_manager.free_encoder_input(request, input_id)
 
     def update_draft_token_ids(self, draft_token_ids: DraftTokenIds) -> None:
-        for req_id, spec_token_ids in zip(
-            draft_token_ids.req_ids,
-            draft_token_ids.draft_token_ids,
+        draft_metadata = draft_token_ids.draft_token_metadata
+        for i, (req_id, spec_token_ids) in enumerate(
+            zip(draft_token_ids.req_ids, draft_token_ids.draft_token_ids)
         ):
             request = self.requests.get(req_id)
             if request is None or request.is_finished():
@@ -1675,6 +1697,7 @@ class Scheduler(SchedulerInterface):
                 # Ignore draft tokens for prefill chunks.
                 if request.spec_token_ids:
                     request.spec_token_ids = []
+                request.spec_token_metadata = None
                 continue
 
             # Add newly generated spec token ids to the request.
@@ -1682,6 +1705,9 @@ class Scheduler(SchedulerInterface):
                 metadata = request.structured_output_request
                 spec_token_ids = metadata.grammar.validate_tokens(spec_token_ids)  # type: ignore[union-attr]
             request.spec_token_ids = spec_token_ids
+            request.spec_token_metadata = (
+                None if draft_metadata is None else draft_metadata[i]
+            )
 
     def update_draft_token_ids_in_output(
         self, draft_token_ids: DraftTokenIds, scheduler_output: SchedulerOutput

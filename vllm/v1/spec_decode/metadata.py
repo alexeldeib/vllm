@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import torch
@@ -22,6 +23,9 @@ class SpecDecodeMetadata:
     bonus_logits_indices: torch.Tensor
     # [num_tokens + batch_size]
     logits_indices: torch.Tensor
+    # Optional method-specific metadata. DDTree uses this to carry the dynamic
+    # tree shape needed by the sampler.
+    ddtree_metadata: list[Any] | None = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
