@@ -15,17 +15,23 @@ readout for the DDTree path.
 
 - vLLM branch: `alex/ddtree-vllm-integration`
 - Pushed review branch: `alexeldeib/vllm:alex/ddtree-vllm-integration`
-- Current vLLM commit: `8f0c77a7c20db5843a2fadddf47a417b8777ee3c`
+- Current vLLM commit: `6acdb096fea8723d337292251068ee5928ce00a2`
 - Current clean image:
-  `ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-fdc3617-8f0c77a7c20db5843a2fadddf47a417b8777ee3c`
+  `ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-7cf4eae-6acdb096fea8723d337292251068ee5928ce00a2`
 - Current clean image manifest digest:
-  `sha256:69c787bc1324333f2f50ddd3cf89eb2c33369c00808e0db463c5ffce200bd551`
+  `sha256:05a12a894d2a548ba7d9182eb2cab72feeca6a07cf1956e62950a8026060b21f`
 - Platforms for that image: `linux/amd64`, `linux/arm64`
-- Monkeypatch validation pod: `ddtree-batch-vllm-test`
-- Clean-image validation pod: `ddtree-clean-vllm-test`
+- Platform manifests:
+  - `linux/amd64`: `sha256:aaf31d599ac88c9404d3ff91b20781c11affdd1b25ff12949adfc5543f1d9b17`
+  - `linux/arm64`: `sha256:ce4dd39d65a0889b1e305587a3c708cf94bfad2c4830cb02936f2052451c3faa`
+- `ml-containers` branch: `alex-ddtree-vllm-image`
+- `ml-containers` commit: `7cf4eae7e6c1458928edbcf356fef24a4db66c6b`
+- CI run: `https://github.com/coreweave/ml-containers/actions/runs/25264137128`
+- Earlier monkeypatch validation pod: `ddtree-batch-vllm-test`
+- Clean-image validation pod: `ddtree-vllm-7cf4eae-gb200`
 - Cluster and namespace: `cw4637-dev-us-e-01a`, `ace-inference`
 - Runtime architecture: `aarch64`
-- Clean-image vLLM package: `0.1.dev16274+g8f0c77a7c.d20260502`
+- Clean-image vLLM package: `0.1.dev16276+g6acdb096f.d20260502`
 
 The current branch now implements the production-critical pieces for the
 standard full-attention DDTree path:
@@ -62,41 +68,47 @@ All current correctness checks use greedy decoding, Qwen3-8B target weights, and
 
 | Environment | Check | Result |
 | --- | --- | --- |
-| Local source | `python3 -m py_compile` for modified DDTree, scheduler, worker, attention, output, config, and test files | Passed |
+| Local source | `python3 -m py_compile` for modified DDTree, GPU runner, and benchmark harness files | Passed |
 | Local source | `git diff --check` | Passed |
 | Monkeypatch GB200 pod | Direct batched DDTree unit smoke | Passed |
 | Monkeypatch GB200 pod | 3D qq-bias Triton kernel check | `max_diff 0.0`, passed |
 | Monkeypatch GB200 pod | 4-request Qwen3-8B + DFlash/DDTree generate, `TREE_ATTN`, budget 32, immediate re-proposal enabled | Passed |
-| Monkeypatch GB200 pod | Target-only greedy vs DDTree+DFlash greedy, same prompts, token IDs | Exact match |
+| Monkeypatch GB200 pod | Target-only greedy vs DDTree+DFlash greedy, selected stable prompts, token IDs | Exact match |
 | Earlier monkeypatch image | 48-token target/TREE vs DFlash vs DDTree | Exact token ID match |
 | Earlier monkeypatch image | 128-token DFlash vs DDTree, budgets 16, 32, 64 | Exact token ID match with DFlash |
 | Current clean CI image | `py_compile` for installed modified files | Passed |
-| Current clean CI image | Direct batched DDTree unit smoke | Passed |
-| Current clean CI image | 3D qq-bias Triton kernel check | `max_diff 0.0`, passed |
-| Current clean CI image | Target-only greedy vs DDTree+DFlash greedy, same prompts, token IDs | Exact match |
-| Current clean CI image | 4-request Qwen3-8B + DFlash/DDTree generate, `TREE_ATTN`, budget 32 | Passed |
-| Current clean CI image | Same-shape warmed DFlash vs DDTree+DFlash timing smoke | Passed |
-| Current clean CI image + monkeypatch | `benchmark_ddtree_dflash.py`, C=4 budget sweep, no debug sync | Passed |
-| Current clean CI image + monkeypatch | `benchmark_ddtree_dflash.py`, C=8 and C=16 no-delay points | Passed |
-| Current clean CI image + monkeypatch | Stage-timer run with acceptance metrics for DFlash and DDTree budgets 32/64 | Passed |
-| Earlier clean CI image | 48-token target/TREE vs DFlash vs DDTree, budget 32 | Exact token ID match |
-| Earlier clean CI image | 128-token DFlash vs DDTree, budget 64 | Exact token ID match with DFlash |
+| Current clean CI image | Import/version check on `aarch64` GB200 image | `0.1.dev16276+g6acdb096f.d20260502`, passed |
+| Current clean CI image | `DDTreeProposer.take_last_ddtree_debug_metrics()` present | Passed |
+| Current clean CI image | Single stable prompt, target/TREE vs DFlash vs DDTree budget 32, 48 generated tokens | Exact token ID match |
+| Current clean CI image | 4-prompt DFlash vs DDTree budget 32 run | Generated successfully; one low-margin prompt produced a different target-verified greedy continuation |
+| Current clean CI image | Budget sensitivity on the low-margin median prompt | Budget 8 matched DFlash; budget 32 selected a different target-verified branch |
+| Current clean CI image | C=4 short DFlash vs DDTree+DFlash timing smoke | Passed |
+| Current clean CI image + same source during development | `benchmark_ddtree_dflash.py`, C=4 budget sweep, no debug sync | Passed |
+| Current clean CI image + same source during development | `benchmark_ddtree_dflash.py`, C=8 and C=16 no-delay points | Passed |
+| Current clean CI image + same source during development | Stage-timer run with acceptance metrics for DFlash and DDTree budgets 32/64 | Passed |
 
-The newest target-only comparison used two prompts, `temperature=0.0`,
-`max_tokens=16`, and compared output token IDs exactly:
+Important caveat: exact token equality against target-only or DFlash is not a
+stable universal oracle under the eager BF16 `TREE_ATTN` + DFlash harness. On a
+low-margin prompt asking for a median function, DFlash itself diverged from the
+target-only baseline, and DDTree budget 32 selected `arguments` where DFlash
+selected `parameters`. Budget 8 matched DFlash on the same prompt. This does not
+show a verifier crash or malformed KV compaction; the debug counters show
+accepted target-verified tree nodes followed by a fallback/root target decision.
+It does mean the latest clean image should be described as passing integration,
+shape, import, selected exact-match, and smoke-performance checks, with broader
+distributional correctness still requiring a larger oracle than byte-for-byte
+target-only equality on low-margin prompts.
 
-```text
-DDTree greedy output matches target-only baseline
-```
-
-This is the key correctness check for accepted-KV compaction because the
-scheduler now advances `num_computed_tokens` through compacted accepted tree
-nodes instead of recomputing them.
+The key accepted-KV compaction check is still that verified DDTree nodes can be
+retained and reused without recomputing them. The branch now advances
+`num_computed_tokens` through compacted accepted tree nodes and immediately
+re-proposes from the actual accepted node path instead of assuming a linear
+prefix.
 
 ## Measured Performance
 
-The current primary measurement is from the clean CI image on GB200 with the
-latest branch source monkeypatched into the pod. The target is Qwen3-8B, the
+The primary measurement below is from GB200 development runs using the same
+source now built into the clean CI image. The target is Qwen3-8B, the
 drafter is `z-lab/Qwen3-8B-DFlash-b16`, target attention is forced through
 `TREE_ATTN` for every mode, `enforce_eager=True`, `max_tokens=128`,
 `max_num_batched_tokens=8192`, and async scheduling is disabled for both DFlash
@@ -135,6 +147,20 @@ raises accepted-prefix length, but verifier, drafter, tree-build, and metadata
 cost can dominate under batching. The current best budget is workload-dependent:
 budget 64 wins in this C=4 offline sweep, while budget 32 is safer at C=8 and
 C=16.
+
+The final clean CI image was also smoke-tested directly on GB200 with a shorter
+C=4, one-batch, 64-token no-debug run:
+
+| Mode | Budget | Output tokens | Output tokens/s | Speedup vs target/TREE | Delta vs DFlash |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Target only, `TREE_ATTN` | n/a | 256 | 130.29 | 1.00x | n/a |
+| DFlash, `TREE_ATTN` target | n/a | 256 | 139.16 | 1.07x | n/a |
+| DDTree+DFlash | 32 | 256 | 248.42 | 1.91x | +78.5% |
+| DDTree+DFlash | 64 | 256 | 268.32 | 2.06x | +92.8% |
+
+This short clean-image run is an integration smoke, not the headline result:
+DFlash was unusually low on that small sample, so the more stable C=4/C=8/C=16
+development sweep remains the better performance readout.
 
 The stage-timer run below uses CUDA synchronizations, so absolute throughput is
 slightly different from no-debug throughput. It is useful for decomposition:
@@ -268,7 +294,8 @@ Current limitations:
   compaction may need cross-rank KV movement.
 - `TREE_ATTN` supports `auto`, `float16`, and `bfloat16` KV cache dtypes, not
   fp8 KV cache.
-- Dynamic tree attention bias is dense and rebuilt per step.
+- Dynamic tree attention bias is dense and rebuilt per step as a host buffer
+  with one host-to-device copy per batch.
 - M-RoPE, XD-RoPE, multimodal inputs, tensor parallelism, expert parallelism,
   MoE routing, and hybrid stateful attention under DDTree are not validated.
 - Hybrid stateful attention models are not supported. The Qwen3.5 hybrid
@@ -385,7 +412,7 @@ Short term:
 1. Keep this vLLM branch focused on Qwen3/full-attention DDTree and land the
    batched accepted-KV implementation cleanly.
 2. Keep using the current multi-arch `vllm-tensorizer` image for clean-image
-   review and validation, then rebuild it at the latest branch head.
+   review and validation.
 3. Run a Qwen3 no-delay Rebench-shaped server comparison for DFlash vs
    DDTree+DFlash across the full C sweep.
 4. Use the new stage timers and acceptance counters to choose budget defaults per
