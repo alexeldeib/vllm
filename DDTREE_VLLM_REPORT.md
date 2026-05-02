@@ -8,9 +8,11 @@ build a prefix-closed draft tree, verifies the dynamic tree in one target-model
 forward pass with `TREE_ATTN`, and greedily walks the verified tree to emit the
 accepted target path plus the first fallback token.
 
-The implementation was monkey-patched into the existing
+The implementation was first monkey-patched into the existing
 `docker.cloudsmith.io/coreweave/infr/vllm:v2.10.0` image and validated on a GB200
-pod in `cw4637-dev-us-e-01a`, namespace `ace-inference`.
+pod in `cw4637-dev-us-e-01a`, namespace `ace-inference`. It was then built into
+a multi-arch `vllm-tensorizer` image through `ml-containers` CI and revalidated
+from a clean image on GB200.
 
 ## Algorithm
 
@@ -62,7 +64,7 @@ instead of the DFlash horizon itself.
 
 ## Correctness Results
 
-Environment:
+Monkeypatch environment:
 
 - Cluster: `cw4637-dev-us-e-01a`
 - Namespace: `ace-inference`
@@ -86,6 +88,27 @@ Passing checks:
 | 48-token DDTree with no explicit `ddtree_tree_budget` | Exact token-id match with target/TREE |
 | 128-token DFlash vs DDTree, budget 16 | Exact token-id match |
 | 128-token DFlash vs DDTree, budget 32 | Exact token-id match |
+| 128-token DFlash vs DDTree, budget 64 | Exact token-id match |
+
+Clean CI image validation:
+
+- `ml-containers` branch: `alex-ddtree-vllm-image`
+- `ml-containers` commit: `be7262e`
+- CI run: `https://github.com/coreweave/ml-containers/actions/runs/25258865880`
+- Image:
+  `ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-be7262e-74f6f52790887fb0729dde13928a12cb3d0a2dad`
+- Manifest index digest:
+  `sha256:425f069eefb838918cf77e09e16d3960e165fb5784ad183da197c5364aecd1be`
+- Platforms: `linux/amd64`, `linux/arm64`
+- Clean-image test pod: `ddtree-vllm-ci`
+- Runtime architecture: `aarch64`
+- vLLM package version:
+  `0.1.dev16269+g74f6f5279.d20260502`
+
+| Clean image check | Result |
+| --- | --- |
+| vLLM import | `vllm.v1.spec_decode.ddtree.DDTreeProposer` imported |
+| 48-token target/TREE vs DFlash vs DDTree, budget 32 | Exact token-id match |
 | 128-token DFlash vs DDTree, budget 64 | Exact token-id match |
 
 Observed baseline caveat:
@@ -135,6 +158,18 @@ no-explicit-budget run improved by about 24% over DFlash.
 | DDTree | 32 | 20.20 | +8.0% | Exact match with DFlash |
 | DDTree | 64 | 20.84 | +11.4% | Exact match with DFlash |
 
+Clean CI image results from
+`ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-be7262e-74f6f52790887fb0729dde13928a12cb3d0a2dad`
+on `ddtree-vllm-ci`:
+
+| Mode | Budget | Tokens | Tokens/s | Delta vs DFlash | Correctness note |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Target only, `TREE_ATTN` | n/a | 48 | 13.64 | n/a | Baseline |
+| DFlash | n/a | 48 | 6.04 | n/a | Exact match with target/TREE |
+| DDTree | 32 | 48 | 8.59 | +42.3% | Exact match with target/TREE and DFlash |
+| DFlash | n/a | 128 | 17.08 | n/a | Baseline for longer speculative smoke |
+| DDTree | 64 | 128 | 20.90 | +22.4% | Exact match with DFlash |
+
 The public DDTree results at https://liranringel.github.io/ddtree/ report much
 larger expected end-to-end speedups in optimized benchmarking, with DDTree
 typically improving over DFlash by increasing accepted-prefix lengths. The site
@@ -165,6 +200,6 @@ autoregressive decoding.
   verified target KVs instead of performing a canonical catch-up step.
 - Extend DDTree metadata handling to batched active requests.
 - Add stochastic sampling and logprob support.
-- Add CI e2e coverage once the container image branch is built.
+- Add automated CI e2e coverage now that the container image branch builds.
 - Benchmark under serving-like settings without eager mode and with realistic
   prompt/output distributions.
