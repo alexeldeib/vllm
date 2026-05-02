@@ -213,19 +213,32 @@ Relevant current facts:
 - Kimi K2.6 uses the same architecture as Kimi K2.5, so the inference-stack
   blockers should be the same.
 - vLLM has Kimi K2.5 model support and recipes for GB200/aarch64 deployment.
+- There is a public Kimi K2.5 DFlash drafter:
+  `z-lab/Kimi-K2.5-DFlash`.
+  Its config advertises `architectures=["DFlashDraftModel"]`, target model
+  `moonshotai/Kimi-K2.5`, block size 8, 6 draft layers, hidden size 7168, 61
+  target layers, `mask_token_id=163838`, and target hidden layer IDs
+  `[1, 12, 24, 35, 47, 58]`.
 - Our local vLLM speculative config already lists `kimi_k2` and `kimi_k25` in
   the aux-hidden-state supported set for DFlash/DDTree-style methods. That means
   hidden-state plumbing is probably not the first blocker.
+- The vLLM draft model registry maps `DFlashDraftModel` to the existing
+  `DFlashQwen3ForCausalLM` implementation. The Kimi drafter config uses
+  `model_type="qwen3"` and Qwen3-style DFlash custom code, so it is plausibly
+  compatible with the existing DFlash draft-model path. This still needs a real
+  load/run validation against `moonshotai/Kimi-K2.5`.
 
 What Kimi support would take:
 
-1. Build or obtain a Kimi-compatible DFlash drafter.
+1. Validate and wire the public Kimi-compatible DFlash drafter.
 
-   DDTree uses DFlash logits as its proposal distribution. The current drafter
-   model is Qwen3-specific (`DFlashDraftModel` maps to the Qwen3 DFlash
-   implementation). Kimi K2.5 deployments in the `perfy` scenario used Eagle3,
-   not DFlash. Eagle3 draft outputs are not a drop-in replacement for the
-   current DDTree builder without a new proposal adapter and correctness proof.
+   DDTree uses DFlash logits as its proposal distribution. The public
+   `z-lab/Kimi-K2.5-DFlash` checkpoint likely removes the need to train or
+   obtain a Kimi K2.5 drafter. The remaining work is to verify that vLLM can
+   load it through the `DFlashDraftModel` registry path, that target hidden
+   states are gathered from the intended Kimi layers, that tensor-parallel
+   partitioning works, and that DFlash alone is correct and performant before
+   layering DDTree on top.
 
 2. Add tree verification to MLA attention.
 
@@ -257,10 +270,13 @@ What Kimi support would take:
    Kimi is multimodal, but the shortest path is text-only Kimi DDTree first.
    Image/video handling can follow once text-only MLA, TP, and batching work.
 
-Practical estimate: Kimi support is a medium-to-large project, not a small model
-registration change. If a Kimi DFlash drafter already exists, the hard work is
-mostly MLA tree verification, KV retention, TP, and batching. If no Kimi DFlash
-drafter exists, the drafter becomes the first major dependency.
+Practical estimate: Kimi support is still a medium-to-large project, not a small
+model registration change. The public Kimi K2.5 DFlash drafter removes one major
+dependency for K2.5. The hard work is now MLA tree verification, KV retention,
+TP, batching, and validation under the Rebench-shaped workload. Kimi K2.6 has
+the same architecture, but the K2.5 drafter should not be assumed to give the
+same acceptance on K2.6 weights; it can be tried as a bootstrap, but a K2.6-tuned
+drafter or acceptance/performance validation is still required.
 
 ## GLM-5.1
 
@@ -314,8 +330,8 @@ Medium term:
 
 Stretch models:
 
-1. Kimi K2.5/K2.6 is the more natural first stretch target if a DFlash drafter
-   exists or can be trained. The architecture is MLA/MoE, but not DSA.
+1. Kimi K2.5 is the more natural first stretch target because a public DFlash
+   drafter exists. The architecture is MLA/MoE, but not DSA.
 2. GLM-5.1 should follow after the MLA path is solved, because DSA adds another
    state-management surface.
 
@@ -325,6 +341,7 @@ Stretch models:
 - Local DDTree prototype: `/Users/aeldeib/code/claude/ddd/ddtree`
 - K2.5 Rebench scenario: `/Users/aeldeib/code/claude/perfy/scenarios/k2_5_chat`
 - Kimi K2.5 model card: https://huggingface.co/moonshotai/Kimi-K2.5
+- Kimi K2.5 DFlash drafter: https://huggingface.co/z-lab/Kimi-K2.5-DFlash
 - Kimi K2.6 model card: https://huggingface.co/moonshotai/Kimi-K2.6
 - vLLM Kimi K2.5 recipe: https://docs.vllm.ai/projects/recipes/en/latest/moonshotai/Kimi-K2.5.html
 - GLM-5.1 model card: https://huggingface.co/zai-org/GLM-5.1
