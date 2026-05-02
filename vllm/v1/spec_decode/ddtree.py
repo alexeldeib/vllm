@@ -58,6 +58,7 @@ def _make_ddtree_drafter_token_indices(
     sampled_token_ids: list[list[int]],
     num_draft_tokens: list[int],
     accepted_node_indices: list[list[int]],
+    ddtree_metadata: list[DDTreeRequestMetadata | None],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Map DDTree accepted paths back to target-forward token indices.
 
@@ -69,20 +70,41 @@ def _make_ddtree_drafter_token_indices(
     if (
         len(sampled_token_ids) != batch_size
         or len(accepted_node_indices) != batch_size
+        or len(ddtree_metadata) != batch_size
         or query_start_loc_cpu.numel() != batch_size + 1
     ):
         raise ValueError(
             "DDTree drafter inputs are not batch-aligned: "
             f"{len(sampled_token_ids)=}, {len(num_draft_tokens)=}, "
-            f"{len(accepted_node_indices)=}, {query_start_loc_cpu.numel()=}"
+            f"{len(accepted_node_indices)=}, {len(ddtree_metadata)=}, "
+            f"{query_start_loc_cpu.numel()=}"
         )
 
     token_indices: list[int] = []
     num_rejected_tokens: list[int] = []
     query_start_np = query_start_loc_cpu.numpy()
-    for req_index, (tokens, num_draft, accepted_nodes) in enumerate(
-        zip(sampled_token_ids, num_draft_tokens, accepted_node_indices)
+    for req_index, (tokens, num_draft, accepted_nodes, tree_metadata) in enumerate(
+        zip(
+            sampled_token_ids,
+            num_draft_tokens,
+            accepted_node_indices,
+            ddtree_metadata,
+        )
     ):
+        req_start = int(query_start_np[req_index])
+        req_end = int(query_start_np[req_index + 1])
+        query_len = req_end - req_start
+
+        if tree_metadata is None:
+            if accepted_nodes:
+                raise ValueError(
+                    "Accepted DDTree nodes were reported for a non-DDTree "
+                    f"request row {req_index}: {accepted_nodes}"
+                )
+            token_indices.extend(range(req_start, req_end))
+            num_rejected_tokens.append(0)
+            continue
+
         if len(tokens) != len(accepted_nodes) + 1:
             raise ValueError(
                 "DDTree sampled token count must equal accepted nodes plus "
@@ -91,12 +113,10 @@ def _make_ddtree_drafter_token_indices(
             )
 
         tree_len = num_draft + 1
-        req_start = int(query_start_np[req_index])
-        req_end = int(query_start_np[req_index + 1])
-        if req_end - req_start != tree_len:
+        if query_len != tree_len:
             raise ValueError(
                 "DDTree query window does not match draft token count for "
-                f"request {req_index}: {req_end - req_start} != {tree_len}"
+                f"request {req_index}: {query_len} != {tree_len}"
             )
 
         path = [0, *accepted_nodes]
@@ -292,7 +312,10 @@ def ddtree_greedy_sample(
         raise ValueError("DDTree sampler requires metadata.ddtree_metadata.")
 
     batch_size = len(ddtree_metadata)
-    max_output_len = max((m.max_depth for m in ddtree_metadata), default=0) + 1
+    max_output_len = (
+        max((m.max_depth if m is not None else 0 for m in ddtree_metadata), default=0)
+        + 1
+    )
     output_token_ids = torch.full(
         (batch_size, max_output_len),
         PLACEHOLDER_TOKEN_ID,
@@ -306,7 +329,9 @@ def ddtree_greedy_sample(
     logit_offset = 0
     draft_offset = 0
     accepted_node_indices_by_req: list[list[int]] = []
+    empty_metadata = DDTreeRequestMetadata([], [], 0)
     for req_index, tree in enumerate(ddtree_metadata):
+        tree = tree or empty_metadata
         num_nodes = len(tree.node_depths)
         children: dict[int, dict[int, int]] = {}
         req_draft_tokens = draft_token_ids[draft_offset : draft_offset + num_nodes]
@@ -394,6 +419,7 @@ class DDTreeProposer(DFlashProposer):
         sampled_token_ids: list[list[int]],
         num_draft_tokens: list[int],
         accepted_node_indices: list[list[int]],
+        ddtree_metadata: list[DDTreeRequestMetadata | None],
     ) -> tuple[CommonAttentionMetadata, torch.Tensor]:
         """Prepare DFlash drafter context after a DDTree verification step."""
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
@@ -402,6 +428,7 @@ class DDTreeProposer(DFlashProposer):
             sampled_token_ids,
             num_draft_tokens,
             accepted_node_indices,
+            ddtree_metadata,
         )
 
         assert common_attn_metadata.seq_lens_cpu_upper_bound is not None

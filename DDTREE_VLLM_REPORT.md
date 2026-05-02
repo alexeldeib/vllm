@@ -10,7 +10,9 @@ target path plus the first fallback token, and now compacts accepted target KVs
 from scratch tree slots into canonical paged-KV slots for the standard
 full-attention path. The current branch also immediately re-proposes the next
 DDTree from the actual accepted tree-node path, avoiding the earlier
-correctness-first catch-up step.
+correctness-first catch-up step. Mixed scheduler steps with DDTree verification
+rows and ordinary prefill rows are handled by preserving the accepted DDTree path
+for tree rows and contiguous prompt hidden states for non-tree rows.
 
 The implementation was first monkey-patched into the existing
 `docker.cloudsmith.io/coreweave/infr/vllm:v2.10.0` image and validated on a GB200
@@ -69,6 +71,8 @@ instead of the DFlash horizon itself.
   - compact accepted target KVs into canonical slots,
   - prepare the next DFlash/DDTree proposal from non-contiguous accepted tree
     nodes,
+  - keep ordinary prefill rows contiguous when they share a batch with DDTree
+    verification rows,
   - disable async scheduling for DDTree.
 - Added focused unit coverage in `tests/v1/spec_decode/test_ddtree.py`.
 
@@ -150,8 +154,8 @@ both modes:
 
 | Mode | Budget | Output tokens | Elapsed generation time | Output tokens/s | Delta vs DFlash |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| DFlash, `TREE_ATTN` target | n/a | 256 | 1.9997s | 128.02 | n/a |
-| DDTree+DFlash, `TREE_ATTN` target | 32 | 256 | 1.3401s | 191.03 | +49.2% |
+| DFlash, `TREE_ATTN` target | n/a | 256 | 1.6428s | 155.83 | n/a |
+| DDTree+DFlash, `TREE_ATTN` target | 32 | 256 | 1.0825s | 236.50 | +51.8% |
 
 This is a smoke result, not a serving benchmark, but it confirms that batched
 verification plus accepted-KV compaction materially changes the performance

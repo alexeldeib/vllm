@@ -41,6 +41,9 @@ standard full-attention DDTree path:
 - Immediate next-tree proposal after DDTree verification, using the actual
   accepted tree-node path rather than assuming accepted nodes are a linear
   prefix of the depth-ordered tree.
+- Mixed-batch handling where DDTree verification rows can share a scheduler
+  step with ordinary prefill rows; DDTree rows use accepted-node indices and
+  non-tree rows keep contiguous prompt hidden states for the drafter context.
 - Batched top-k/logprob transfer for tree construction, reducing one CPU sync
   per request to one CPU transfer per DDTree batch.
 - Triton qq-bias cleanup for the vector logical mask warning seen in the GB200
@@ -86,8 +89,8 @@ comparing different target attention backends.
 
 | Mode | Budget | Output tokens | Elapsed generation time | Output tokens/s | Delta vs DFlash |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| DFlash, `TREE_ATTN` target | n/a | 256 | 1.9997s | 128.02 | n/a |
-| DDTree+DFlash, `TREE_ATTN` target | 32 | 256 | 1.3401s | 191.03 | +49.2% |
+| DFlash, `TREE_ATTN` target | n/a | 256 | 1.6428s | 155.83 | n/a |
+| DDTree+DFlash, `TREE_ATTN` target | 32 | 256 | 1.0825s | 236.50 | +51.8% |
 
 This result should be interpreted as a strong integration smoke signal, not as a
 serving SLO claim. It benefits from accepted-KV compaction and a small fixed

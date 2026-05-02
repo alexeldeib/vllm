@@ -189,12 +189,41 @@ def test_ddtree_greedy_sample_handles_batched_variable_trees():
 
 
 def test_make_ddtree_drafter_token_indices_follow_accepted_path():
+    metadata_a = DDTreeRequestMetadata(
+        node_depths=[1, 1, 2],
+        parents=[0, 0, 1],
+        max_depth=2,
+    )
+    metadata_b = DDTreeRequestMetadata(
+        node_depths=[1],
+        parents=[0],
+        max_depth=1,
+    )
     num_rejected, token_indices = _make_ddtree_drafter_token_indices(
         query_start_loc_cpu=torch.tensor([0, 4, 6], dtype=torch.int32),
         sampled_token_ids=[[10, 11, 7], [30, 31]],
         num_draft_tokens=[3, 1],
         accepted_node_indices=[[1, 3], [1]],
+        ddtree_metadata=[metadata_a, metadata_b],
     )
 
     assert num_rejected.tolist() == [1, 0]
     assert token_indices.tolist() == [0, 1, 3, 4, 5]
+
+
+def test_make_ddtree_drafter_token_indices_keeps_non_tree_rows_contiguous():
+    metadata = DDTreeRequestMetadata(
+        node_depths=[1, 1, 2],
+        parents=[0, 0, 1],
+        max_depth=2,
+    )
+    num_rejected, token_indices = _make_ddtree_drafter_token_indices(
+        query_start_loc_cpu=torch.tensor([0, 4, 11], dtype=torch.int32),
+        sampled_token_ids=[[10, 11, 7], [30]],
+        num_draft_tokens=[3, 0],
+        accepted_node_indices=[[1, 3], []],
+        ddtree_metadata=[metadata, None],
+    )
+
+    assert num_rejected.tolist() == [1, 0]
+    assert token_indices.tolist() == [0, 1, 3, 4, 5, 6, 7, 8, 9, 10]

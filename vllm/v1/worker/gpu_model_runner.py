@@ -2794,12 +2794,9 @@ class GPUModelRunner(
             self.device, non_blocking=True
         )
 
-        empty_metadata = DDTreeRequestMetadata([], [], 0)
         ordered_metadata = []
         for req_id in self.input_batch.req_ids:
-            ordered_metadata.append(
-                ddtree_scheduled_metadata.get(req_id, empty_metadata)
-            )
+            ordered_metadata.append(ddtree_scheduled_metadata.get(req_id))
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -3773,6 +3770,11 @@ class GPUModelRunner(
             base_position = int(self.input_batch.num_computed_tokens_cpu[req_index])
 
             for depth, node_index in enumerate(nodes, start=1):
+                if tree_metadata is None:
+                    raise ValueError(
+                        "DDTree accepted nodes were reported for a non-DDTree "
+                        f"request {req_id}: {nodes}"
+                    )
                 if node_index <= 0 or node_index >= num_sched:
                     raise ValueError(
                         "DDTree accepted node index is outside the scheduled "
@@ -4580,7 +4582,10 @@ class GPUModelRunner(
                 <= self.effective_drafter_max_model_len
             )
             use_gpu_toks = (
-                spec_config.use_eagle()
+                (
+                    spec_config.use_eagle()
+                    and not spec_config.use_ddtree()
+                )
                 or spec_config.uses_draft_model()
                 or spec_config.uses_extract_hidden_states()
             ) and not spec_config.disable_padded_drafter_batch
@@ -5006,13 +5011,17 @@ class GPUModelRunner(
                 EagleProposer | DFlashProposer | DDTreeProposer | DraftModelProposer,
             )
 
-            if spec_config.disable_padded_drafter_batch:
+            use_cpu_sampled_tokens = (
+                spec_config.disable_padded_drafter_batch
+                or spec_config.use_ddtree()
+            )
+            if use_cpu_sampled_tokens:
                 # When padded-batch is disabled, the sampled_token_ids should be
                 # the cpu-side list[list[int]] of valid sampled tokens for each
                 # request, with invalid requests having empty lists.
                 assert isinstance(sampled_token_ids, list), (
                     "sampled_token_ids should be a python list when"
-                    "padded-batch is disabled."
+                    "padded-batch is disabled or DDTree is active."
                 )
                 next_token_ids = self.drafter.prepare_next_token_ids_cpu(
                     sampled_token_ids,
@@ -5065,7 +5074,7 @@ class GPUModelRunner(
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
-                if spec_config.disable_padded_drafter_batch:
+                if use_cpu_sampled_tokens:
                     token_indices_to_sample = None
                     if (
                         spec_config.use_ddtree()
@@ -5087,6 +5096,7 @@ class GPUModelRunner(
                                 sampled_token_ids,
                                 spec_decode_metadata.num_draft_tokens,
                                 ddtree_accepted_node_indices,
+                                spec_decode_metadata.ddtree_metadata,
                             )
                         )
                     else:
