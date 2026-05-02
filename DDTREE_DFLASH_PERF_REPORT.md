@@ -15,15 +15,17 @@ readout for the DDTree path.
 
 - vLLM branch: `alex/ddtree-vllm-integration`
 - Pushed review branch: `alexeldeib/vllm:alex/ddtree-vllm-integration`
-- Prior clean image:
-  `ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-be7262e-74f6f52790887fb0729dde13928a12cb3d0a2dad`
-- Prior clean image manifest digest:
-  `sha256:425f069eefb838918cf77e09e16d3960e165fb5784ad183da197c5364aecd1be`
+- Current vLLM commit: `8f0c77a7c20db5843a2fadddf47a417b8777ee3c`
+- Current clean image:
+  `ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-fdc3617-8f0c77a7c20db5843a2fadddf47a417b8777ee3c`
+- Current clean image manifest digest:
+  `sha256:69c787bc1324333f2f50ddd3cf89eb2c33369c00808e0db463c5ffce200bd551`
 - Platforms for that image: `linux/amd64`, `linux/arm64`
-- Current monkeypatch validation pod: `ddtree-batch-vllm-test`
+- Monkeypatch validation pod: `ddtree-batch-vllm-test`
+- Clean-image validation pod: `ddtree-clean-vllm-test`
 - Cluster and namespace: `cw4637-dev-us-e-01a`, `ace-inference`
 - Runtime architecture: `aarch64`
-- vLLM package from base image: `0.1.dev16269+g74f6f5279.d20260502`
+- Clean-image vLLM package: `0.1.dev16274+g8f0c77a7c.d20260502`
 
 The current branch now implements the production-critical pieces for the
 standard full-attention DDTree path:
@@ -64,7 +66,12 @@ All current correctness checks use greedy decoding, Qwen3-8B target weights, and
 | Monkeypatch GB200 pod | Target-only greedy vs DDTree+DFlash greedy, same prompts, token IDs | Exact match |
 | Earlier monkeypatch image | 48-token target/TREE vs DFlash vs DDTree | Exact token ID match |
 | Earlier monkeypatch image | 128-token DFlash vs DDTree, budgets 16, 32, 64 | Exact token ID match with DFlash |
-| Earlier clean CI image | Import `vllm.v1.spec_decode.ddtree.DDTreeProposer` | Passed |
+| Current clean CI image | `py_compile` for installed modified files | Passed |
+| Current clean CI image | Direct batched DDTree unit smoke | Passed |
+| Current clean CI image | 3D qq-bias Triton kernel check | `max_diff 0.0`, passed |
+| Current clean CI image | Target-only greedy vs DDTree+DFlash greedy, same prompts, token IDs | Exact match |
+| Current clean CI image | 4-request Qwen3-8B + DFlash/DDTree generate, `TREE_ATTN`, budget 32 | Passed |
+| Current clean CI image | Same-shape warmed DFlash vs DDTree+DFlash timing smoke | Passed |
 | Earlier clean CI image | 48-token target/TREE vs DFlash vs DDTree, budget 32 | Exact token ID match |
 | Earlier clean CI image | 128-token DFlash vs DDTree, budget 64 | Exact token ID match with DFlash |
 
@@ -81,23 +88,41 @@ nodes instead of recomputing them.
 
 ## Measured Performance
 
-These are smoke-test numbers, not final serving economics. They run on the
-GB200 monkeypatch pod, eager mode, Qwen3-8B target, `z-lab/Qwen3-8B-DFlash-b16`
-drafter, `max_num_seqs=4`, `max_num_batched_tokens=4096`, four prompts, and
-`max_tokens=64`. Both rows force the target verifier through `TREE_ATTN` to avoid
-comparing different target attention backends.
+These are smoke-test numbers, not final serving economics. The current primary
+measurement is from the clean CI image on GB200, eager mode, Qwen3-8B target,
+`z-lab/Qwen3-8B-DFlash-b16` drafter, `max_num_seqs=4`,
+`max_num_batched_tokens=4096`, four prompts per batch, and `max_tokens=64`. Both
+rows force the target verifier through `TREE_ATTN` to avoid comparing different
+target attention backends.
 
-| Mode | Budget | Output tokens | Elapsed generation time | Output tokens/s | Delta vs DFlash |
+The script warms each mode with the same batch shape before measuring three
+distinct prompt groups. This avoids the misleading first-shape overhead seen in
+single-pass smoke timings and avoids measuring a repeated identical prompt set.
+
+| Mode | Budget | Median output tokens | Median elapsed generation time | Median output tokens/s | Delta vs DFlash |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| DFlash, `TREE_ATTN` target | n/a | 256 | 1.6428s | 155.83 | n/a |
-| DDTree+DFlash, `TREE_ATTN` target | 32 | 256 | 1.0825s | 236.50 | +51.8% |
+| DFlash, `TREE_ATTN` target | n/a | 256 | 1.0605s | 241.40 | n/a |
+| DDTree+DFlash, `TREE_ATTN` target | 32 | 256 | 1.0022s | 255.44 | +5.8% |
 
 This result should be interpreted as a strong integration smoke signal, not as a
-serving SLO claim. It benefits from accepted-KV compaction and a small fixed
-prompt set. The correct next performance step is a Rebench-shaped workload:
-full trace shape, no artificial request-count truncation, and a DFlash vs
+serving SLO claim. It benefits from accepted-KV compaction and a small synthetic
+prompt set, while DFlash still has async scheduling enabled and DDTree currently
+does not. The correct next performance step is a Rebench-shaped workload: full
+trace shape, no artificial request-count truncation, and a DFlash vs
 DDTree+DFlash comparison with only the speculative method and tree budget
 changed.
+
+The measured samples were:
+
+| Mode | Samples |
+| --- | --- |
+| DFlash, `TREE_ATTN` target | `1.3977s/256tok/183.16tps`, `1.0562s/256tok/242.39tps`, `1.0605s/256tok/241.40tps` |
+| DDTree+DFlash, `TREE_ATTN` target | `1.0022s/256tok/255.44tps`, `0.9659s/256tok/265.05tps`, `1.0049s/256tok/254.76tps` |
+
+An earlier one-pass monkeypatch smoke, using only a tiny warmup prompt, reported
+`155.83` output tokens/s for DFlash and `236.50` output tokens/s for
+DDTree+DFlash (+51.8%). That number was useful as an integration signal but is
+too warmup-sensitive to use as the headline comparison.
 
 Earlier clean-image single-request smoke numbers, before batched accepted-KV
 compaction, were:
@@ -317,8 +342,8 @@ Short term:
 
 1. Keep this vLLM branch focused on Qwen3/full-attention DDTree and land the
    batched accepted-KV implementation cleanly.
-2. Trigger a fresh multi-arch `vllm-tensorizer` image build from the new vLLM
-   commit, because the prior clean image predates batched compaction.
+2. Keep using the current multi-arch `vllm-tensorizer` image for clean-image
+   review and validation.
 3. Run a Qwen3 no-delay Rebench-shaped comparison for DFlash vs DDTree+DFlash at
    C=1 and then a small concurrency sweep.
 4. Add stage timers and acceptance counters before optimizing further.

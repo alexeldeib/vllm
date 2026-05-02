@@ -18,9 +18,9 @@ The implementation was first monkey-patched into the existing
 `docker.cloudsmith.io/coreweave/infr/vllm:v2.10.0` image and validated on a GB200
 pod in `cw4637-dev-us-e-01a`, namespace `ace-inference`. It was then built into
 a multi-arch `vllm-tensorizer` image through `ml-containers` CI and revalidated
-from a clean image on GB200. The branch has since been extended with batched
-DDTree verification and accepted-KV compaction; those newer changes have been
-validated by monkeypatch on GB200 and need a fresh clean image build.
+from a clean image on GB200. The current clean image includes the batched DDTree
+verification, immediate re-proposal, mixed-batch drafter prep, and accepted-KV
+compaction fixes.
 
 ## Algorithm
 
@@ -82,7 +82,7 @@ Monkeypatch environment:
 
 - Cluster: `cw4637-dev-us-e-01a`
 - Namespace: `ace-inference`
-- Test pod: `ddtree-vllm-dev`
+- Test pod: `ddtree-batch-vllm-test`
 - GPU class: GB200
 - Base image: `docker.cloudsmith.io/coreweave/infr/vllm:v2.10.0`
 - Target model: `Qwen/Qwen3-8B`
@@ -111,23 +111,31 @@ Passing checks:
 Clean CI image validation:
 
 - `ml-containers` branch: `alex-ddtree-vllm-image`
-- `ml-containers` commit: `be7262e`
-- CI run: `https://github.com/coreweave/ml-containers/actions/runs/25258865880`
+- `ml-containers` commit: `fdc3617b2595279b38e4f31818ab16c7e42db55a`
+- vLLM commit: `8f0c77a7c20db5843a2fadddf47a417b8777ee3c`
+- CI run: `https://github.com/coreweave/ml-containers/actions/runs/25262221047`
 - Image:
-  `ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-be7262e-74f6f52790887fb0729dde13928a12cb3d0a2dad`
+  `ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-fdc3617-8f0c77a7c20db5843a2fadddf47a417b8777ee3c`
 - Manifest index digest:
-  `sha256:425f069eefb838918cf77e09e16d3960e165fb5784ad183da197c5364aecd1be`
+  `sha256:69c787bc1324333f2f50ddd3cf89eb2c33369c00808e0db463c5ffce200bd551`
 - Platforms: `linux/amd64`, `linux/arm64`
-- Clean-image test pod: `ddtree-vllm-ci`
+- Clean-image test pod: `ddtree-clean-vllm-test`
 - Runtime architecture: `aarch64`
 - vLLM package version:
-  `0.1.dev16269+g74f6f5279.d20260502`
+  `0.1.dev16274+g8f0c77a7c.d20260502`
 
 | Clean image check | Result |
 | --- | --- |
-| vLLM import | `vllm.v1.spec_decode.ddtree.DDTreeProposer` imported |
-| 48-token target/TREE vs DFlash vs DDTree, budget 32 | Exact token-id match |
-| 128-token DFlash vs DDTree, budget 64 | Exact token-id match |
+| Installed source syntax | `py_compile` passed for modified installed files |
+| Direct batched DDTree unit smoke | Passed |
+| 3D qq-bias Triton kernel check | `max_diff 0.0`, passed |
+| Target-only greedy vs DDTree+DFlash greedy | Exact token-id match |
+| 4-request batched DDTree generate with accepted-KV compaction and immediate re-proposal | Passed |
+| Same-shape warmed DFlash vs DDTree+DFlash timing smoke | Passed |
+
+Earlier clean-image checks, from the pre-compaction CI image, also passed
+48-token target/TREE vs DFlash vs DDTree and 128-token DFlash vs DDTree
+correctness. The current image supersedes those results.
 
 Observed baseline caveat:
 
@@ -147,23 +155,39 @@ Unsupported or not yet validated:
 
 ## Performance Results
 
-Current batched accepted-KV-compaction smoke on the GB200 monkeypatch pod,
+Current batched accepted-KV-compaction smoke on the GB200 clean CI image,
 Qwen3-8B target, `z-lab/Qwen3-8B-DFlash-b16` drafter, `max_num_seqs=4`, four
-prompts, `max_tokens=64`, and target verifier forced through `TREE_ATTN` for
-both modes:
+prompts per batch, `max_tokens=64`, and target verifier forced through
+`TREE_ATTN` for both modes. The script warms each mode with the same batch shape
+before measuring three distinct prompt groups.
 
-| Mode | Budget | Output tokens | Elapsed generation time | Output tokens/s | Delta vs DFlash |
+| Mode | Budget | Median output tokens | Median elapsed generation time | Median output tokens/s | Delta vs DFlash |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| DFlash, `TREE_ATTN` target | n/a | 256 | 1.6428s | 155.83 | n/a |
-| DDTree+DFlash, `TREE_ATTN` target | 32 | 256 | 1.0825s | 236.50 | +51.8% |
+| DFlash, `TREE_ATTN` target | n/a | 256 | 1.0605s | 241.40 | n/a |
+| DDTree+DFlash, `TREE_ATTN` target | 32 | 256 | 1.0022s | 255.44 | +5.8% |
 
 This is a smoke result, not a serving benchmark, but it confirms that batched
-verification plus accepted-KV compaction materially changes the performance
-profile relative to the original correctness-first path.
+verification plus accepted-KV compaction works end-to-end from the built image
+and is modestly faster than DFlash on this warmed four-request profile. DFlash
+still has async scheduling enabled while DDTree disables it, so this is not
+stacking every possible DDTree optimization.
 
-These numbers are smoke-test measurements from a single GB200 pod with
-`enforce_eager=True`, `max_num_seqs=1`, and one prompt. They are useful for
-relative integration validation, not as final serving benchmarks.
+Measured samples:
+
+| Mode | Samples |
+| --- | --- |
+| DFlash, `TREE_ATTN` target | `1.3977s/256tok/183.16tps`, `1.0562s/256tok/242.39tps`, `1.0605s/256tok/241.40tps` |
+| DDTree+DFlash, `TREE_ATTN` target | `1.0022s/256tok/255.44tps`, `0.9659s/256tok/265.05tps`, `1.0049s/256tok/254.76tps` |
+
+An earlier one-pass monkeypatch smoke reported `155.83` output tokens/s for
+DFlash and `236.50` output tokens/s for DDTree+DFlash (+51.8%). That run used
+only a tiny warmup prompt and is too warmup-sensitive to use as the headline
+comparison.
+
+The following historical numbers are single-request smoke measurements from a
+single GB200 pod with `enforce_eager=True`, `max_num_seqs=1`, and one prompt.
+They are useful for relative integration validation, not as final serving
+benchmarks.
 
 Prompt: `List three properties of a binary tree in one sentence.`
 
@@ -190,7 +214,7 @@ no-explicit-budget run improved by about 24% over DFlash.
 | DDTree | 32 | 20.20 | +8.0% | Exact match with DFlash |
 | DDTree | 64 | 20.84 | +11.4% | Exact match with DFlash |
 
-Clean CI image results from
+Earlier clean CI image results from
 `ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-be7262e-74f6f52790887fb0729dde13928a12cb3d0a2dad`
 on `ddtree-vllm-ci`:
 
@@ -229,8 +253,6 @@ autoregressive decoding.
 
 ## Follow-Up Work
 
-- Trigger a fresh multi-arch `vllm-tensorizer` image build from the current vLLM
-  commit; the prior clean image predates batched accepted-KV compaction.
 - Run a Rebench-shaped Qwen3 full-attention comparison for DFlash vs
   DDTree+DFlash at C=1 and then a small concurrency sweep.
 - Add stage timers and acceptance counters for draft forward, tree build,
