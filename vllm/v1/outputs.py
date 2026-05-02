@@ -123,6 +123,11 @@ class SamplerOutput:
     # PLACEHOLDER_TOKEN_ID (-1 by default) is used for padding.
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
+    # DDTree-only: accepted draft node indices per request. These are relative
+    # to each request's tree verification window, where 0 is the root and draft
+    # nodes start at 1. Used by the model runner to compact accepted KVs from
+    # scratch tree slots into canonical contiguous cache slots.
+    ddtree_accepted_node_indices: list[list[int]] | None = None
 
 
 @dataclass
@@ -201,6 +206,11 @@ class ModelRunnerOutput:
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
+
+    # DDTree-only: req_id -> accepted draft token count whose KVs were
+    # compacted into canonical slots. The scheduler uses this to advance
+    # num_computed_tokens without recomputing accepted tree nodes.
+    ddtree_num_accepted_tokens: dict[str, int] | None = None
 
 
 # ModelRunnerOutput wrapper for async scheduling.

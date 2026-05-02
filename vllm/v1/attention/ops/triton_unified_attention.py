@@ -91,6 +91,7 @@ def kernel_unified_attention(
     output_stride_0: tl.int64,  # int
     output_stride_1: tl.int64,  # int, should be equal to head_size
     qq_bias_stride_0: tl.int64,  # int
+    qq_bias_batch_stride: tl.int64,  # int
     BLOCK_SIZE: tl.constexpr,  # int
     TILE_SIZE: tl.constexpr,  # int must be power of 2
     HEAD_SIZE: tl.constexpr,  # int
@@ -98,6 +99,7 @@ def kernel_unified_attention(
     USE_ALIBI_SLOPES: tl.constexpr,  # bool
     USE_ALIBI_SQRT: tl.constexpr,  # bool
     USE_QQ_BIAS: tl.constexpr,  # bool
+    USE_3D_QQ_BIAS: tl.constexpr,  # bool
     USE_SOFTCAP: tl.constexpr,  # bool
     USE_SINKS: tl.constexpr,  # bool
     SLIDING_WINDOW: tl.constexpr,  # int
@@ -208,7 +210,10 @@ def kernel_unified_attention(
         )
 
     if USE_QQ_BIAS:
-        qq_bias_row_ptrs = qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
+        qq_bias_base_ptr = qq_bias_ptr
+        if USE_3D_QQ_BIAS:
+            qq_bias_base_ptr += seq_idx * qq_bias_batch_stride
+        qq_bias_row_ptrs = qq_bias_base_ptr + query_pos[:, None] * qq_bias_stride_0
 
     loop_lo, loop_hi, max_seq_prefix_len = compute_tile_loop_bounds(
         context_len,
@@ -567,6 +572,22 @@ def unified_attention(
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
+    use_3d_qq_bias = False
+    if use_qq_bias:
+        if not qq_bias.is_contiguous():
+            qq_bias = qq_bias.contiguous()
+        if qq_bias.ndim == 2:
+            qq_bias_stride_0 = qq_bias.stride(0)
+            qq_bias_batch_stride = 0
+        elif qq_bias.ndim == 3:
+            use_3d_qq_bias = True
+            qq_bias_stride_0 = qq_bias.stride(1)
+            qq_bias_batch_stride = qq_bias.stride(0)
+        else:
+            raise ValueError(f"Unsupported qq_bias shape: {qq_bias.shape}")
+    else:
+        qq_bias_stride_0 = 0
+        qq_bias_batch_stride = 0
 
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
@@ -685,7 +706,8 @@ def unified_attention(
         query_stride_1=q.stride(1),
         output_stride_0=out.stride(0),
         output_stride_1=out.stride(1),
-        qq_bias_stride_0=qq_bias.stride(0) if use_qq_bias else 0,
+        qq_bias_stride_0=qq_bias_stride_0,
+        qq_bias_batch_stride=qq_bias_batch_stride,
         BLOCK_SIZE=block_size,
         TILE_SIZE=tile_size,
         HEAD_SIZE=head_size,
@@ -693,6 +715,7 @@ def unified_attention(
         USE_ALIBI_SLOPES=use_alibi_slopes,
         USE_ALIBI_SQRT=use_alibi_sqrt,
         USE_QQ_BIAS=use_qq_bias,
+        USE_3D_QQ_BIAS=use_3d_qq_bias,
         USE_SOFTCAP=(softcap > 0),
         USE_SINKS=(sinks is not None),
         USE_MM_PREFIX=use_mm_prefix,

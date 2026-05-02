@@ -6,8 +6,11 @@ from __future__ import annotations
 import heapq
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
+from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.dflash import DFlashProposer
@@ -50,31 +53,90 @@ def _order_nodes_by_depth(
     )
 
 
-def build_ddtree_tree(
-    draft_logits: torch.Tensor,
+def _make_ddtree_drafter_token_indices(
+    query_start_loc_cpu: torch.Tensor,
+    sampled_token_ids: list[list[int]],
+    num_draft_tokens: list[int],
+    accepted_node_indices: list[list[int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map DDTree accepted paths back to target-forward token indices.
+
+    Generic spec decode can keep the first N target positions for each request
+    because draft verification is linear. DDTree verification is depth ordered,
+    so the accepted path can be non-contiguous in the flattened tree window.
+    """
+    batch_size = len(num_draft_tokens)
+    if (
+        len(sampled_token_ids) != batch_size
+        or len(accepted_node_indices) != batch_size
+        or query_start_loc_cpu.numel() != batch_size + 1
+    ):
+        raise ValueError(
+            "DDTree drafter inputs are not batch-aligned: "
+            f"{len(sampled_token_ids)=}, {len(num_draft_tokens)=}, "
+            f"{len(accepted_node_indices)=}, {query_start_loc_cpu.numel()=}"
+        )
+
+    token_indices: list[int] = []
+    num_rejected_tokens: list[int] = []
+    query_start_np = query_start_loc_cpu.numpy()
+    for req_index, (tokens, num_draft, accepted_nodes) in enumerate(
+        zip(sampled_token_ids, num_draft_tokens, accepted_node_indices)
+    ):
+        if len(tokens) != len(accepted_nodes) + 1:
+            raise ValueError(
+                "DDTree sampled token count must equal accepted nodes plus "
+                f"bonus token for request {req_index}: {len(tokens)} vs "
+                f"{len(accepted_nodes)}"
+            )
+
+        tree_len = num_draft + 1
+        req_start = int(query_start_np[req_index])
+        req_end = int(query_start_np[req_index + 1])
+        if req_end - req_start != tree_len:
+            raise ValueError(
+                "DDTree query window does not match draft token count for "
+                f"request {req_index}: {req_end - req_start} != {tree_len}"
+            )
+
+        path = [0, *accepted_nodes]
+        for node_index in path:
+            if node_index < 0 or node_index >= tree_len:
+                raise ValueError(
+                    "DDTree accepted node index is outside the scheduled tree "
+                    f"window for request {req_index}: {node_index}"
+                )
+            token_indices.append(req_start + node_index)
+        num_rejected_tokens.append(tree_len - len(path))
+
+    return (
+        torch.tensor(num_rejected_tokens, dtype=torch.int32),
+        torch.tensor(token_indices, dtype=torch.int64),
+    )
+
+
+def _build_ddtree_tree_from_topk(
+    top_logprobs_cpu: torch.Tensor,
+    top_token_ids_cpu: torch.Tensor,
     budget: int,
 ) -> DDTreeDraft:
-    """Build a prefix-closed DDTree from one request's DFlash logits.
-
-    The heap expansion mirrors the reference DDTree prototype. Parent indices
-    are 1-based for tree nodes and use 0 for the root. The final node order is
-    normalized by depth for the verifier's tree attention path.
-    """
-    if draft_logits.ndim != 2:
-        raise ValueError(f"Expected [horizon, vocab] logits, got {draft_logits.shape}")
     if budget <= 0:
         return DDTreeDraft([], DDTreeRequestMetadata([], [], 0))
 
-    depth_limit, vocab_size = draft_logits.shape
-    if depth_limit == 0 or vocab_size == 0:
+    if top_logprobs_cpu.ndim != 2 or top_token_ids_cpu.ndim != 2:
+        raise ValueError(
+            "Expected [horizon, topk] tensors, got "
+            f"{top_logprobs_cpu.shape} and {top_token_ids_cpu.shape}"
+        )
+    if top_logprobs_cpu.shape != top_token_ids_cpu.shape:
+        raise ValueError(
+            "top_logprobs and top_token_ids must have the same shape, got "
+            f"{top_logprobs_cpu.shape} and {top_token_ids_cpu.shape}"
+        )
+
+    depth_limit, topk = top_logprobs_cpu.shape
+    if depth_limit == 0 or topk == 0:
         return DDTreeDraft([], DDTreeRequestMetadata([], [], 0))
-
-    topk = min(budget, vocab_size)
-    logprobs = torch.log_softmax(draft_logits.float(), dim=-1)
-    top_logprobs, top_token_ids = torch.topk(logprobs, k=topk, dim=-1)
-
-    top_logprobs_cpu = top_logprobs.detach().cpu()
-    top_token_ids_cpu = top_token_ids.detach().cpu()
 
     node_token_ids: list[int] = []
     node_depths: list[int] = []
@@ -122,6 +184,35 @@ def build_ddtree_tree(
     )
 
 
+def build_ddtree_tree(
+    draft_logits: torch.Tensor,
+    budget: int,
+) -> DDTreeDraft:
+    """Build a prefix-closed DDTree from one request's DFlash logits.
+
+    The heap expansion mirrors the reference DDTree prototype. Parent indices
+    are 1-based for tree nodes and use 0 for the root. The final node order is
+    normalized by depth for the verifier's tree attention path.
+    """
+    if draft_logits.ndim != 2:
+        raise ValueError(f"Expected [horizon, vocab] logits, got {draft_logits.shape}")
+    if budget <= 0:
+        return DDTreeDraft([], DDTreeRequestMetadata([], [], 0))
+
+    depth_limit, vocab_size = draft_logits.shape
+    if depth_limit == 0 or vocab_size == 0:
+        return DDTreeDraft([], DDTreeRequestMetadata([], [], 0))
+
+    topk = min(budget, vocab_size)
+    logprobs = torch.log_softmax(draft_logits.float(), dim=-1)
+    top_logprobs, top_token_ids = torch.topk(logprobs, k=topk, dim=-1)
+    return _build_ddtree_tree_from_topk(
+        top_logprobs.detach().cpu(),
+        top_token_ids.detach().cpu(),
+        budget,
+    )
+
+
 def make_ddtree_attention_bias(
     metadata: DDTreeRequestMetadata,
     *,
@@ -139,6 +230,45 @@ def make_ddtree_attention_bias(
             bias[node_index, parent] = 0
             parent = metadata.parents[parent - 1]
     return bias
+
+
+def make_batched_ddtree_attention_bias(
+    metadata: list[DDTreeRequestMetadata | None],
+    *,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Build per-request dense tree attention biases for a DDTree batch.
+
+    Requests without DDTree metadata use a zero bias, which preserves normal
+    causal attention behavior. Requests with metadata get the DDTree
+    root/ancestor/self visibility mask in their active tree window.
+    """
+    if not metadata:
+        return torch.empty((0, 0, 0), device=device, dtype=dtype)
+
+    max_tree_len = max(
+        (len(m.node_depths) + 1 if m is not None else 1) for m in metadata
+    )
+    batched_bias = torch.zeros(
+        (len(metadata), max_tree_len, max_tree_len),
+        device=device,
+        dtype=dtype,
+    )
+
+    for req_index, tree_metadata in enumerate(metadata):
+        if tree_metadata is None:
+            continue
+        tree_len = len(tree_metadata.node_depths) + 1
+        req_bias = batched_bias[req_index, :tree_len, :tree_len]
+        req_bias.fill_(-torch.inf)
+        req_bias[:, 0] = 0
+        req_bias.fill_diagonal_(0)
+        for node_index, parent in enumerate(tree_metadata.parents, start=1):
+            while parent:
+                req_bias[node_index, parent] = 0
+                parent = tree_metadata.parents[parent - 1]
+    return batched_bias
 
 
 def ddtree_greedy_sample(
@@ -175,6 +305,7 @@ def ddtree_greedy_sample(
 
     logit_offset = 0
     draft_offset = 0
+    accepted_node_indices_by_req: list[list[int]] = []
     for req_index, tree in enumerate(ddtree_metadata):
         num_nodes = len(tree.node_depths)
         children: dict[int, dict[int, int]] = {}
@@ -186,12 +317,14 @@ def ddtree_greedy_sample(
 
         current_node = 0
         emitted: list[int] = []
+        accepted_node_indices: list[int] = []
         while True:
             target_token_id = int(target_argmax[logit_offset + current_node])
             emitted.append(target_token_id)
             child = children.get(current_node, {}).get(target_token_id)
             if child is None:
                 break
+            accepted_node_indices.append(child)
             current_node = child
 
         output_token_ids[req_index, : len(emitted)] = torch.tensor(
@@ -199,10 +332,15 @@ def ddtree_greedy_sample(
             dtype=torch.int32,
             device=logits.device,
         )
+        accepted_node_indices_by_req.append(accepted_node_indices)
         logit_offset += num_nodes + 1
         draft_offset += num_nodes
 
-    return SamplerOutput(sampled_token_ids=output_token_ids, logprobs_tensors=None)
+    return SamplerOutput(
+        sampled_token_ids=output_token_ids,
+        logprobs_tensors=None,
+        ddtree_accepted_node_indices=accepted_node_indices_by_req,
+    )
 
 
 class DDTreeProposer(DFlashProposer):
@@ -221,10 +359,25 @@ class DDTreeProposer(DFlashProposer):
         batch_size: int,
     ) -> list[list[int]]:
         draft_logits = logits.view(batch_size, self.num_speculative_tokens, -1)
+        if draft_logits.shape[-1] == 0 or self.tree_budget <= 0:
+            empty = DDTreeRequestMetadata([], [], 0)
+            self._last_ddtree_metadata = [empty for _ in range(batch_size)]
+            return [[] for _ in range(batch_size)]
+
+        topk = min(self.tree_budget, draft_logits.shape[-1])
+        logprobs = torch.log_softmax(draft_logits.float(), dim=-1)
+        top_logprobs, top_token_ids = torch.topk(logprobs, k=topk, dim=-1)
+        top_logprobs_cpu = top_logprobs.detach().cpu()
+        top_token_ids_cpu = top_token_ids.detach().cpu()
+
         all_token_ids: list[list[int]] = []
         all_metadata: list[DDTreeRequestMetadata] = []
         for req_index in range(batch_size):
-            draft = build_ddtree_tree(draft_logits[req_index], self.tree_budget)
+            draft = _build_ddtree_tree_from_topk(
+                top_logprobs_cpu[req_index],
+                top_token_ids_cpu[req_index],
+                self.tree_budget,
+            )
             all_token_ids.append(draft.token_ids)
             all_metadata.append(draft.metadata)
         self._last_ddtree_metadata = all_metadata
@@ -234,3 +387,58 @@ class DDTreeProposer(DFlashProposer):
         metadata = self._last_ddtree_metadata
         self._last_ddtree_metadata = None
         return metadata
+
+    def prepare_ddtree_inputs(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        sampled_token_ids: list[list[int]],
+        num_draft_tokens: list[int],
+        accepted_node_indices: list[list[int]],
+    ) -> tuple[CommonAttentionMetadata, torch.Tensor]:
+        """Prepare DFlash drafter context after a DDTree verification step."""
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+        num_rejected_tokens, token_indices_cpu = _make_ddtree_drafter_token_indices(
+            query_start_loc_cpu,
+            sampled_token_ids,
+            num_draft_tokens,
+            accepted_node_indices,
+        )
+
+        assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
+        new_seq_lens_cpu = (
+            common_attn_metadata.seq_lens_cpu_upper_bound - num_rejected_tokens
+        )
+
+        new_query_len_per_req = (
+            query_start_loc_cpu[1:] - query_start_loc_cpu[:-1] - num_rejected_tokens
+        )
+        new_query_len_per_req_np = new_query_len_per_req.numpy()
+
+        new_query_start_loc_cpu = torch.zeros(
+            query_start_loc_cpu.shape,
+            dtype=torch.int32,
+            pin_memory=is_pin_memory_available(),
+        )
+        new_query_start_loc_np = new_query_start_loc_cpu.numpy()
+        np.cumsum(new_query_len_per_req_np, out=new_query_start_loc_np[1:])
+
+        device = common_attn_metadata.query_start_loc.device
+        token_indices = token_indices_cpu.to(device, non_blocking=True)
+        spec_common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=new_query_start_loc_cpu.to(device, non_blocking=True),
+            seq_lens=new_seq_lens_cpu.to(device, non_blocking=True),
+            query_start_loc_cpu=new_query_start_loc_cpu,
+            _seq_lens_cpu=new_seq_lens_cpu,
+            _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
+            seq_lens_cpu_upper_bound=new_seq_lens_cpu,
+            num_reqs=common_attn_metadata.num_reqs,
+            num_actual_tokens=int(new_query_start_loc_np[-1]),
+            max_query_len=int(new_query_len_per_req.max().item()),
+            max_seq_len=int(new_seq_lens_cpu.max().item()),
+            block_table_tensor=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping[token_indices],
+            causal=True,
+            dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
+        )
+
+        return spec_common_attn_metadata, token_indices

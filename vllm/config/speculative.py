@@ -287,6 +287,7 @@ class SpeculativeConfig:
             "eagle3",
             "extract_hidden_states",
             "dflash",
+            "ddtree",
         )
         factors.append(uses_aux_hidden_states)
 

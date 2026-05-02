@@ -1312,6 +1312,7 @@ class Scheduler(SchedulerInterface):
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats = model_runner_output.cudagraph_stats
+        ddtree_num_accepted_tokens = model_runner_output.ddtree_num_accepted_tokens
 
         perf_stats: PerfStats | None = None
         if self.perf_metrics and self.perf_metrics.is_enabled():
@@ -1373,11 +1374,17 @@ class Scheduler(SchedulerInterface):
                     scheduler_output.scheduled_spec_decode_metadata
                     and req_id in scheduler_output.scheduled_spec_decode_metadata
                 ):
-                    # Correctness-first DDTree writes verifier nodes into scratch
-                    # future slots and lets the next step recompute the accepted
-                    # path canonically, so none of the tree nodes are counted as
-                    # permanently computed here.
-                    num_rejected = num_draft_tokens
+                    # DDTree verifies into scratch tree slots. The model runner
+                    # reports how many accepted nodes were compacted into
+                    # canonical KV slots; un-compacted accepted nodes must be
+                    # recomputed by the next catch-up step.
+                    num_kv_accepted = (
+                        ddtree_num_accepted_tokens.get(req_id, 0)
+                        if ddtree_num_accepted_tokens is not None
+                        else 0
+                    )
+                    num_kv_accepted = min(num_kv_accepted, num_accepted)
+                    num_rejected = num_draft_tokens - num_kv_accepted
                 else:
                     num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens

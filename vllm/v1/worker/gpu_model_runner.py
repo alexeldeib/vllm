@@ -167,9 +167,10 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.ddtree import (
+    DDTreeRequestMetadata,
     DDTreeProposer,
     ddtree_greedy_sample,
-    make_ddtree_attention_bias,
+    make_batched_ddtree_attention_bias,
 )
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
@@ -1865,27 +1866,29 @@ class GPUModelRunner(
             self._calc_xdrope_positions(scheduler_output)
 
         if ddtree_scheduled_metadata:
-            if num_reqs != 1 or len(ddtree_scheduled_metadata) != 1:
-                raise NotImplementedError(
-                    "DDTree currently supports one scheduled request per step."
-                )
-            req_id = next(iter(ddtree_scheduled_metadata))
-            tree_metadata = ddtree_scheduled_metadata[req_id]
-            req_idx = self.input_batch.req_id_to_index[req_id]
-            req_start = 0 if req_idx == 0 else int(cu_num_tokens[req_idx - 1])
-            num_sched = int(num_scheduled_tokens[req_idx])
-            if len(tree_metadata.node_depths) + 1 != num_sched:
-                raise ValueError(
-                    "DDTree metadata does not match scheduled token count: "
-                    f"{len(tree_metadata.node_depths) + 1} != {num_sched}"
-                )
             positions_np = storage_positions_np.copy()
-            base_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
-            positions_np[req_start] = base_pos
-            for i, depth in enumerate(tree_metadata.node_depths, start=1):
-                positions_np[req_start + i] = base_pos + depth
-            self._ddtree_attn_bias = make_ddtree_attention_bias(
-                tree_metadata, device=self.device
+            ddtree_metadata_by_req: list[DDTreeRequestMetadata | None] = []
+            for req_idx, req_id in enumerate(self.input_batch.req_ids):
+                tree_metadata = ddtree_scheduled_metadata.get(req_id)
+                ddtree_metadata_by_req.append(tree_metadata)
+                if tree_metadata is None:
+                    continue
+
+                req_start = 0 if req_idx == 0 else int(cu_num_tokens[req_idx - 1])
+                num_sched = int(num_scheduled_tokens[req_idx])
+                tree_len = len(tree_metadata.node_depths) + 1
+                if tree_len != num_sched:
+                    raise ValueError(
+                        "DDTree metadata does not match scheduled token count: "
+                        f"{tree_len} != {num_sched}"
+                    )
+                base_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
+                positions_np[req_start] = base_pos
+                for i, depth in enumerate(tree_metadata.node_depths, start=1):
+                    positions_np[req_start + i] = base_pos + depth
+
+            self._ddtree_attn_bias = make_batched_ddtree_attention_bias(
+                ddtree_metadata_by_req, device=self.device
             )
 
         # Get token indices.
@@ -2791,11 +2794,12 @@ class GPUModelRunner(
             self.device, non_blocking=True
         )
 
+        empty_metadata = DDTreeRequestMetadata([], [], 0)
         ordered_metadata = []
         for req_id in self.input_batch.req_ids:
-            metadata = ddtree_scheduled_metadata.get(req_id)
-            if metadata is not None:
-                ordered_metadata.append(metadata)
+            ordered_metadata.append(
+                ddtree_scheduled_metadata.get(req_id, empty_metadata)
+            )
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -3667,6 +3671,169 @@ class GPUModelRunner(
             invalid_req_indices,
         )
 
+    def _compact_ddtree_accepted_kv_cache(
+        self,
+        scheduler_output: "SchedulerOutput",
+        spec_decode_metadata: SpecDecodeMetadata | None,
+        sampler_output: SamplerOutput,
+    ) -> dict[str, int] | None:
+        if (
+            spec_decode_metadata is None
+            or spec_decode_metadata.ddtree_metadata is None
+            or sampler_output.ddtree_accepted_node_indices is None
+        ):
+            return None
+
+        req_ids = self.input_batch.req_ids
+        accepted_node_indices = sampler_output.ddtree_accepted_node_indices
+        if len(accepted_node_indices) != len(req_ids):
+            raise ValueError(
+                "DDTree accepted-node metadata is not aligned with the batch: "
+                f"{len(accepted_node_indices)} != {len(req_ids)}"
+            )
+
+        accepted_counts = {
+            req_id: len(nodes) for req_id, nodes in zip(req_ids, accepted_node_indices)
+        }
+        total_accepted = sum(accepted_counts.values())
+        if total_accepted == 0:
+            return accepted_counts
+
+        if get_total_cp_world_size() != 1:
+            logger.warning_once(
+                "DDTree accepted-KV compaction is disabled when context "
+                "parallelism is active; accepted tree nodes will be recomputed."
+            )
+            return None
+
+        block_tables = self.input_batch.block_table.block_tables
+        if not block_tables:
+            return None
+        for kv_cache_group in self.kv_cache_config.kv_cache_groups:
+            if not isinstance(kv_cache_group.kv_cache_spec, FullAttentionSpec):
+                logger.warning_once(
+                    "DDTree accepted-KV compaction is disabled for non-full "
+                    "attention KV cache group %s; accepted tree nodes will be "
+                    "recomputed.",
+                    type(kv_cache_group.kv_cache_spec).__name__,
+                )
+                return None
+
+        kv_caches_by_group: list[list[torch.Tensor]] = [
+            [] for _ in range(len(block_tables))
+        ]
+        seen_cache_ptrs: set[int] = set()
+        for group in self._attn_group_iterator():
+            group_id = group.kv_cache_group_id
+            if group_id >= len(kv_caches_by_group):
+                continue
+            if not isinstance(group.kv_cache_spec, FullAttentionSpec):
+                continue
+            for layer_name in group.layer_names:
+                layer = self.compilation_config.static_forward_context[layer_name]
+                kv_cache = getattr(layer, "kv_cache", None)
+                if not isinstance(kv_cache, torch.Tensor):
+                    logger.warning_once(
+                        "DDTree accepted-KV compaction is disabled for a "
+                        "non-tensor KV cache on layer %s.",
+                        layer_name,
+                    )
+                    return None
+                if kv_cache.dim() < 5 or kv_cache.shape[0] != 2:
+                    logger.warning_once(
+                        "DDTree accepted-KV compaction is disabled for KV cache "
+                        "shape %s on layer %s.",
+                        tuple(kv_cache.shape),
+                        layer_name,
+                    )
+                    return None
+                cache_ptr = kv_cache.data_ptr()
+                if cache_ptr in seen_cache_ptrs:
+                    continue
+                seen_cache_ptrs.add(cache_ptr)
+                kv_caches_by_group[group_id].append(kv_cache)
+
+        if not any(kv_caches_by_group):
+            return None
+
+        num_scheduled_tokens = [
+            scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids
+        ]
+        cu_num_tokens = np.cumsum(num_scheduled_tokens, dtype=np.int32)
+        source_flat_indices: list[int] = []
+        dest_positions: list[int] = []
+        dest_query_start = [0]
+
+        for req_index, (req_id, nodes) in enumerate(
+            zip(req_ids, accepted_node_indices)
+        ):
+            req_start = 0 if req_index == 0 else int(cu_num_tokens[req_index - 1])
+            tree_metadata = spec_decode_metadata.ddtree_metadata[req_index]
+            num_sched = num_scheduled_tokens[req_index]
+            base_position = int(self.input_batch.num_computed_tokens_cpu[req_index])
+
+            for depth, node_index in enumerate(nodes, start=1):
+                if node_index <= 0 or node_index >= num_sched:
+                    raise ValueError(
+                        "DDTree accepted node index is outside the scheduled "
+                        f"tree window for request {req_id}: {node_index}"
+                    )
+                if depth > tree_metadata.max_depth:
+                    raise ValueError(
+                        "DDTree accepted path exceeds tree depth for request "
+                        f"{req_id}: {depth} > {tree_metadata.max_depth}"
+                    )
+                source_flat_indices.append(req_start + node_index)
+                dest_positions.append(base_position + depth)
+            dest_query_start.append(len(dest_positions))
+
+        source_indices = torch.tensor(
+            source_flat_indices,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        dest_positions_gpu = torch.tensor(
+            dest_positions,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        dest_query_start_gpu = torch.tensor(
+            dest_query_start,
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        total_num_scheduled_tokens = int(cu_num_tokens[-1])
+        source_slot_mappings = [
+            block_table.slot_mapping.gpu[:total_num_scheduled_tokens].clone()
+            for block_table in block_tables
+        ]
+
+        for group_id, block_table in enumerate(block_tables):
+            group_kv_caches = kv_caches_by_group[group_id]
+            if not group_kv_caches:
+                continue
+
+            source_slots = source_slot_mappings[group_id].index_select(
+                0, source_indices
+            )
+            block_table.compute_slot_mapping(
+                len(req_ids),
+                dest_query_start_gpu,
+                dest_positions_gpu,
+            )
+            dest_slots = block_table.slot_mapping.gpu[:total_accepted].clone()
+            for kv_cache in group_kv_caches:
+                key_cache, value_cache = kv_cache.unbind(0)
+                key_cache_flat = key_cache.flatten(0, 1)
+                value_cache_flat = value_cache.flatten(0, 1)
+                key_values = key_cache_flat.index_select(0, source_slots)
+                value_values = value_cache_flat.index_select(0, source_slots)
+                key_cache_flat.index_copy_(0, dest_slots, key_values)
+                value_cache_flat.index_copy_(0, dest_slots, value_values)
+
+        return accepted_counts
+
     @contextmanager
     def synchronize_input_prep(self):
         if self.prepare_inputs_event is None:
@@ -4400,6 +4567,7 @@ class GPUModelRunner(
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     slot_mappings,
+                    sampler_output.ddtree_accepted_node_indices,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -4496,6 +4664,12 @@ class GPUModelRunner(
                 scheduler_output.total_num_scheduled_tokens,
             )
 
+        ddtree_num_accepted_tokens = self._compact_ddtree_accepted_kv_cache(
+            scheduler_output,
+            spec_decode_metadata,
+            sampler_output,
+        )
+
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
@@ -4534,6 +4708,7 @@ class GPUModelRunner(
                 else None,
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
+                ddtree_num_accepted_tokens=ddtree_num_accepted_tokens,
             )
 
         if not self.use_async_scheduling:
@@ -4704,20 +4879,11 @@ class GPUModelRunner(
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        ddtree_accepted_node_indices: list[list[int]] | None = None,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
-        if (
-            spec_config.use_ddtree()
-            and spec_decode_metadata is not None
-            and spec_decode_metadata.ddtree_metadata is not None
-        ):
-            # The correctness-first DDTree path verifies into scratch future slots
-            # and lets the next engine step recompute the accepted path
-            # canonically. Do not propose another tree until that catch-up step
-            # has produced target hidden states for the latest committed token.
-            return [[] for _ in self.input_batch.req_ids]
 
         if spec_config.method == "ngram":
             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
@@ -4901,11 +5067,36 @@ class GPUModelRunner(
             else:
                 if spec_config.disable_padded_drafter_batch:
                     token_indices_to_sample = None
-                    common_attn_metadata, token_indices = self.drafter.prepare_inputs(
-                        common_attn_metadata,
-                        sampled_token_ids,
-                        spec_decode_metadata.num_draft_tokens,
-                    )
+                    if (
+                        spec_config.use_ddtree()
+                        and spec_decode_metadata.ddtree_metadata is not None
+                    ):
+                        if ddtree_accepted_node_indices is None:
+                            raise ValueError(
+                                "DDTree accepted-node metadata is required to "
+                                "prepare the next drafter input."
+                            )
+                        if not isinstance(self.drafter, DDTreeProposer):
+                            raise TypeError(
+                                "DDTree drafter input preparation requires "
+                                f"DDTreeProposer, got {type(self.drafter).__name__}"
+                            )
+                        common_attn_metadata, token_indices = (
+                            self.drafter.prepare_ddtree_inputs(
+                                common_attn_metadata,
+                                sampled_token_ids,
+                                spec_decode_metadata.num_draft_tokens,
+                                ddtree_accepted_node_indices,
+                            )
+                        )
+                    else:
+                        common_attn_metadata, token_indices = (
+                            self.drafter.prepare_inputs(
+                                common_attn_metadata,
+                                sampled_token_ids,
+                                spec_decode_metadata.num_draft_tokens,
+                            )
+                        )
                     target_token_ids = self.input_ids.gpu[token_indices]
                     target_positions = self._get_positions(token_indices)
                     if self.use_aux_hidden_state_outputs:

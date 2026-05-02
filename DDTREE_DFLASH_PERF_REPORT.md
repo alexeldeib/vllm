@@ -2,38 +2,49 @@
 
 ## Scope
 
-This report focuses on the current vLLM DDTree integration as a DFlash
-extension: correctness evidence, the measured DFlash vs DDTree+DFlash delta, why
-the current workload profile is not yet representative of K2.5 serving, what is
-missing relative to the upstream DDTree prototype, and what blocks Kimi K2.5,
-Kimi K2.6, and GLM-5.1.
+This report covers the current vLLM DDTree integration as a DFlash extension:
+what is implemented, what has been validated on GB200, the measured DFlash vs
+DDTree+DFlash smoke deltas, what is now closer to upstream DDTree, and what
+still blocks Kimi K2.5/K2.6 and GLM-5.1.
 
-The detailed build log and clean-image validation remain in
-`DDTREE_VLLM_REPORT.md`. This file is the shorter performance and architecture
-readout.
+The detailed image-build history and earlier clean-image validation remain in
+`DDTREE_VLLM_REPORT.md`. This file is the focused performance and architecture
+readout for the DDTree path.
 
 ## Current State
 
 - vLLM branch: `alex/ddtree-vllm-integration`
 - Pushed review branch: `alexeldeib/vllm:alex/ddtree-vllm-integration`
-- Container branch: `coreweave/ml-containers:alex-ddtree-vllm-image`
-- Clean image:
+- Prior clean image:
   `ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-be7262e-74f6f52790887fb0729dde13928a12cb3d0a2dad`
-- Clean image manifest digest:
+- Prior clean image manifest digest:
   `sha256:425f069eefb838918cf77e09e16d3960e165fb5784ad183da197c5364aecd1be`
-- Platforms: `linux/amd64`, `linux/arm64`
-- Clean GB200 validation pod: `ddtree-vllm-ci`
+- Platforms for that image: `linux/amd64`, `linux/arm64`
+- Current monkeypatch validation pod: `ddtree-batch-vllm-test`
 - Cluster and namespace: `cw4637-dev-us-e-01a`, `ace-inference`
 - Runtime architecture: `aarch64`
-- vLLM package from image: `0.1.dev16269+g74f6f5279.d20260502`
+- vLLM package from base image: `0.1.dev16269+g74f6f5279.d20260502`
 
-The implementation is correctness-first:
+The current branch now implements the production-critical pieces for the
+standard full-attention DDTree path:
 
-- It adds speculative method `ddtree`.
-- It uses the DFlash drafter to generate parallel draft logits.
-- It builds a prefix-closed DDTree from those logits.
-- It verifies the dynamic tree in one target forward pass through `TREE_ATTN`.
-- It greedily walks the verified tree and emits the accepted path plus fallback.
+- Speculative method `ddtree`.
+- DFlash drafter integration for parallel draft logits.
+- Batched prefix-closed DDTree construction from a full request batch.
+- Batched 3D per-request tree attention bias for target verification.
+- `TREE_ATTN` target verification with per-request tree masks.
+- Greedy target walk that records accepted DDTree node indices.
+- Accepted-path KV compaction from scratch tree slots into canonical contiguous
+  paged-KV slots for standard full-attention KV cache.
+- Scheduler accounting for compacted DDTree accepted tokens, so accepted tree
+  nodes are not recomputed in the next step.
+- Immediate next-tree proposal after DDTree verification, using the actual
+  accepted tree-node path rather than assuming accepted nodes are a linear
+  prefix of the depth-ordered tree.
+- Batched top-k/logprob transfer for tree construction, reducing one CPU sync
+  per request to one CPU transfer per DDTree batch.
+- Triton qq-bias cleanup for the vector logical mask warning seen in the GB200
+  smoke tests.
 
 ## Correctness Evidence
 
@@ -42,26 +53,51 @@ All current correctness checks use greedy decoding, Qwen3-8B target weights, and
 
 | Environment | Check | Result |
 | --- | --- | --- |
-| Monkeypatch image | Import and unit smoke | Passed |
-| Monkeypatch image | 48-token target/TREE vs DFlash vs DDTree | Exact token ID match |
-| Monkeypatch image | 128-token DFlash vs DDTree, budgets 16, 32, 64 | Exact token ID match with DFlash |
-| Clean CI image | Import `vllm.v1.spec_decode.ddtree.DDTreeProposer` | Passed |
-| Clean CI image | 48-token target/TREE vs DFlash vs DDTree, budget 32 | Exact token ID match |
-| Clean CI image | 128-token DFlash vs DDTree, budget 64 | Exact token ID match with DFlash |
+| Local source | `python3 -m py_compile` for modified DDTree, scheduler, worker, attention, output, config, and test files | Passed |
+| Local source | `git diff --check` | Passed |
+| Monkeypatch GB200 pod | Direct batched DDTree unit smoke | Passed |
+| Monkeypatch GB200 pod | 3D qq-bias Triton kernel check | `max_diff 0.0`, passed |
+| Monkeypatch GB200 pod | 4-request Qwen3-8B + DFlash/DDTree generate, `TREE_ATTN`, budget 32, immediate re-proposal enabled | Passed |
+| Monkeypatch GB200 pod | Target-only greedy vs DDTree+DFlash greedy, same prompts, token IDs | Exact match |
+| Earlier monkeypatch image | 48-token target/TREE vs DFlash vs DDTree | Exact token ID match |
+| Earlier monkeypatch image | 128-token DFlash vs DDTree, budgets 16, 32, 64 | Exact token ID match with DFlash |
+| Earlier clean CI image | Import `vllm.v1.spec_decode.ddtree.DDTreeProposer` | Passed |
+| Earlier clean CI image | 48-token target/TREE vs DFlash vs DDTree, budget 32 | Exact token ID match |
+| Earlier clean CI image | 128-token DFlash vs DDTree, budget 64 | Exact token ID match with DFlash |
 
-The 128-token smoke had one important caveat: DFlash and DDTree diverged
-together from the non-spec target at the same token. Since DDTree exactly matched
-DFlash in that run, this looks like an existing DFlash/spec baseline behavior in
-the eager single-request harness rather than a DDTree-specific correctness
-issue.
+The newest target-only comparison used two prompts, `temperature=0.0`,
+`max_tokens=16`, and compared output token IDs exactly:
+
+```text
+DDTree greedy output matches target-only baseline
+```
+
+This is the key correctness check for accepted-KV compaction because the
+scheduler now advances `num_computed_tokens` through compacted accepted tree
+nodes instead of recomputing them.
 
 ## Measured Performance
 
-These are smoke-test numbers, not serving economics. They use one prompt,
-`max_num_seqs=1`, and eager execution on GB200. They are useful for integration
-directionality, but they should not be used as final workload claims.
+These are smoke-test numbers, not final serving economics. They run on the
+GB200 monkeypatch pod, eager mode, Qwen3-8B target, `z-lab/Qwen3-8B-DFlash-b16`
+drafter, `max_num_seqs=4`, `max_num_batched_tokens=4096`, four prompts, and
+`max_tokens=64`. Both rows force the target verifier through `TREE_ATTN` to avoid
+comparing different target attention backends.
 
-Clean image on `ddtree-vllm-ci`:
+| Mode | Budget | Output tokens | Elapsed generation time | Output tokens/s | Delta vs DFlash |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| DFlash, `TREE_ATTN` target | n/a | 256 | 1.9997s | 128.02 | n/a |
+| DDTree+DFlash, `TREE_ATTN` target | 32 | 256 | 1.3401s | 191.03 | +49.2% |
+
+This result should be interpreted as a strong integration smoke signal, not as a
+serving SLO claim. It benefits from accepted-KV compaction and a small fixed
+prompt set. The correct next performance step is a Rebench-shaped workload:
+full trace shape, no artificial request-count truncation, and a DFlash vs
+DDTree+DFlash comparison with only the speculative method and tree budget
+changed.
+
+Earlier clean-image single-request smoke numbers, before batched accepted-KV
+compaction, were:
 
 | Mode | Budget | Tokens | Tokens/s | Delta vs DFlash | Correctness |
 | --- | ---: | ---: | ---: | ---: | --- |
@@ -71,20 +107,9 @@ Clean image on `ddtree-vllm-ci`:
 | DFlash | n/a | 128 | 17.08 | n/a | Baseline for longer smoke |
 | DDTree+DFlash | 64 | 128 | 20.90 | +22.4% | Exact match with DFlash |
 
-Earlier monkeypatch validation on the v0.20.0-derived image showed the same
-direction:
-
-| Mode | Budget | Tokens | Tokens/s | Delta vs DFlash |
-| --- | ---: | ---: | ---: | ---: |
-| DFlash | n/a | 48 | 7.30 | n/a |
-| DDTree+DFlash | 32 | 48 | 8.93 | +22.4% |
-| DFlash | n/a | 128 | 18.71 | n/a |
-| DDTree+DFlash | 64 | 128 | 20.84 | +11.4% |
-
-The result is directionally good: DDTree is already faster than DFlash in the
-single-request harness. It is not yet the DDTree paper/site result shape because
-we have not implemented the performance-critical KV reuse path, and we are not
-benchmarking a serving workload yet.
+The new batched compaction result is directionally consistent with the DDTree
+algorithm: once accepted target KVs are retained, the verifier pass does useful
+work beyond sampling and avoids recomputing the accepted path.
 
 ## Workload Profile Gap
 
@@ -109,101 +134,83 @@ request-count-bounded Rebench rows sampled shallow prefixes at high concurrency;
 the no-delay full replay reaches late turns with large cached context. That is
 the right workload shape for K2.5 serving economics.
 
-The current DDTree implementation cannot run that serving sweep yet. In
-`gpu_model_runner.py`, DDTree explicitly raises if more than one request is
-scheduled in a verification step:
+What changed with this patch:
 
-```text
-DDTree currently supports one scheduled request per step.
-```
+- The old single-active-request DDTree limitation is removed for standard
+  full-attention `TREE_ATTN` verification.
+- A Qwen3-style batched DDTree serving-profile test is now technically possible.
+- The actual K2.5 no-delay sweep is still blocked because K2.5 uses MLA/HND/fp8
+  KV cache, not the standard full-attention `TREE_ATTN` cache path implemented
+  here.
 
-So a C=4,8,16,32,48 AIPerf comparison would currently be invalid or would fail.
-The closest honest apples-to-apples profile today is:
+The closest honest workload ladder is now:
 
-1. Replay the same Rebench no-delay trace shape at C=1, or run an offline
-   sequential full-trace harness over the same 2,025 turns.
-2. Compare DFlash vs DDTree+DFlash with only the speculative method and tree
-   budget changed.
-3. Record token equality for a fixed greedy configuration.
-4. Collect per-step timers for drafter forward, tree build, verifier forward,
-   sampler walk, accepted length, and catch-up/recompute.
-5. After batched DDTree lands, repeat the real AIPerf no-delay sweep at
-   C=4,8,16,32,48.
+1. Run an offline or server-backed Qwen3 full-trace replay shape with
+   `max_num_seqs` swept above 1, comparing DFlash vs DDTree+DFlash.
+2. Add stage timers and acceptance counters to decompose draft forward, tree
+   build, verifier forward, sampler walk, KV compaction, and next-draft prep.
+3. Validate the public Kimi K2.5 DFlash drafter with DFlash alone.
+4. Implement MLA tree verification and MLA accepted-KV compaction.
+5. Then rerun the real K2.5 AIPerf no-delay sweep at `C=4,8,16,32,48`.
 
 ## Upstream Parity
 
-We matched the algorithmic skeleton from the upstream/local DDTree prototype:
+We now match more of the upstream/local DDTree performance architecture than the
+earlier correctness-first branch.
 
-- DFlash block logits
-- Heap-based prefix-closed tree construction
-- Root/ancestor/self tree visibility
-- One target verification pass
-- Greedy target walk
-
-We have not matched the performance architecture of the prototype.
-
-| Area | Upstream/local prototype | Current vLLM branch | Impact |
+| Area | Upstream/local prototype | Current vLLM branch | Status |
 | --- | --- | --- | --- |
-| Tree construction | CPU heap after top-k logits copied to CPU | Same broad approach | CPU sync exists, but this is not the main parity gap |
-| Greedy tree walk | Converts target posterior to Python list | Same broad approach | CPU sync exists, but likely secondary |
-| Buffer reuse | Preallocates verify input, positions, and tree visibility buffers | Rebuilds dynamic bias and metadata per step | Avoidable overhead |
-| Accepted KV reuse | Compacts target `past_key_values` to keep accepted verified nodes | Verifies into scratch slots, then recomputes accepted tokens canonically | Major missing DDTree speedup |
-| Cache compaction implementation | Has Python compaction plus optional inline C++ tail compaction | Not implemented for vLLM paged KV cache | Major parity gap |
-| Serving batch support | Prototype is offline/single sequence | vLLM path is single active request | Blocks real serving benchmarks |
+| DFlash proposal logits | Uses DFlash logits | Uses DFlash logits | Matched for Qwen3 DFlash path |
+| Tree construction | Heap-based prefix-closed tree after top-k | Same algorithm; top-k/logprob transfer is batched across requests | Mostly matched, still CPU heap |
+| Tree visibility | Root/ancestor/self mask | Batched 3D per-request dense qq-bias | Matched for full attention |
+| Target verification | One target pass over tree | One target pass over batched trees through `TREE_ATTN` | Matched for full attention |
+| Greedy tree walk | Greedy walk over target posterior | Greedy walk, now records accepted node indices | Matched for greedy |
+| Accepted KV reuse | Retains accepted verified nodes | Compacts accepted nodes from scratch paged-KV slots to canonical slots | Matched for standard full-attention, no context parallelism |
+| Next proposal | Reuses the accepted path immediately | Re-proposes immediately from the actual accepted tree-node path | Matched for standard full-attention greedy path |
+| Serving batch | Prototype is offline/single sequence | vLLM batch support for standard full attention | Improved beyond prototype envelope |
+| MLA / fp8 KV | Not the prototype focus | Not implemented | Missing for Kimi/GLM |
+| Stochastic sampling | Not covered by current branch | Not implemented | Missing |
+| Logprobs | Not covered by current branch | Not implemented | Missing |
 
-The CPU sync is real and worth removing, but it is not the reason we are below
-the expected upstream DDTree gains. The upstream prototype also synchronizes for
-top-k tree construction and tree following. The larger gap is that upstream
-retains the target KVs for the accepted path; our vLLM path throws away that
-advantage by verifying in scratch slots and then doing canonical catch-up.
-
-## Stacked Optimization Plan
-
-| Step | What changes | Why it matters | Expected value |
-| --- | --- | --- | --- |
-| Current branch | DDTree+DFlash with scratch verification | Already proves correctness and direction | +22.4% vs DFlash on clean 128-token smoke; +42.3% on clean 48-token smoke |
-| Apples-to-apples C=1 Rebench | Use full no-delay trace shape without serving concurrency | Replaces toy prompt with realistic prompt growth and output caps | Determines whether gains survive real turn distribution |
-| Stage timers | Add timers/counters for draft, tree build, verify, sample, accepted length, catch-up | Shows which overhead dominates in vLLM | Required before optimizing blindly |
-| TREE_ATTN baseline control | Compare DFlash under the same target backend constraints when possible | Separates DDTree benefit from backend tax | Makes the comparison cleaner |
-| Preallocate tree buffers | Reuse attention bias/input/position buffers per runner | Removes obvious allocation overhead | Modest, low risk |
-| GPU/async tree build and sampler | Keep top-k expansion and target walk on GPU, or overlap CPU work | Removes CPU sync stalls | Useful, but not sufficient for upstream parity |
-| Accepted KV reuse | Compact/remap accepted verified target KVs into canonical cache slots | Avoids recomputing tokens DDTree already verified | High impact; required for real DDTree speedup |
-| Batched DDTree | Carry per-request tree metadata and masks for multiple active requests | Enables serving workloads and AIPerf concurrency sweeps | Required for production relevance |
-| MLA/DSA tree verification | Implement tree visibility in MLA/DSA attention backends and cache layouts | Enables Kimi and GLM families | Required for stretch models |
+The remaining CPU sync is now less severe: tree construction still moves top-k
+data to CPU for heap expansion, but it does so once per batch rather than once
+per request. A fully GPU-resident tree builder and sampler would still help, but
+the larger upstream parity gap, accepted-KV retention, is now closed for the
+standard full-attention path.
 
 ## Current Architecture Limits
 
-The current branch is intentionally narrow. It supports a full-attention,
-greedy, single-request path and has not been generalized to the large
-MLA/MoE/hybrid models we care about next.
+The current implementation is production-shaped for Qwen3-style full-attention
+greedy DDTree on one context-parallel rank. It is not yet a universal DDTree
+implementation across all vLLM model families.
 
 Current limitations:
 
 - Greedy decoding only.
 - Logprobs are not implemented.
-- One active request per DDTree verification step.
 - Async scheduling is disabled for DDTree.
+- CUDAGraph/compile is still effectively disabled for dynamic DDTree execution
+  in the validated path.
 - Target model must use `attention_backend="TREE_ATTN"`.
-- Drafter path is DFlash-based and currently tied to the Qwen3 DFlash draft
-  model implementation.
-- `TREE_ATTN` supports standard full-attention KV cache shape, not MLA cache
-  layout.
+- Accepted-KV compaction supports standard full-attention 5D KV cache tensors
+  shaped like `(2, num_blocks, block_size, num_kv_heads, head_size)`.
+- Accepted-KV compaction is disabled when context parallelism is active because
+  compaction may need cross-rank KV movement.
 - `TREE_ATTN` supports `auto`, `float16`, and `bfloat16` KV cache dtypes, not
   fp8 KV cache.
 - Dynamic tree attention bias is dense and rebuilt per step.
-- Verified target KVs are not retained for the accepted path.
 - M-RoPE, XD-RoPE, multimodal inputs, tensor parallelism, expert parallelism,
-  and MoE routing under DDTree are not validated.
+  MoE routing, and hybrid stateful attention under DDTree are not validated.
 - Hybrid stateful attention models are not supported. The Qwen3.5 hybrid
-  GDN/linear-attention path already failed in multi-node DDTree validation.
+  GDN/linear-attention path already failed in earlier DDTree validation.
 
 MoE itself is not necessarily the hard blocker. The harder blockers are the
-attention/cache architecture, serving batch shape, and whether a compatible
-DFlash drafter exists.
+attention/cache architecture, distributed cache movement, and whether a
+compatible DFlash drafter exists and is validated for the target model.
 
 ## Kimi K2.5 and Kimi K2.6
 
-Kimi K2.5 and Kimi K2.6 are outside the current DDTree support envelope.
+Kimi K2.5 and Kimi K2.6 are still outside the current DDTree support envelope.
 
 Relevant current facts:
 
@@ -219,14 +226,11 @@ Relevant current facts:
   `moonshotai/Kimi-K2.5`, block size 8, 6 draft layers, hidden size 7168, 61
   target layers, `mask_token_id=163838`, and target hidden layer IDs
   `[1, 12, 24, 35, 47, 58]`.
-- Our local vLLM speculative config already lists `kimi_k2` and `kimi_k25` in
-  the aux-hidden-state supported set for DFlash/DDTree-style methods. That means
-  hidden-state plumbing is probably not the first blocker.
 - The vLLM draft model registry maps `DFlashDraftModel` to the existing
-  `DFlashQwen3ForCausalLM` implementation. The Kimi drafter config uses
-  `model_type="qwen3"` and Qwen3-style DFlash custom code, so it is plausibly
-  compatible with the existing DFlash draft-model path. This still needs a real
-  load/run validation against `moonshotai/Kimi-K2.5`.
+  DFlash implementation. The Kimi drafter config uses `model_type="qwen3"` and
+  Qwen3-style DFlash custom code, so it is plausibly compatible with the
+  existing DFlash path. This still needs real load/run validation against
+  `moonshotai/Kimi-K2.5`.
 
 What Kimi support would take:
 
@@ -235,18 +239,17 @@ What Kimi support would take:
    DDTree uses DFlash logits as its proposal distribution. The public
    `z-lab/Kimi-K2.5-DFlash` checkpoint likely removes the need to train or
    obtain a Kimi K2.5 drafter. The remaining work is to verify that vLLM can
-   load it through the `DFlashDraftModel` registry path, that target hidden
-   states are gathered from the intended Kimi layers, that tensor-parallel
-   partitioning works, and that DFlash alone is correct and performant before
-   layering DDTree on top.
+   load it through the `DFlashDraftModel` path, target hidden states are
+   gathered from the intended Kimi layers, tensor-parallel partitioning works,
+   and DFlash alone is correct and performant before layering DDTree on top.
 
 2. Add tree verification to MLA attention.
 
    Kimi's production path uses MLA, not standard full attention. The current
    DDTree verifier requires `TREE_ATTN`, whose KV cache shape and supported KV
-   dtypes do not match Kimi's MLA path. We need the root/ancestor/self visibility
-   semantics in an MLA backend such as FlashInfer MLA, FlashMLA, or another
-   selected Kimi backend.
+   dtypes do not match Kimi's MLA path. We need the root/ancestor/self
+   visibility semantics in an MLA backend such as FlashInfer MLA, FlashMLA, or
+   the selected production Kimi backend.
 
 3. Support Kimi KV cache layout and dtype.
 
@@ -254,29 +257,25 @@ What Kimi support would take:
    way to write scratch verified tree nodes and then retain or compact accepted
    nodes in the MLA cache format.
 
-4. Support tensor/expert parallel serving.
+4. Support distributed serving.
 
-   K2.5 GB200 recipes use multi-GPU tensor parallelism. DDTree metadata,
-   verifier logits, accepted-token sampling, and drafter hidden states all need
-   to be correct under TP and MoE routing.
+   K2.5 GB200 recipes use multi-GPU tensor parallelism and may use parallelism
+   combinations where accepted-KV compaction needs rank-aware movement. DDTree
+   metadata, verifier logits, accepted-token sampling, and drafter hidden states
+   all need to be correct under TP and MoE routing.
 
-5. Add batched DDTree.
-
-   K2.5 serving economics are measured with concurrent chat requests. A
-   single-active-request implementation cannot validate or ship that workload.
-
-6. Start text-only.
+5. Start text-only.
 
    Kimi is multimodal, but the shortest path is text-only Kimi DDTree first.
    Image/video handling can follow once text-only MLA, TP, and batching work.
 
 Practical estimate: Kimi support is still a medium-to-large project, not a small
 model registration change. The public Kimi K2.5 DFlash drafter removes one major
-dependency for K2.5. The hard work is now MLA tree verification, KV retention,
-TP, batching, and validation under the Rebench-shaped workload. Kimi K2.6 has
-the same architecture, but the K2.5 drafter should not be assumed to give the
-same acceptance on K2.6 weights; it can be tried as a bootstrap, but a K2.6-tuned
-drafter or acceptance/performance validation is still required.
+dependency for K2.5. The hard work is now MLA tree verification, MLA KV
+retention/compaction, TP, and validation under the Rebench-shaped workload. Kimi
+K2.6 has the same architecture, but the K2.5 drafter should not be assumed to
+give the same acceptance on K2.6 weights; it can be tried as a bootstrap, but a
+K2.6-tuned drafter or acceptance/performance validation is still required.
 
 ## GLM-5.1
 
@@ -297,10 +296,10 @@ What GLM-5.1 support would take:
 1. Confirm the exact target model config and serving backend we plan to use.
 2. Build or obtain a GLM-compatible DFlash drafter.
 3. Add DDTree verification semantics to the GLM MLA + DSA attention path.
-4. Define cache scratch, accepted-node retention, and compaction for both MLA KV
-   state and DSA/indexer state.
+4. Define scratch, accepted-node retention, and compaction for both MLA KV state
+   and DSA/indexer state.
 5. Validate MoE routing, TP/EP behavior, and distributed sampler correctness.
-6. Add batched DDTree before any serving-level Rebench/AIPerf claim.
+6. Run DFlash-only correctness/performance before adding DDTree.
 
 The DSA part is the warning sign. DDTree is straightforward when a token's
 future state is just full-attention KV. With DSA or other stateful/hybrid
@@ -313,20 +312,23 @@ the current support envelope.
 
 Short term:
 
-1. Keep the current branch scoped to Qwen3 full-attention correctness.
-2. Run a full-depth no-delay Rebench-shaped C=1/offline comparison for DFlash vs
-   DDTree+DFlash.
-3. Add stage timers and acceptance counters before doing more performance work.
-4. Implement accepted KV reuse/compaction before spending much time on GPU-only
-   tree build optimizations.
+1. Keep this vLLM branch focused on Qwen3/full-attention DDTree and land the
+   batched accepted-KV implementation cleanly.
+2. Trigger a fresh multi-arch `vllm-tensorizer` image build from the new vLLM
+   commit, because the prior clean image predates batched compaction.
+3. Run a Qwen3 no-delay Rebench-shaped comparison for DFlash vs DDTree+DFlash at
+   C=1 and then a small concurrency sweep.
+4. Add stage timers and acceptance counters before optimizing further.
 
 Medium term:
 
-1. Add batched DDTree for standard full attention.
-2. Rerun the real AIPerf no-delay sweep at C=4,8,16,32,48.
-3. Compare stacked deltas: DFlash baseline, DDTree scratch, DDTree with buffer
-   reuse, DDTree with GPU/async tree build, DDTree with accepted KV reuse, and
-   DDTree batched.
+1. Preallocate/reuse tree bias and metadata buffers to reduce allocation churn.
+2. Move tree expansion and/or tree walk closer to GPU-resident execution if
+   timers show CPU sync is material after compaction.
+3. Validate non-eager execution and decide whether DDTree can safely use
+   compile/CUDAGraph bucketing for common tree budgets.
+4. Add stochastic sampling and logprob support or enforce DDTree eligibility
+   earlier per request.
 
 Stretch models:
 

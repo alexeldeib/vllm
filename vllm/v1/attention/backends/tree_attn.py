@@ -134,6 +134,9 @@ class TreeAttentionMetadata:
         q_start_loc = self.query_start_loc[: self.num_decodes + 1]
         q_seqlens = torch.diff(q_start_loc)
         kv_seqlens = self.seq_lens[: self.num_decodes]
+        tree_attn_bias = self.tree_attn_bias
+        if tree_attn_bias is not None and tree_attn_bias.dim() == 3:
+            tree_attn_bias = tree_attn_bias[: self.num_decodes]
         # Construct & cache decode-phase attention metadata structure
         self._cached_decode_metadata = TreeAttentionMetadata(
             num_actual_tokens=self.num_decode_tokens,
@@ -143,7 +146,7 @@ class TreeAttentionMetadata:
             seq_lens=kv_seqlens,
             block_table=self.block_table[: self.num_decodes],
             slot_mapping=self.slot_mapping[: self.num_decode_tokens],
-            tree_attn_bias=self.tree_attn_bias,
+            tree_attn_bias=tree_attn_bias,
         )
         return self._cached_decode_metadata
 
@@ -187,7 +190,7 @@ class TreeAttentionMetadataBuilder(AttentionMetadataBuilder[TreeAttentionMetadat
         tree_attn_bias = common_attn_metadata.tree_attn_bias
         if tree_attn_bias is None:
             tree_attn_bias = self.tree_attn_bias
-        decode_threshold = tree_attn_bias.shape[0]
+        decode_threshold = tree_attn_bias.shape[-1]
         num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
             split_decodes_and_prefills(
                 common_attn_metadata, decode_threshold=decode_threshold
