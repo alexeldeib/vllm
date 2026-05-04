@@ -145,6 +145,45 @@ AIPerf sweep. The run intentionally used a shorter context limit and lower
 on K2.5 remains guarded until native MLA tree verification and MLA accepted-KV
 compaction are implemented.
 
+### Baseline Comparison
+
+The same bounded no-delay workload was also run against a target-only baseline
+pod with the same image family, target weights, TP4/NVFP4 settings, TRT-LLM
+ragged DeepSeek prefill, `max_model_len=32768`, `max_num_batched_tokens=8192`,
+and `max_num_seqs=8`.
+
+| Mode | Requests | C | max_tokens | Wall s | Req/s | Output tok/s | Total tok/s | Mean latency s | P50 latency s | P95 latency s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Target only | 32 | 8 | 64 | 4.386 | 7.296 | 466.956 | 625.647 | 1.094 | 1.088 | 1.129 |
+| DFlash only | 32 | 8 | 64 | 3.511 | 9.115 | 583.345 | 781.591 | 0.837 | 0.836 | 1.266 |
+
+On this smoke workload, DFlash-only improved request rate, output throughput,
+and total token throughput by about 24.9% over the no-spec baseline. Mean
+latency improved by 23.5% and p50 latency improved by 23.2%. P95 latency was
+12.1% worse in this single short run, so tail latency needs a longer repeated
+Rebench/AIPerf-style run before drawing a production conclusion.
+
+There is no valid K2.5 DDTree-vs-DFlash number yet. The current K2.5 target
+uses MLA, and DDTree is intentionally guarded until the verifier supports MLA
+tree masks and accepted MLA KV compaction. The K2.5 comparison above is
+therefore no-spec baseline vs DFlash-only, not DDTree+DFlash vs DFlash-only.
+
+### Image Build
+
+An `ml-containers` image build was started for the top of the review stack:
+
+- Repo: `coreweave/ml-containers`
+- Branch: `alex-ddtree-kimi-glm-wsfix-image`
+- Commit: `432bfa9`
+- Workflow run: `https://github.com/coreweave/ml-containers/actions/runs/25298422553`
+- vLLM repo: `https://github.com/alexeldeib/vllm`
+- vLLM commit: `4c400cdbd65a2e616a2134695997c2f4b1d320a5`
+- Expected image tag after the manifest merge:
+  `ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-kimi-glm-wsfix-image-432bfa9-4c400cdbd65a2e616a2134695997c2f4b1d320a5`
+
+The workflow is using the shared build workflow default platforms
+`linux/amd64,linux/arm64`, matching the multi-arch behavior on `main`.
+
 ## Why K2.5 DDTree Is Still Guarded
 
 The serving K2.5 pods use MLA attention and FP8 KV cache with TRT-LLM ragged
