@@ -16,8 +16,8 @@
 
 3. `alex/ddtree-glm51-scaffold`
    - GLM 5.1 scaffolding branch.
-   - Intended to add aux-hidden-state support for GLM MoE targets and keep it
-     behind the same verifier capability checks until GLM can be tested.
+   - Adds aux-hidden-state support for GLM MoE targets and keeps DDTree behind
+     the same verifier capability checks until GLM can be tested.
 
 ## Current K2.5 Cluster Baseline
 
@@ -255,8 +255,9 @@ so it cannot be validated yet. Its config uses:
 - `--max-num-batched-tokens=8192`
 - `--max-num-seqs=10`
 
-GLM 5.1 should be added after Kimi by first enabling aux hidden-state capture
-for the GLM MoE target class and keeping DDTree behind the same verifier guard.
-If GLM 5.1 remains standard attention, `TREE_ATTN` may be enough for DDTree. If
-the selected GLM target path is MLA or another specialized attention path, it
-needs the same tree-verification support as Kimi before DDTree can be enabled.
+The GLM scaffold branch enables aux hidden-state capture for the GLM MoE target
+class and allows GLM MoE model types through speculative config validation. This
+does not enable untested DDTree execution by itself. If GLM 5.1 remains standard
+attention, `TREE_ATTN` may be enough for DDTree. If the selected GLM target path
+is MLA or another specialized attention path, it needs the same tree-verification
+support as Kimi before DDTree can be enabled.

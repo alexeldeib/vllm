@@ -1005,6 +1005,8 @@ class SpeculativeConfig:
             "nemotron_h",
             "deepseek_v2",
             "deepseek_v3",
+            "glm4_moe",
+            "glm_moe_dsa",
             "kimi_k2",
             "kimi_k25",
             "minimax_m2",
