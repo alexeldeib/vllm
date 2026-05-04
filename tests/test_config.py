@@ -1288,6 +1288,33 @@ def test_eagle_draft_model_config():
     assert draft_model_config.architecture == "EagleLlamaForCausalLM"
 
 
+def test_dflash_aux_layer_ids_affect_speculative_config_hash():
+    def config_with_layers(layer_ids):
+        return SpeculativeConfig(
+            method="dflash",
+            num_speculative_tokens=4,
+            draft_model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    dflash_config={"target_layer_ids": layer_ids}
+                )
+            ),
+        )
+
+    assert config_with_layers([1, 12, 24]).compute_hash() != config_with_layers(
+        [1, 12, 25]
+    ).compute_hash()
+
+
+def test_dflash_aux_layer_ids_accept_compatibility_alias():
+    hf_config = SimpleNamespace(dflash_config={"layer_ids": [1, 12, 24]})
+
+    assert SpeculativeConfig.get_aux_hidden_state_layer_ids(hf_config) == (
+        1,
+        12,
+        24,
+    )
+
+
 def test_ir_op_priority_default():
     """Test that IR op priority defaults are set correctly."""
     from vllm.config.kernel import IrOpPriorityConfig

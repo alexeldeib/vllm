@@ -293,17 +293,36 @@ class SpeculativeConfig:
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
-            layer_ids = getattr(
-                self.draft_model_config.hf_config,
-                "eagle_aux_hidden_state_layer_ids",
-                None,
+            layer_ids = self.get_aux_hidden_state_layer_ids(
+                self.draft_model_config.hf_config
             )
             if layer_ids is not None:
-                # Convert to tuple to make it hashable
-                factors.append(tuple(layer_ids))
+                factors.append(layer_ids)
 
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
+
+    @staticmethod
+    def get_aux_hidden_state_layer_ids(
+        hf_config: PretrainedConfig,
+    ) -> tuple[int, ...] | None:
+        """Extract target aux-hidden layers from Eagle3/DFlash draft config."""
+        layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
+        if layer_ids is None:
+            dflash_config = getattr(hf_config, "dflash_config", None)
+            if dflash_config and isinstance(dflash_config, dict):
+                layer_ids = dflash_config.get("target_layer_ids")
+                if layer_ids is None:
+                    layer_ids = dflash_config.get("layer_ids")
+
+        if layer_ids is None:
+            return None
+        if not isinstance(layer_ids, (list, tuple)):
+            raise ValueError(
+                "Aux hidden-state layer ids must be a list or tuple, got "
+                f"{type(layer_ids).__name__}."
+            )
+        return tuple(int(layer_id) for layer_id in layer_ids)
 
     @staticmethod
     def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:

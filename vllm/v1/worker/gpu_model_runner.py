@@ -29,6 +29,7 @@ from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import (
     CompilationMode,
     CUDAGraphMode,
+    SpeculativeConfig,
     VllmConfig,
     get_layers_from_vllm_config,
     set_current_vllm_config,
@@ -568,8 +569,11 @@ class GPUModelRunner(
                     != AttentionBackendEnum.TREE_ATTN
                 ):
                     raise ValueError(
-                        "DDTree target verification requires "
-                        "attention_backend='TREE_ATTN' for the target model."
+                        "DDTree target verification requires the target model "
+                        "to use attention_backend='TREE_ATTN'. MLA targets "
+                        "such as Kimi/DeepSeek/GLM FP8/NVFP4 still need a "
+                        "native MLA tree-verification backend before DDTree "
+                        "can be enabled correctly."
                     )
                 self.drafter = DDTreeProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -5497,14 +5501,10 @@ class GPUModelRunner(
 
         hf_config = self.speculative_config.draft_model_config.hf_config
 
-        layer_ids = getattr(hf_config, "eagle_aux_hidden_state_layer_ids", None)
-        if not layer_ids:
-            dflash_config = getattr(hf_config, "dflash_config", None)
-            if dflash_config and isinstance(dflash_config, dict):
-                layer_ids = dflash_config.get("target_layer_ids")
+        layer_ids = SpeculativeConfig.get_aux_hidden_state_layer_ids(hf_config)
 
-        if layer_ids and isinstance(layer_ids, (list, tuple)):
-            return tuple(layer_ids)
+        if layer_ids:
+            return layer_ids
 
         return None
 
