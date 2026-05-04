@@ -564,16 +564,17 @@ class GPUModelRunner(
                     self.max_num_reqs, dtype=torch.int32, pin_memory=True
                 )
             elif self.speculative_config.use_ddtree():
-                if (
-                    self.vllm_config.attention_config.backend
-                    != AttentionBackendEnum.TREE_ATTN
-                ):
+                backend = self.vllm_config.attention_config.backend
+                backend_supports_ddtree = backend == AttentionBackendEnum.TREE_ATTN
+                if not backend_supports_ddtree and backend is not None:
+                    backend_supports_ddtree = backend.get_class().is_mla()
+                if not backend_supports_ddtree and backend is None:
+                    backend_supports_ddtree = self.model_config.use_mla
+                if not backend_supports_ddtree:
                     raise ValueError(
                         "DDTree target verification requires the target model "
-                        "to use attention_backend='TREE_ATTN'. MLA targets "
-                        "such as Kimi/DeepSeek/GLM FP8/NVFP4 still need a "
-                        "native MLA tree-verification backend before DDTree "
-                        "can be enabled correctly."
+                        "to use attention_backend='TREE_ATTN' or an MLA "
+                        "attention backend with DDTree tree verification."
                     )
                 self.drafter = DDTreeProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -819,6 +820,8 @@ class GPUModelRunner(
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self._ddtree_attn_bias: torch.Tensor | None = None
+        self._ddtree_tree_start_loc_cpu: torch.Tensor | None = None
+        self._ddtree_tree_lens_cpu: torch.Tensor | None = None
         self._spec_decode_debug_metrics = (
             os.environ.get("SPEC_DECODE_DEBUG_METRICS") == "1"
         )
@@ -1859,6 +1862,8 @@ class GPUModelRunner(
             else None
         )
         self._ddtree_attn_bias = None
+        self._ddtree_tree_start_loc_cpu = None
+        self._ddtree_tree_lens_cpu = None
 
         # Storage positions are unique KV-cache slots assigned by the scheduler.
         # DDTree may use different model positions because siblings at the same
@@ -1882,29 +1887,71 @@ class GPUModelRunner(
         if ddtree_scheduled_metadata:
             positions_np = storage_positions_np.copy()
             ddtree_metadata_by_req: list[DDTreeRequestMetadata | None] = []
+            ddtree_query_lens: list[int] = []
+            ddtree_tree_offsets: list[int] = []
+            ddtree_tree_start_loc_cpu = torch.full(
+                (num_reqs,),
+                -1,
+                dtype=torch.int32,
+                pin_memory=is_pin_memory_available(),
+            )
+            ddtree_tree_lens_cpu = torch.zeros(
+                (num_reqs,),
+                dtype=torch.int32,
+                pin_memory=is_pin_memory_available(),
+            )
             for req_idx, req_id in enumerate(self.input_batch.req_ids):
                 tree_metadata = ddtree_scheduled_metadata.get(req_id)
                 ddtree_metadata_by_req.append(tree_metadata)
+                num_sched = int(num_scheduled_tokens[req_idx])
+                ddtree_query_lens.append(num_sched)
+                ddtree_tree_offsets.append(0)
                 if tree_metadata is None:
                     continue
 
                 req_start = 0 if req_idx == 0 else int(cu_num_tokens[req_idx - 1])
-                num_sched = int(num_scheduled_tokens[req_idx])
                 tree_len = len(tree_metadata.node_depths) + 1
-                if tree_len != num_sched:
+                if tree_len > num_sched:
                     raise ValueError(
                         "DDTree metadata does not match scheduled token count: "
-                        f"{tree_len} != {num_sched}"
-                    )
-                base_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
-                positions_np[req_start] = base_pos
+                        f"{tree_len} > {num_sched}"
+                )
+                tree_offset = num_sched - tree_len
+                ddtree_tree_offsets[req_idx] = tree_offset
+                tree_start = req_start + tree_offset
+                base_pos = (
+                    self.input_batch.num_computed_tokens_cpu[req_idx]
+                    + tree_offset
+                )
+                ddtree_tree_start_loc_cpu[req_idx] = tree_start
+                ddtree_tree_lens_cpu[req_idx] = tree_len
+                positions_np[tree_start] = base_pos
                 for i, depth in enumerate(tree_metadata.node_depths, start=1):
-                    positions_np[req_start + i] = base_pos + depth
+                    positions_np[tree_start + i] = base_pos + depth
 
             with self._spec_debug_timer("ddtree_attention_bias"):
-                self._ddtree_attn_bias = make_batched_ddtree_attention_bias(
+                ddtree_attn_bias = make_batched_ddtree_attention_bias(
                     ddtree_metadata_by_req, device=self.device
                 )
+                if any(ddtree_tree_offsets):
+                    max_query_len = max(ddtree_query_lens)
+                    full_attn_bias = ddtree_attn_bias.new_zeros(
+                        (num_reqs, max_query_len, max_query_len)
+                    )
+                    for req_idx, tree_metadata in enumerate(ddtree_metadata_by_req):
+                        if tree_metadata is None:
+                            continue
+                        tree_offset = ddtree_tree_offsets[req_idx]
+                        tree_len = len(tree_metadata.node_depths) + 1
+                        full_attn_bias[
+                            req_idx,
+                            tree_offset : tree_offset + tree_len,
+                            tree_offset : tree_offset + tree_len,
+                        ] = ddtree_attn_bias[req_idx, :tree_len, :tree_len]
+                    ddtree_attn_bias = full_attn_bias
+                self._ddtree_attn_bias = ddtree_attn_bias
+            self._ddtree_tree_start_loc_cpu = ddtree_tree_start_loc_cpu
+            self._ddtree_tree_lens_cpu = ddtree_tree_lens_cpu
 
         # Get token indices.
         # E.g., [0, 1, 0, 1, 2, 3, 4, 0, 1, 2]
@@ -2288,6 +2335,8 @@ class GPUModelRunner(
             is_prefilling=is_prefilling,
             positions=self.positions[:num_tokens_padded],
             tree_attn_bias=self._ddtree_attn_bias,
+            tree_attn_start_loc_cpu=self._ddtree_tree_start_loc_cpu,
+            tree_attn_lens_cpu=self._ddtree_tree_lens_cpu,
         )
 
         if self.dcp_world_size > 1:
@@ -3718,11 +3767,32 @@ class GPUModelRunner(
             )
             return None
 
+        def is_full_attention_cache_spec(kv_cache_spec: KVCacheSpec) -> bool:
+            if isinstance(kv_cache_spec, FullAttentionSpec):
+                return True
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                return all(
+                    isinstance(spec, FullAttentionSpec)
+                    for spec in kv_cache_spec.kv_cache_specs.values()
+                )
+            return False
+
+        def get_compress_ratio(kv_cache_spec: KVCacheSpec) -> int:
+            if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+                ratios = {
+                    getattr(spec, "compress_ratio", 1)
+                    for spec in kv_cache_spec.kv_cache_specs.values()
+                }
+                if len(ratios) != 1:
+                    return -1
+                return ratios.pop()
+            return getattr(kv_cache_spec, "compress_ratio", 1)
+
         block_tables = self.input_batch.block_table.block_tables
         if not block_tables:
             return None
         for kv_cache_group in self.kv_cache_config.kv_cache_groups:
-            if not isinstance(kv_cache_group.kv_cache_spec, FullAttentionSpec):
+            if not is_full_attention_cache_spec(kv_cache_group.kv_cache_spec):
                 logger.warning_once(
                     "DDTree accepted-KV compaction is disabled for non-full "
                     "attention KV cache group %s; accepted tree nodes will be "
@@ -3739,8 +3809,18 @@ class GPUModelRunner(
             group_id = group.kv_cache_group_id
             if group_id >= len(kv_caches_by_group):
                 continue
-            if not isinstance(group.kv_cache_spec, FullAttentionSpec):
+            if not is_full_attention_cache_spec(group.kv_cache_spec):
                 continue
+            is_mla_cache = group.backend.is_mla()
+            compress_ratio = get_compress_ratio(group.kv_cache_spec)
+            if is_mla_cache and compress_ratio != 1:
+                logger.warning_once(
+                    "DDTree accepted-KV compaction is disabled for compressed "
+                    "MLA KV cache group %s; accepted tree nodes will be "
+                    "recomputed.",
+                    group_id,
+                )
+                return None
             for layer_name in group.layer_names:
                 layer = self.compilation_config.static_forward_context[layer_name]
                 kv_cache = getattr(layer, "kv_cache", None)
@@ -3751,7 +3831,16 @@ class GPUModelRunner(
                         layer_name,
                     )
                     return None
-                if kv_cache.dim() < 5 or kv_cache.shape[0] != 2:
+                if is_mla_cache:
+                    if kv_cache.dim() != 3:
+                        logger.warning_once(
+                            "DDTree accepted-KV compaction is disabled for MLA "
+                            "KV cache shape %s on layer %s.",
+                            tuple(kv_cache.shape),
+                            layer_name,
+                        )
+                        return None
+                elif kv_cache.dim() < 5 or kv_cache.shape[0] != 2:
                     logger.warning_once(
                         "DDTree accepted-KV compaction is disabled for KV cache "
                         "shape %s on layer %s.",
@@ -3783,6 +3872,15 @@ class GPUModelRunner(
             tree_metadata = spec_decode_metadata.ddtree_metadata[req_index]
             num_sched = num_scheduled_tokens[req_index]
             base_position = int(self.input_batch.num_computed_tokens_cpu[req_index])
+            tree_offset = 0
+            if tree_metadata is not None:
+                tree_len = len(tree_metadata.node_depths) + 1
+                if tree_len > num_sched:
+                    raise ValueError(
+                        "DDTree metadata is larger than the scheduled window "
+                        f"for request {req_id}: {tree_len} > {num_sched}"
+                    )
+                tree_offset = num_sched - tree_len
 
             for depth, node_index in enumerate(nodes, start=1):
                 if tree_metadata is None:
@@ -3800,8 +3898,8 @@ class GPUModelRunner(
                         "DDTree accepted path exceeds tree depth for request "
                         f"{req_id}: {depth} > {tree_metadata.max_depth}"
                     )
-                source_flat_indices.append(req_start + node_index)
-                dest_positions.append(base_position + depth)
+                source_flat_indices.append(req_start + tree_offset + node_index)
+                dest_positions.append(base_position + tree_offset + depth)
             dest_query_start.append(len(dest_positions))
 
         source_indices = torch.tensor(
@@ -3841,13 +3939,18 @@ class GPUModelRunner(
             )
             dest_slots = block_table.slot_mapping.gpu[:total_accepted].clone()
             for kv_cache in group_kv_caches:
-                key_cache, value_cache = kv_cache.unbind(0)
-                key_cache_flat = key_cache.flatten(0, 1)
-                value_cache_flat = value_cache.flatten(0, 1)
-                key_values = key_cache_flat.index_select(0, source_slots)
-                value_values = value_cache_flat.index_select(0, source_slots)
-                key_cache_flat.index_copy_(0, dest_slots, key_values)
-                value_cache_flat.index_copy_(0, dest_slots, value_values)
+                if kv_cache.dim() == 3:
+                    kv_cache_flat = kv_cache.flatten(0, 1)
+                    values = kv_cache_flat.index_select(0, source_slots)
+                    kv_cache_flat.index_copy_(0, dest_slots, values)
+                else:
+                    key_cache, value_cache = kv_cache.unbind(0)
+                    key_cache_flat = key_cache.flatten(0, 1)
+                    value_cache_flat = value_cache.flatten(0, 1)
+                    key_values = key_cache_flat.index_select(0, source_slots)
+                    value_values = value_cache_flat.index_select(0, source_slots)
+                    key_cache_flat.index_copy_(0, dest_slots, key_values)
+                    value_cache_flat.index_copy_(0, dest_slots, value_values)
 
         return accepted_counts
 
@@ -5501,7 +5604,23 @@ class GPUModelRunner(
 
         hf_config = self.speculative_config.draft_model_config.hf_config
 
-        layer_ids = SpeculativeConfig.get_aux_hidden_state_layer_ids(hf_config)
+        get_layer_ids = getattr(
+            SpeculativeConfig, "get_aux_hidden_state_layer_ids", None
+        )
+        if get_layer_ids is not None:
+            layer_ids = get_layer_ids(hf_config)
+        else:
+            layer_ids = getattr(
+                hf_config, "eagle_aux_hidden_state_layer_ids", None
+            )
+            if layer_ids is None:
+                dflash_config = getattr(hf_config, "dflash_config", None)
+                if dflash_config and isinstance(dflash_config, dict):
+                    layer_ids = dflash_config.get("target_layer_ids")
+                    if layer_ids is None:
+                        layer_ids = dflash_config.get("layer_ids")
+            if layer_ids is not None:
+                layer_ids = tuple(int(layer_id) for layer_id in layer_ids)
 
         if layer_ids:
             return layer_ids

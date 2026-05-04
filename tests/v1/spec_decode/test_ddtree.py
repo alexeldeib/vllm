@@ -2,7 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import torch
+import torch.nn.functional as F
 
+from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonDecodeMetadata,
+    MLACommonMetadata,
+    _mla_tree_attention_ref,
+)
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.ddtree import (
     DDTreeRequestMetadata,
@@ -227,3 +233,115 @@ def test_make_ddtree_drafter_token_indices_keeps_non_tree_rows_contiguous():
 
     assert num_rejected.tolist() == [1, 0]
     assert token_indices.tolist() == [0, 1, 3, 4, 5, 6, 7, 8, 9, 10]
+
+
+def test_mla_tree_attention_ref_applies_tree_visibility_to_mla_cache():
+    torch.manual_seed(0)
+
+    kv_lora_rank = 3
+    rope_dim = 2
+    num_heads = 2
+    head_size = kv_lora_rank + rope_dim
+    block_size = 4
+
+    tree_a = DDTreeRequestMetadata(
+        node_depths=[1, 1, 2],
+        parents=[0, 0, 1],
+        max_depth=2,
+    )
+    tree_b = DDTreeRequestMetadata(
+        node_depths=[1],
+        parents=[0],
+        max_depth=1,
+    )
+    tree_bias = make_batched_ddtree_attention_bias([tree_a, tree_b], device="cpu")
+
+    query_start_loc_cpu = torch.tensor([0, 4, 6], dtype=torch.int32)
+    seq_lens_cpu = torch.tensor([7, 4], dtype=torch.int32)
+    block_table = torch.tensor(
+        [
+            [2, 4],
+            [1, 3],
+        ],
+        dtype=torch.int32,
+    )
+    slot_mapping = torch.tensor(
+        [
+            4 * block_size + 3,
+            2 * block_size + 0,
+            2 * block_size + 1,
+            2 * block_size + 2,
+            3 * block_size + 2,
+            3 * block_size + 3,
+        ],
+        dtype=torch.int64,
+    )
+    kv_cache = torch.randn(5, block_size, head_size)
+    ql_nope = torch.randn(6, num_heads, kv_lora_rank)
+    q_pe = torch.randn(6, num_heads, rope_dim)
+    scale = head_size**-0.5
+
+    metadata = MLACommonMetadata(
+        num_reqs=2,
+        max_query_len=4,
+        max_seq_len=7,
+        num_actual_tokens=6,
+        query_start_loc=query_start_loc_cpu,
+        slot_mapping=slot_mapping,
+        num_decodes=2,
+        num_decode_tokens=6,
+        num_prefills=0,
+        decode=MLACommonDecodeMetadata(
+            block_table=block_table,
+            seq_lens=seq_lens_cpu,
+            dcp_tot_seq_lens=None,
+        ),
+        query_start_loc_cpu=query_start_loc_cpu,
+        seq_lens_cpu=seq_lens_cpu,
+        tree_attn_bias=tree_bias,
+    )
+
+    actual = _mla_tree_attention_ref(
+        ql_nope,
+        q_pe,
+        kv_cache,
+        metadata,
+        scale,
+        kv_lora_rank,
+    )
+
+    expected_parts = []
+    kv_cache_flat = kv_cache.flatten(0, 1)
+    for req_index, q_len in enumerate([4, 2]):
+        req_start = int(query_start_loc_cpu[req_index])
+        context_len = int(seq_lens_cpu[req_index]) - q_len
+        context_positions = torch.arange(context_len, dtype=torch.long)
+        context_slots = (
+            block_table[req_index, context_positions // block_size].to(torch.long)
+            * block_size
+            + context_positions % block_size
+        )
+        tree_slots = slot_mapping[req_start : req_start + q_len]
+        kv = kv_cache_flat[torch.cat((context_slots, tree_slots))]
+        q = torch.cat(
+            (
+                ql_nope[req_start : req_start + q_len],
+                q_pe[req_start : req_start + q_len],
+            ),
+            dim=-1,
+        )
+        k = kv.unsqueeze(1).expand(-1, num_heads, -1)
+        v = kv[:, :kv_lora_rank].unsqueeze(1).expand(-1, num_heads, -1)
+        context_mask = torch.ones(q_len, context_len, dtype=torch.bool)
+        tree_mask = torch.isfinite(tree_bias[req_index, :q_len, :q_len])
+        attn_mask = torch.cat((context_mask, tree_mask), dim=-1)
+        expected = F.scaled_dot_product_attention(
+            q.transpose(0, 1).unsqueeze(0),
+            k.transpose(0, 1).unsqueeze(0),
+            v.transpose(0, 1).unsqueeze(0),
+            attn_mask=attn_mask.unsqueeze(0).unsqueeze(0),
+            scale=scale,
+        )
+        expected_parts.append(expected.squeeze(0).transpose(0, 1))
+
+    torch.testing.assert_close(actual, torch.cat(expected_parts, dim=0))

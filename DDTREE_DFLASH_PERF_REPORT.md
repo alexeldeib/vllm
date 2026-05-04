@@ -1,5 +1,10 @@
 # DDTree + DFlash Performance and Architecture Report
 
+> Kimi K2.5 MLA update: this report is the older Qwen/full-attention DDTree
+> readout. The current K2.5 MLA monkeypatch validation, including MLA tree
+> verification, accepted-KV compaction, and the negative DFlash-vs-DDTree
+> performance result, is in `DDTREE_K25_MLA_VALIDATION_REPORT.md`.
+
 ## Scope
 
 This report covers the current vLLM DDTree integration as a DFlash extension:

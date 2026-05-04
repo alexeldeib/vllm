@@ -116,12 +116,14 @@ def _make_ddtree_drafter_token_indices(
             )
 
         tree_len = num_draft + 1
-        if query_len != tree_len:
+        if query_len < tree_len:
             raise ValueError(
                 "DDTree query window does not match draft token count for "
-                f"request {req_index}: {query_len} != {tree_len}"
+                f"request {req_index}: {query_len} < {tree_len}"
             )
 
+        tree_offset = query_len - tree_len
+        token_indices.extend(range(req_start, req_start + tree_offset))
         path = [0, *accepted_nodes]
         for node_index in path:
             if node_index < 0 or node_index >= tree_len:
@@ -129,7 +131,7 @@ def _make_ddtree_drafter_token_indices(
                     "DDTree accepted node index is outside the scheduled tree "
                     f"window for request {req_index}: {node_index}"
                 )
-            token_indices.append(req_start + node_index)
+            token_indices.append(req_start + tree_offset + node_index)
         num_rejected_tokens.append(tree_len - len(path))
 
     return (

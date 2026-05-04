@@ -399,6 +399,10 @@ class CommonAttentionMetadata:
 
     tree_attn_bias: torch.Tensor | None = None
     """Optional dynamic tree attention bias for speculative tree verification."""
+    tree_attn_start_loc_cpu: torch.Tensor | None = None
+    """Optional flattened query start of the active tree window per request."""
+    tree_attn_lens_cpu: torch.Tensor | None = None
+    """Optional active tree-window length per request."""
 
     is_prefilling: torch.Tensor | None = None
     """(batch_size,) bool tensor: True if request is still in prefill phase
@@ -566,11 +570,24 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
                 speculative_config is not None
                 and speculative_config.num_speculative_tokens is not None
             ):
-                max_num_queries_for_spec = (
-                    1
-                    + (2 if speculative_config.parallel_drafting else 1)
-                    * speculative_config.num_speculative_tokens
-                )
+                if speculative_config.use_ddtree():
+                    max_num_queries_for_spec = (
+                        1 + speculative_config.get_ddtree_tree_budget()
+                    )
+                    if speculative_config.num_speculative_tokens is not None:
+                        # DDTree decode steps can include a short accepted-token
+                        # catch-up prefix before the next verifier tree. Treat
+                        # both as decode so tree verification can apply a
+                        # q-query mask instead of falling back to prefill.
+                        max_num_queries_for_spec += (
+                            speculative_config.num_speculative_tokens
+                        )
+                else:
+                    max_num_queries_for_spec = (
+                        1
+                        + (2 if speculative_config.parallel_drafting else 1)
+                        * speculative_config.num_speculative_tokens
+                    )
                 self.reorder_batch_threshold = max(
                     self.reorder_batch_threshold,
                     max_num_queries_for_spec,
