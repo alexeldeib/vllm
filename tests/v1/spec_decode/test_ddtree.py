@@ -12,9 +12,11 @@ from vllm.model_executor.layers.attention.mla_attention import (
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.ddtree import (
     DDTreeRequestMetadata,
+    DDTreeProposer,
     _make_ddtree_drafter_token_indices,
     build_ddtree_tree,
     ddtree_greedy_sample,
+    ddtree_can_use_tree_verifier,
     make_batched_ddtree_attention_bias,
     make_ddtree_attention_bias,
 )
@@ -46,6 +48,70 @@ def _sampling_metadata_for_batch(batch_size: int) -> SamplingMetadata:
     )
 
 
+def _random_sampling_metadata_for_batch(batch_size: int) -> SamplingMetadata:
+    return SamplingMetadata(
+        temperature=torch.ones(batch_size),
+        all_greedy=False,
+        all_random=True,
+        top_p=None,
+        top_k=None,
+        generators={},
+        max_num_logprobs=None,
+        no_penalties=True,
+        prompt_token_ids=None,
+        frequency_penalties=torch.empty(0),
+        presence_penalties=torch.empty(0),
+        repetition_penalties=torch.empty(0),
+        output_token_ids=[[] for _ in range(batch_size)],
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=[],
+    )
+
+
+def test_ddtree_verifier_is_greedy_only():
+    greedy = _sampling_metadata_for_batch(2)
+    random = _random_sampling_metadata_for_batch(2)
+    with_logprobs = _sampling_metadata_for_batch(2)
+    with_logprobs.max_num_logprobs = 1
+
+    assert ddtree_can_use_tree_verifier(greedy)
+    assert not ddtree_can_use_tree_verifier(random)
+    assert not ddtree_can_use_tree_verifier(with_logprobs)
+
+
+def test_ddtree_proposer_falls_back_to_linear_dflash_for_non_greedy():
+    proposer = DDTreeProposer.__new__(DDTreeProposer)
+    proposer.num_speculative_tokens = 2
+    proposer.tree_budget = 4
+    proposer.min_path_probability = None
+    proposer.min_branch_gain_per_node = None
+    proposer._last_ddtree_metadata = []
+    proposer._last_ddtree_debug_metrics = None
+    proposer._debug_metrics = True
+
+    logits = torch.full((4, 8), -10.0)
+    logits[0, 3] = 1.0
+    logits[1, 4] = 1.0
+    logits[2, 5] = 1.0
+    logits[3, 6] = 1.0
+
+    tokens = DDTreeProposer.propose_ddtree_from_logits(
+        proposer,
+        logits,
+        batch_size=2,
+        sampling_metadata=_random_sampling_metadata_for_batch(2),
+    )
+
+    assert tokens == [[3, 4], [5, 6]]
+    assert proposer.take_last_ddtree_metadata() is None
+    metrics = proposer.take_last_ddtree_debug_metrics()
+    assert metrics is not None
+    assert metrics["metadata_bypass"]
+    assert metrics["fallback_reason"] == "non_greedy"
+    assert metrics["tree_modes"] == ["linear_fallback", "linear_fallback"]
+
+
 def test_build_ddtree_tree_is_prefix_closed():
     logits = torch.full((3, 8), -10.0)
     logits[0, 1] = 5.0
@@ -63,6 +129,38 @@ def test_build_ddtree_tree_is_prefix_closed():
     for node_index, parent in enumerate(draft.metadata.parents, start=1):
         assert parent < node_index
     assert draft.metadata.max_depth <= logits.shape[0]
+
+
+def test_build_ddtree_tree_prunes_low_probability_paths():
+    logits = torch.full((3, 8), -4.0)
+    logits[:, 1] = 0.0
+
+    draft = build_ddtree_tree(
+        logits,
+        budget=6,
+        min_path_probability=0.8,
+    )
+
+    assert draft.metadata.max_depth == 1
+    assert len(draft.token_ids) == 1
+
+
+def test_build_ddtree_tree_can_fallback_to_linear_chain():
+    logits = torch.full((3, 8), -10.0)
+    logits[0, 1] = 5.0
+    logits[1, 2] = 5.0
+    logits[2, 3] = 5.0
+
+    draft = build_ddtree_tree(
+        logits,
+        budget=6,
+        min_branch_gain_per_node=1.0,
+    )
+
+    assert draft.metadata.mode == "linear"
+    assert draft.token_ids == [1, 2, 3]
+    assert draft.metadata.node_depths == [1, 2, 3]
+    assert draft.metadata.parents == [0, 1, 2]
 
 
 def test_make_ddtree_attention_bias():

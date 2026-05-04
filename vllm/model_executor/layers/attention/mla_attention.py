@@ -188,6 +188,7 @@ return curr_o @ W_O
 """
 
 import functools
+import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -268,6 +269,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
+from vllm.v1.attention.ops.triton_decode_attention import decode_attention_fwd
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.attention.selector import get_attn_backend
 from vllm.v1.kv_cache_interface import (
@@ -761,19 +763,43 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     raise NotImplementedError(
                         "MLA DDTree verification does not support fp8_ds_mla "
                         "KV cache yet."
-                    )
+                )
                 assert isinstance(mqa_q, tuple)
                 mqa_ql_nope, mqa_q_pe = mqa_q
-                attn_out = _mla_tree_attention_unified(
-                    mqa_ql_nope[:, : self.num_heads],
-                    mqa_q_pe[:, : self.num_heads],
-                    kv_cache,
-                    attn_metadata,
-                    self.scale,
-                    self.kv_lora_rank,
-                    self._k_scale,
-                    self.kv_cache_dtype,
-                )
+                if os.environ.get("VLLM_DDTREE_MLA_SPLIT_VERIFIER") == "1":
+                    try:
+                        attn_out = _mla_tree_attention_split(
+                            mqa_ql_nope[:, : self.num_heads],
+                            mqa_q_pe[:, : self.num_heads],
+                            kv_cache,
+                            attn_metadata,
+                            self.scale,
+                            self.kv_lora_rank,
+                            self._k_scale,
+                            self.kv_cache_dtype,
+                        )
+                    except (NotImplementedError, ValueError):
+                        attn_out = _mla_tree_attention_unified(
+                            mqa_ql_nope[:, : self.num_heads],
+                            mqa_q_pe[:, : self.num_heads],
+                            kv_cache,
+                            attn_metadata,
+                            self.scale,
+                            self.kv_lora_rank,
+                            self._k_scale,
+                            self.kv_cache_dtype,
+                        )
+                else:
+                    attn_out = _mla_tree_attention_unified(
+                        mqa_ql_nope[:, : self.num_heads],
+                        mqa_q_pe[:, : self.num_heads],
+                        kv_cache,
+                        attn_metadata,
+                        self.scale,
+                        self.kv_lora_rank,
+                        self._k_scale,
+                        self.kv_cache_dtype,
+                    )
                 lse = None
             else:
                 if not is_sparse_impl:
@@ -1321,6 +1347,9 @@ class MLACommonMetadata(AttentionMetadata, Generic[D]):
     tree_attn_bias: torch.Tensor | None = None
     tree_attn_start_loc_cpu: torch.Tensor | None = None
     tree_attn_lens_cpu: torch.Tensor | None = None
+    tree_attn_prefix_block_table: torch.Tensor | None = None
+    tree_attn_prefix_seq_lens: torch.Tensor | None = None
+    tree_attn_prefix_max_seq_len: int | None = None
 
     def __post_init__(self):
         if self.head_dim is not None and not MLACommonBackend.supports_head_size(
@@ -1889,6 +1918,78 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                 dcp_tot_seq_lens_device=dcp_tot_seq_lens_device,
             )
 
+        tree_attn_prefix_block_table = None
+        tree_attn_prefix_seq_lens = None
+        tree_attn_prefix_max_seq_len = None
+        if (
+            common_attn_metadata.tree_attn_bias is not None
+            and decode_metadata is not None
+            and common_attn_metadata.seq_lens_cpu_upper_bound is not None
+        ):
+            prefix_seq_lens: list[int] = []
+            row_to_req: list[int] = []
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
+            tree_start_locs_cpu = common_attn_metadata.tree_attn_start_loc_cpu
+            tree_lens_cpu = common_attn_metadata.tree_attn_lens_cpu
+
+            for req_index in range(num_decodes):
+                req_start = int(query_start_loc_cpu[req_index])
+                req_end = int(query_start_loc_cpu[req_index + 1])
+                query_len = req_end - req_start
+                seq_len = int(seq_lens_cpu[req_index])
+                context_len = seq_len - query_len
+                if context_len < 0:
+                    raise ValueError(
+                        "MLA DDTree prefix metadata got negative context "
+                        f"length: {seq_len=} {query_len=}"
+                    )
+
+                tree_offset = query_len
+                tree_len = 0
+                if (
+                    tree_start_locs_cpu is not None
+                    and tree_lens_cpu is not None
+                    and req_index < tree_start_locs_cpu.numel()
+                ):
+                    tree_len = int(tree_lens_cpu[req_index])
+                    tree_start = int(tree_start_locs_cpu[req_index])
+                    if tree_len > 0:
+                        tree_offset = tree_start - req_start
+                        if (
+                            tree_offset < 0
+                            or tree_offset + tree_len > query_len
+                        ):
+                            raise ValueError(
+                                "Invalid MLA DDTree prefix window: "
+                                f"{req_start=} {req_end=} {tree_start=} "
+                                f"{tree_len=}"
+                            )
+
+                for local_query_index in range(query_len):
+                    if tree_len > 0 and local_query_index >= tree_offset:
+                        prefix_len = context_len + tree_offset
+                    else:
+                        prefix_len = context_len + local_query_index + 1
+                    prefix_seq_lens.append(prefix_len)
+                    row_to_req.append(req_index)
+
+            if prefix_seq_lens:
+                tree_attn_prefix_max_seq_len = max(prefix_seq_lens)
+                if tree_attn_prefix_max_seq_len > 0:
+                    row_to_req_tensor = torch.tensor(
+                        row_to_req,
+                        dtype=torch.long,
+                        device=device,
+                    )
+                    tree_attn_prefix_block_table = (
+                        decode_metadata.block_table.index_select(0, row_to_req_tensor)
+                    )
+                    tree_attn_prefix_seq_lens = torch.tensor(
+                        prefix_seq_lens,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+
         attn_metadata = self.metadata_cls(
             num_reqs=common_attn_metadata.num_reqs,
             max_query_len=common_attn_metadata.max_query_len,
@@ -1908,6 +2009,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             tree_attn_bias=common_attn_metadata.tree_attn_bias,
             tree_attn_start_loc_cpu=common_attn_metadata.tree_attn_start_loc_cpu,
             tree_attn_lens_cpu=common_attn_metadata.tree_attn_lens_cpu,
+            tree_attn_prefix_block_table=tree_attn_prefix_block_table,
+            tree_attn_prefix_seq_lens=tree_attn_prefix_seq_lens,
+            tree_attn_prefix_max_seq_len=tree_attn_prefix_max_seq_len,
         )
 
         return attn_metadata  # type: ignore[return-value]
@@ -2067,6 +2171,185 @@ def _mla_tree_attention_ref(
     return out
 
 
+def _next_power_of_2_int(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
+def _mla_tree_attention_split(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: MLACommonMetadata,
+    scale: float,
+    kv_lora_rank: int,
+    k_scale: torch.Tensor,
+    kv_cache_dtype: str,
+) -> torch.Tensor:
+    """MLA DDTree verifier split into prefix decode + tree-suffix mask.
+
+    The large prefix/context contribution reuses the existing Triton MLA decode
+    kernel, which computes only the c_kv value dimension. The small DDTree
+    suffix is handled as a dense masked attention over root/ancestor/self tree
+    nodes and merged with the prefix by log-sum-exp.
+    """
+    if attn_metadata.decode is None:
+        raise ValueError("MLA DDTree verification requires decode metadata.")
+    if attn_metadata.tree_attn_bias is None:
+        raise ValueError("MLA DDTree verification requires tree_attn_bias.")
+    if (
+        attn_metadata.query_start_loc_cpu is None
+        or attn_metadata.seq_lens_cpu is None
+        or attn_metadata.tree_attn_start_loc_cpu is None
+        or attn_metadata.tree_attn_lens_cpu is None
+        or attn_metadata.tree_attn_prefix_block_table is None
+        or attn_metadata.tree_attn_prefix_seq_lens is None
+        or attn_metadata.tree_attn_prefix_max_seq_len is None
+    ):
+        raise ValueError("MLA DDTree split verifier requires prefix metadata.")
+    if attn_metadata.tree_attn_prefix_max_seq_len <= 0:
+        raise ValueError("MLA DDTree split verifier requires non-empty prefixes.")
+    if kv_cache.dim() != 3:
+        raise NotImplementedError(
+            "MLA DDTree verification currently supports uncompressed "
+            f"3D MLA KV cache tensors, got shape {tuple(kv_cache.shape)}."
+        )
+    if kv_cache.dtype == torch.uint8 or kv_cache_dtype == "fp8_ds_mla":
+        raise NotImplementedError(
+            "MLA DDTree verification does not support packed fp8_ds_mla KV cache."
+        )
+
+    kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
+    if kv_quant_mode.is_per_token_head or kv_quant_mode.is_nvfp4:
+        raise NotImplementedError(
+            "MLA DDTree verification does not support per-token-head or NVFP4 "
+            "KV cache quantization yet."
+        )
+
+    q = torch.cat((ql_nope, q_pe), dim=-1)
+    num_decode_tokens, num_heads, _ = q.shape
+    if num_decode_tokens == 0:
+        return q.new_empty((0, num_heads, kv_lora_rank))
+
+    prefix_out = torch.empty(
+        (num_decode_tokens, num_heads, kv_lora_rank),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    prefix_lse = torch.empty(
+        (num_decode_tokens, num_heads),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    if envs.VLLM_BATCH_INVARIANT:
+        num_kv_splits = 1
+    else:
+        max_prefix_seq_len = attn_metadata.tree_attn_prefix_max_seq_len
+        ideal_splits = _next_power_of_2_int(max(1, max_prefix_seq_len // 512))
+        max_splits = max(1, current_platform.num_compute_units() * 2)
+        num_kv_splits = min(ideal_splits, max_splits)
+
+    attn_logits = torch.empty(
+        (num_decode_tokens, num_heads, num_kv_splits, kv_lora_rank + 1),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    kv_cache_mqa = kv_cache.unsqueeze(2)
+    kv_c_cache = kv_cache_mqa[..., :kv_lora_rank]
+    decode_attention_fwd(
+        q,
+        kv_cache_mqa,
+        kv_c_cache,
+        prefix_out,
+        prefix_lse,
+        attn_metadata.tree_attn_prefix_block_table,
+        attn_metadata.tree_attn_prefix_seq_lens,
+        attn_logits,
+        num_kv_splits,
+        scale,
+        kv_cache_mqa.size(1),
+        k_scale=k_scale,
+        v_scale=k_scale,
+        is_mla=True,
+    )
+
+    suffix_out = torch.zeros_like(prefix_out)
+    suffix_lse = torch.full(
+        (num_heads, num_decode_tokens),
+        -torch.inf,
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+    kv_cache_flat = kv_cache.flatten(0, 1)
+    query_start_loc_cpu = attn_metadata.query_start_loc_cpu
+    tree_start_loc_cpu = attn_metadata.tree_attn_start_loc_cpu
+    tree_lens_cpu = attn_metadata.tree_attn_lens_cpu
+    tree_attn_bias = attn_metadata.tree_attn_bias
+    slot_mapping = attn_metadata.slot_mapping
+
+    for req_index in range(attn_metadata.num_decodes):
+        tree_len = int(tree_lens_cpu[req_index])
+        if tree_len <= 0:
+            continue
+
+        req_start = int(query_start_loc_cpu[req_index])
+        req_end = int(query_start_loc_cpu[req_index + 1])
+        tree_start = int(tree_start_loc_cpu[req_index])
+        tree_offset = tree_start - req_start
+        if tree_offset < 0 or tree_start + tree_len > req_end:
+            raise ValueError(
+                "Invalid MLA DDTree suffix window: "
+                f"{req_start=} {req_end=} {tree_start=} {tree_len=}"
+            )
+
+        tree_slots = slot_mapping[tree_start : tree_start + tree_len].to(torch.long)
+        kv = kv_cache_flat.index_select(0, tree_slots)
+        if kv.dtype != q.dtype:
+            kv = kv.to(dtype=q.dtype) * k_scale.to(device=q.device, dtype=q.dtype)
+
+        kv_c = kv[:, :kv_lora_rank]
+        k_tree = kv
+        q_tree = q[tree_start : tree_start + tree_len]
+        logits = torch.einsum(
+            "thd,sd->ths", q_tree.float(), k_tree.float()
+        ).mul_(scale)
+
+        if tree_attn_bias.shape[-1] >= tree_offset + tree_len:
+            tree_slice = (
+                slice(tree_offset, tree_offset + tree_len),
+                slice(tree_offset, tree_offset + tree_len),
+            )
+        else:
+            tree_slice = (slice(0, tree_len), slice(0, tree_len))
+        if tree_attn_bias.dim() == 3:
+            tree_bias = tree_attn_bias[req_index, tree_slice[0], tree_slice[1]]
+        else:
+            tree_bias = tree_attn_bias[tree_slice[0], tree_slice[1]]
+        logits = logits + tree_bias.to(device=q.device, dtype=logits.dtype).unsqueeze(1)
+
+        probs = torch.softmax(logits, dim=-1).to(dtype=q.dtype)
+        suffix_out[tree_start : tree_start + tree_len].copy_(
+            torch.einsum("ths,sd->thd", probs, kv_c)
+        )
+        suffix_lse[:, tree_start : tree_start + tree_len].copy_(
+            torch.logsumexp(logits, dim=-1).transpose(0, 1)
+        )
+
+    merged_out = torch.empty_like(prefix_out)
+    merge_attn_states(
+        output=merged_out,
+        prefix_output=prefix_out,
+        prefix_lse=prefix_lse.transpose(0, 1).contiguous(),
+        suffix_output=suffix_out,
+        suffix_lse=suffix_lse,
+    )
+    return merged_out
+
+
 def _mla_tree_attention_unified(
     ql_nope: torch.Tensor,
     q_pe: torch.Tensor,
@@ -2080,10 +2363,8 @@ def _mla_tree_attention_unified(
     """MLA DDTree verifier using the Triton q-query tree-mask kernel.
 
     MLA decode attention computes attention over K=[c_kv, k_pe] and V=c_kv.
-    The unified attention kernel requires K and V to share the same head
-    dimension, so we pass the combined MLA cache for both K and V and slice the
-    first ``kv_lora_rank`` output channels. Those channels are exactly the
-    weighted sum over c_kv; the extra rope channels are discarded.
+    The unified attention kernel supports the narrower value/output width, so
+    DDTree verification avoids accumulating the RoPE key channels as values.
     """
     if attn_metadata.decode is None:
         raise ValueError("MLA DDTree verification requires decode metadata.")
@@ -2108,19 +2389,20 @@ def _mla_tree_attention_unified(
 
     q = torch.cat((ql_nope, q_pe), dim=-1)
     num_decode_tokens = attn_metadata.num_decode_tokens
-    out_full = q.new_empty((num_decode_tokens, q.shape[1], q.shape[2]))
+    out = q.new_empty((num_decode_tokens, q.shape[1], kv_lora_rank))
     if num_decode_tokens == 0:
-        return out_full[..., :kv_lora_rank]
+        return out
 
     kv_cache_mqa = kv_cache.unsqueeze(2)
+    kv_c_cache = kv_cache_mqa[..., :kv_lora_rank]
     descale_shape = (attn_metadata.decode.block_table.shape[0], 1)
     k_descale = k_scale.expand(descale_shape)
 
     unified_attention(
         q=q,
         k=kv_cache_mqa,
-        v=kv_cache_mqa,
-        out=out_full,
+        v=kv_c_cache,
+        out=out,
         cu_seqlens_q=attn_metadata.query_start_loc[
             : attn_metadata.num_decodes + 1
         ],
@@ -2138,7 +2420,7 @@ def _mla_tree_attention_unified(
         qq_bias=attn_metadata.tree_attn_bias,
         kv_quant_mode=kv_quant_mode,
     )
-    return out_full[..., :kv_lora_rank]
+    return out
 
 
 def reorg_kvcache(

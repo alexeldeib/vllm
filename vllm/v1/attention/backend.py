@@ -403,6 +403,12 @@ class CommonAttentionMetadata:
     """Optional flattened query start of the active tree window per request."""
     tree_attn_lens_cpu: torch.Tensor | None = None
     """Optional active tree-window length per request."""
+    tree_attn_prefix_block_table: torch.Tensor | None = None
+    """Optional per-query block table for the DDTree MLA prefix verifier."""
+    tree_attn_prefix_seq_lens: torch.Tensor | None = None
+    """Optional per-query sequence lengths for the DDTree MLA prefix verifier."""
+    tree_attn_prefix_max_seq_len: int | None = None
+    """Optional max prefix length for the DDTree MLA prefix verifier."""
 
     is_prefilling: torch.Tensor | None = None
     """(batch_size,) bool tensor: True if request is still in prefill phase

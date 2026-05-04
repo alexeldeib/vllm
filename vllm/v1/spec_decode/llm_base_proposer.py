@@ -495,7 +495,11 @@ class SpecDecodeBaseProposer:
 
         if self.method == "ddtree":
             logits = self.model.compute_logits(sample_hidden_states)
-            return self.propose_ddtree_from_logits(logits, batch_size)
+            return self.propose_ddtree_from_logits(
+                logits,
+                batch_size,
+                sampling_metadata=sampling_metadata,
+            )
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:

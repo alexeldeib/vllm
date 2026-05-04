@@ -29,6 +29,9 @@ class DDTreeRequestMetadata:
     node_depths: list[int]
     parents: list[int]
     max_depth: int
+    expected_acceptance: float | None = None
+    branch_gain_per_node: float | None = None
+    mode: str = "tree"
 
 
 @dataclass
@@ -37,11 +40,25 @@ class DDTreeDraft:
     metadata: DDTreeRequestMetadata
 
 
+def ddtree_can_use_tree_verifier(sampling_metadata: SamplingMetadata) -> bool:
+    return sampling_metadata.all_greedy and sampling_metadata.max_num_logprobs is None
+
+
+def _linear_dflash_tokens_from_logits(
+    logits: torch.Tensor,
+    batch_size: int,
+    num_speculative_tokens: int,
+) -> list[list[int]]:
+    token_ids = logits.argmax(dim=-1).view(batch_size, num_speculative_tokens)
+    return token_ids.detach().cpu().tolist()
+
+
 def _order_nodes_by_depth(
     token_ids: list[int],
     node_depths: list[int],
     parents: list[int],
-) -> tuple[list[int], list[int], list[int]]:
+    node_logprobs: list[float],
+) -> tuple[list[int], list[int], list[int], list[float]]:
     """Put dynamic tree nodes in verifier-friendly depth order."""
     order = sorted(range(len(token_ids)), key=lambda i: (node_depths[i], i))
 
@@ -53,6 +70,36 @@ def _order_nodes_by_depth(
         [token_ids[i] for i in order],
         [node_depths[i] for i in order],
         [old_to_new[parents[i]] for i in order],
+        [node_logprobs[i] for i in order],
+    )
+
+
+def _build_linear_ddtree_from_topk(
+    top_logprobs_cpu: torch.Tensor,
+    top_token_ids_cpu: torch.Tensor,
+    budget: int,
+) -> DDTreeDraft:
+    depth_limit = min(top_token_ids_cpu.shape[0], budget)
+    token_ids = [int(top_token_ids_cpu[depth, 0]) for depth in range(depth_limit)]
+    node_depths = list(range(1, depth_limit + 1))
+    parents = list(range(depth_limit))
+
+    cumulative_logprob = 0.0
+    expected_acceptance = 0.0
+    for depth in range(depth_limit):
+        cumulative_logprob += float(top_logprobs_cpu[depth, 0])
+        expected_acceptance += float(np.exp(cumulative_logprob))
+
+    return DDTreeDraft(
+        token_ids=token_ids,
+        metadata=DDTreeRequestMetadata(
+            node_depths=node_depths,
+            parents=parents,
+            max_depth=depth_limit,
+            expected_acceptance=expected_acceptance,
+            branch_gain_per_node=None,
+            mode="linear",
+        ),
     )
 
 
@@ -144,6 +191,9 @@ def _build_ddtree_tree_from_topk(
     top_logprobs_cpu: torch.Tensor,
     top_token_ids_cpu: torch.Tensor,
     budget: int,
+    *,
+    min_path_probability: float | None = None,
+    min_branch_gain_per_node: float | None = None,
 ) -> DDTreeDraft:
     if budget <= 0:
         return DDTreeDraft([], DDTreeRequestMetadata([], [], 0))
@@ -166,6 +216,7 @@ def _build_ddtree_tree_from_topk(
     node_token_ids: list[int] = []
     node_depths: list[int] = []
     parents: list[int] = []
+    node_logprobs: list[float] = []
 
     # Max heap via negative cumulative logprob.
     # Entries are (-score, depth, parent_index, rank_at_depth).
@@ -175,16 +226,24 @@ def _build_ddtree_tree_from_topk(
 
     while heap and len(node_token_ids) < budget:
         neg_score, depth, parent_index, rank = heapq.heappop(heap)
+        score = -neg_score
+        if (
+            min_path_probability is not None
+            and min_path_probability > 0.0
+            and float(np.exp(score)) < min_path_probability
+        ):
+            break
         token_id = int(top_token_ids_cpu[depth, rank])
 
         node_index = len(node_token_ids) + 1
         node_token_ids.append(token_id)
         node_depths.append(depth + 1)
         parents.append(parent_index)
+        node_logprobs.append(score)
 
         sibling_rank = rank + 1
         if sibling_rank < topk:
-            sibling_score = -neg_score - float(top_logprobs_cpu[depth, rank])
+            sibling_score = score - float(top_logprobs_cpu[depth, rank])
             sibling_score += float(top_logprobs_cpu[depth, sibling_rank])
             heapq.heappush(
                 heap, (-sibling_score, depth, parent_index, sibling_rank)
@@ -192,11 +251,32 @@ def _build_ddtree_tree_from_topk(
 
         child_depth = depth + 1
         if child_depth < depth_limit:
-            child_score = -neg_score + float(top_logprobs_cpu[child_depth, 0])
+            child_score = score + float(top_logprobs_cpu[child_depth, 0])
             heapq.heappush(heap, (-child_score, child_depth, node_index, 0))
 
-    node_token_ids, node_depths, parents = _order_nodes_by_depth(
-        node_token_ids, node_depths, parents
+    if not node_token_ids:
+        return DDTreeDraft([], DDTreeRequestMetadata([], [], 0))
+
+    expected_acceptance = float(sum(np.exp(score) for score in node_logprobs))
+    branch_gain_per_node = None
+    if min_branch_gain_per_node is not None and min_branch_gain_per_node > 0.0:
+        linear = _build_linear_ddtree_from_topk(
+            top_logprobs_cpu,
+            top_token_ids_cpu,
+            budget,
+        )
+        tree_extra_nodes = len(node_token_ids) - len(linear.token_ids)
+        if tree_extra_nodes > 0:
+            linear_expected = linear.metadata.expected_acceptance or 0.0
+            branch_gain_per_node = (
+                expected_acceptance - linear_expected
+            ) / tree_extra_nodes
+            if branch_gain_per_node < min_branch_gain_per_node:
+                linear.metadata.branch_gain_per_node = branch_gain_per_node
+                return linear
+
+    node_token_ids, node_depths, parents, node_logprobs = _order_nodes_by_depth(
+        node_token_ids, node_depths, parents, node_logprobs
     )
     max_depth = max(node_depths, default=0)
     return DDTreeDraft(
@@ -205,6 +285,9 @@ def _build_ddtree_tree_from_topk(
             node_depths=node_depths,
             parents=parents,
             max_depth=max_depth,
+            expected_acceptance=expected_acceptance,
+            branch_gain_per_node=branch_gain_per_node,
+            mode="tree",
         ),
     )
 
@@ -212,6 +295,9 @@ def _build_ddtree_tree_from_topk(
 def build_ddtree_tree(
     draft_logits: torch.Tensor,
     budget: int,
+    *,
+    min_path_probability: float | None = None,
+    min_branch_gain_per_node: float | None = None,
 ) -> DDTreeDraft:
     """Build a prefix-closed DDTree from one request's DFlash logits.
 
@@ -235,6 +321,8 @@ def build_ddtree_tree(
         top_logprobs.detach().cpu(),
         top_token_ids.detach().cpu(),
         budget,
+        min_path_probability=min_path_probability,
+        min_branch_gain_per_node=min_branch_gain_per_node,
     )
 
 
@@ -391,6 +479,8 @@ class DDTreeProposer(DFlashProposer):
         spec_config = self.vllm_config.speculative_config
         assert spec_config is not None
         self.tree_budget = spec_config.get_ddtree_tree_budget()
+        self.min_path_probability = spec_config.ddtree_min_path_probability
+        self.min_branch_gain_per_node = spec_config.ddtree_min_branch_gain_per_node
         self._last_ddtree_metadata: list[DDTreeRequestMetadata] | None = None
         self._last_ddtree_debug_metrics: dict[str, Any] | None = None
         self._debug_metrics = os.environ.get("SPEC_DECODE_DEBUG_METRICS") == "1"
@@ -403,9 +493,51 @@ class DDTreeProposer(DFlashProposer):
         self,
         logits: torch.Tensor,
         batch_size: int,
+        sampling_metadata: SamplingMetadata | None = None,
     ) -> list[list[int]]:
         draft_logits = logits.view(batch_size, self.num_speculative_tokens, -1)
         self._last_ddtree_debug_metrics = None
+        if sampling_metadata is not None and not ddtree_can_use_tree_verifier(
+            sampling_metadata
+        ):
+            # DDTree verification walks target argmax through a tree and is only
+            # exact for greedy requests. For random/logprob batches, emit the
+            # same linear greedy DFlash draft that the standard rejection sampler
+            # already knows how to verify without DDTree metadata.
+            all_token_ids = _linear_dflash_tokens_from_logits(
+                logits,
+                batch_size,
+                self.num_speculative_tokens,
+            )
+            self._last_ddtree_metadata = None
+            if self._debug_metrics:
+                fallback_reason = (
+                    "logprobs"
+                    if sampling_metadata.max_num_logprobs is not None
+                    else "non_greedy"
+                )
+                self._last_ddtree_debug_metrics = {
+                    "tree_budget": self.tree_budget,
+                    "batch_size": batch_size,
+                    "horizon": self.num_speculative_tokens,
+                    "topk": 1,
+                    "metadata_bypass": True,
+                    "fallback_reason": fallback_reason,
+                    "tree_nodes": [len(tokens) for tokens in all_token_ids],
+                    "tree_max_depths": [
+                        len(tokens) for tokens in all_token_ids
+                    ],
+                    "tree_modes": ["linear_fallback" for _ in all_token_ids],
+                    "tree_expected_acceptance": [None for _ in all_token_ids],
+                    "tree_branch_gain_per_node": [None for _ in all_token_ids],
+                    "tree_min_path_probability": self.min_path_probability,
+                    "tree_min_branch_gain_per_node": self.min_branch_gain_per_node,
+                    "tree_topk_ms": 0.0,
+                    "tree_transfer_ms": 0.0,
+                    "tree_cpu_build_ms": 0.0,
+                }
+            return all_token_ids
+
         if draft_logits.shape[-1] == 0 or self.tree_budget <= 0:
             empty = DDTreeRequestMetadata([], [], 0)
             self._last_ddtree_metadata = [empty for _ in range(batch_size)]
@@ -433,19 +565,36 @@ class DDTreeProposer(DFlashProposer):
                 top_logprobs_cpu[req_index],
                 top_token_ids_cpu[req_index],
                 self.tree_budget,
+                min_path_probability=self.min_path_probability,
+                min_branch_gain_per_node=self.min_branch_gain_per_node,
             )
             all_token_ids.append(draft.token_ids)
             all_metadata.append(draft.metadata)
         build_ms = (time.perf_counter() - build_start) * 1000
-        self._last_ddtree_metadata = all_metadata
+        # If every request fell back to a top-1 chain, keep the generated draft
+        # tokens but do not attach DDTree metadata. The scheduler will then use
+        # the standard linear speculative verifier/rejection sampler, which is
+        # equivalent for this batch and avoids DDTree verifier overhead.
+        all_linear = all(metadata.mode == "linear" for metadata in all_metadata)
+        self._last_ddtree_metadata = None if all_linear else all_metadata
         if self._debug_metrics:
             self._last_ddtree_debug_metrics = {
                 "tree_budget": self.tree_budget,
                 "batch_size": batch_size,
                 "horizon": self.num_speculative_tokens,
                 "topk": topk,
+                "metadata_bypass": all_linear,
                 "tree_nodes": [len(tokens) for tokens in all_token_ids],
                 "tree_max_depths": [metadata.max_depth for metadata in all_metadata],
+                "tree_modes": [metadata.mode for metadata in all_metadata],
+                "tree_expected_acceptance": [
+                    metadata.expected_acceptance for metadata in all_metadata
+                ],
+                "tree_branch_gain_per_node": [
+                    metadata.branch_gain_per_node for metadata in all_metadata
+                ],
+                "tree_min_path_probability": self.min_path_probability,
+                "tree_min_branch_gain_per_node": self.min_branch_gain_per_node,
                 "tree_topk_ms": topk_ms,
                 "tree_transfer_ms": transfer_ms,
                 "tree_cpu_build_ms": build_ms,

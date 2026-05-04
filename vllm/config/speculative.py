@@ -157,6 +157,18 @@ class SpeculativeConfig:
     """Maximum number of dynamic DDTree draft nodes per request. Only used when
     method is ``ddtree``. If unspecified, defaults to
     ``4 * num_speculative_tokens``."""
+    ddtree_min_path_probability: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    """Minimum cumulative DFlash path probability for a DDTree node. Lower
+    probability candidates are pruned from the dynamic tree. Only used when
+    method is ``ddtree``."""
+    ddtree_min_branch_gain_per_node: float | None = Field(
+        default=None, ge=0.0, le=1.0
+    )
+    """Minimum estimated acceptance gain per extra branched DDTree node. When
+    the estimated branch gain falls below this threshold, DDTree emits a linear
+    chain instead of the branched tree. Only used when method is ``ddtree``."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore

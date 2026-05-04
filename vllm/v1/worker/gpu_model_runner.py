@@ -108,6 +108,7 @@ from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
 from vllm.tracing import instrument
+from vllm.triton_utils import tl, triton
 from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
@@ -210,7 +211,7 @@ from vllm.v1.worker.ubatch_utils import (
     split_attn_metadata,
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import current_workspace_manager, lock_workspace
 
 from .utils import (
     AttentionGroup,
@@ -231,6 +232,36 @@ logger = init_logger(__name__)
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
+
+
+@triton.jit
+def _ddtree_kv_compact_rows_kernel(
+    cache_ptr,
+    source_slots_ptr,
+    dest_slots_ptr,
+    num_rows: tl.constexpr,
+    ROW_WIDTH: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    elem_offsets = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    total = num_rows * ROW_WIDTH
+    mask = elem_offsets < total
+    # Copy deeper accepted path rows first so canonical lower-slot writes do not
+    # clobber source rows that are still needed later in the same compaction.
+    forward_row_offsets = elem_offsets // ROW_WIDTH
+    row_offsets = num_rows - 1 - forward_row_offsets
+    col_offsets = elem_offsets - forward_row_offsets * ROW_WIDTH
+    source_rows = tl.load(source_slots_ptr + row_offsets, mask=mask, other=0)
+    dest_rows = tl.load(dest_slots_ptr + row_offsets, mask=mask, other=0)
+    values = tl.load(
+        cache_ptr + source_rows * ROW_WIDTH + col_offsets,
+        mask=mask,
+    )
+    tl.store(
+        cache_ptr + dest_rows * ROW_WIDTH + col_offsets,
+        values,
+        mask=mask,
+    )
 
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
@@ -820,8 +851,13 @@ class GPUModelRunner(
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self._ddtree_attn_bias: torch.Tensor | None = None
+        self._ddtree_attn_bias_workspace: torch.Tensor | None = None
         self._ddtree_tree_start_loc_cpu: torch.Tensor | None = None
         self._ddtree_tree_lens_cpu: torch.Tensor | None = None
+        self._ddtree_force_eager: bool = False
+        self._ddtree_kv_compact_workspaces: dict[
+            tuple[str, int, torch.dtype, tuple[int, ...]], torch.Tensor
+        ] = {}
         self._spec_decode_debug_metrics = (
             os.environ.get("SPEC_DECODE_DEBUG_METRICS") == "1"
         )
@@ -1864,6 +1900,7 @@ class GPUModelRunner(
         self._ddtree_attn_bias = None
         self._ddtree_tree_start_loc_cpu = None
         self._ddtree_tree_lens_cpu = None
+        self._ddtree_force_eager = False
 
         # Storage positions are unique KV-cache slots assigned by the scheduler.
         # DDTree may use different model positions because siblings at the same
@@ -1933,7 +1970,8 @@ class GPUModelRunner(
                 ddtree_attn_bias = make_batched_ddtree_attention_bias(
                     ddtree_metadata_by_req, device=self.device
                 )
-                if any(ddtree_tree_offsets):
+                has_tree_offsets = any(ddtree_tree_offsets)
+                if has_tree_offsets:
                     max_query_len = max(ddtree_query_lens)
                     full_attn_bias = ddtree_attn_bias.new_zeros(
                         (num_reqs, max_query_len, max_query_len)
@@ -1949,7 +1987,32 @@ class GPUModelRunner(
                             tree_offset : tree_offset + tree_len,
                         ] = ddtree_attn_bias[req_idx, :tree_len, :tree_len]
                     ddtree_attn_bias = full_attn_bias
-                self._ddtree_attn_bias = ddtree_attn_bias
+                workspace_shape = ddtree_attn_bias.shape
+                workspace = self._ddtree_attn_bias_workspace
+                if (
+                    workspace is None
+                    or workspace.shape[0] < workspace_shape[0]
+                    or workspace.shape[1] < workspace_shape[1]
+                    or workspace.shape[2] < workspace_shape[2]
+                    or workspace.dtype != ddtree_attn_bias.dtype
+                    or workspace.device != ddtree_attn_bias.device
+                ):
+                    workspace = torch.empty(
+                        workspace_shape,
+                        dtype=ddtree_attn_bias.dtype,
+                        device=ddtree_attn_bias.device,
+                    )
+                    self._ddtree_attn_bias_workspace = workspace
+                ddtree_attn_bias_view = workspace[
+                    : workspace_shape[0],
+                    : workspace_shape[1],
+                    : workspace_shape[2],
+                ]
+                ddtree_attn_bias_view.copy_(ddtree_attn_bias)
+                self._ddtree_attn_bias = ddtree_attn_bias_view
+                self._ddtree_force_eager = has_tree_offsets or (
+                    os.environ.get("VLLM_DDTREE_FORCE_EAGER") == "1"
+                )
             self._ddtree_tree_start_loc_cpu = ddtree_tree_start_loc_cpu
             self._ddtree_tree_lens_cpu = ddtree_tree_lens_cpu
 
@@ -3732,6 +3795,71 @@ class GPUModelRunner(
             invalid_req_indices,
         )
 
+    def _ddtree_kv_compact_index_select(
+        self,
+        cache_flat: torch.Tensor,
+        source_slots: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather accepted KV rows into a reusable workspace.
+
+        The workspace preserves the old overlap-safe semantics of
+        ``index_select`` followed by ``index_copy_`` while avoiding a fresh
+        temporary allocation for every layer on every DDTree step.
+        """
+        num_rows = source_slots.numel()
+        if num_rows == 0:
+            return cache_flat[:0]
+
+        device_index = cache_flat.device.index
+        key = (
+            cache_flat.device.type,
+            -1 if device_index is None else device_index,
+            cache_flat.dtype,
+            tuple(cache_flat.shape[1:]),
+        )
+        workspace = self._ddtree_kv_compact_workspaces.get(key)
+        workspace_shape = (num_rows, *cache_flat.shape[1:])
+        if workspace is None or workspace.shape[0] < num_rows:
+            workspace = torch.empty(
+                workspace_shape,
+                dtype=cache_flat.dtype,
+                device=cache_flat.device,
+            )
+            self._ddtree_kv_compact_workspaces[key] = workspace
+        else:
+            workspace = workspace[:num_rows]
+
+        torch.index_select(cache_flat, 0, source_slots, out=workspace)
+        return workspace
+
+    def _ddtree_kv_compact_rows_inplace(
+        self,
+        cache_flat: torch.Tensor,
+        source_slots: torch.Tensor,
+        dest_slots: torch.Tensor,
+    ) -> bool:
+        """Copy accepted KV rows directly when the cache layout is contiguous."""
+        num_rows = source_slots.numel()
+        if num_rows == 0:
+            return True
+        if cache_flat.device.type != "cuda" or not cache_flat.is_contiguous():
+            return False
+
+        row_width = cache_flat[0].numel()
+        if row_width == 0:
+            return True
+        block_size = 1024
+        total_elems = num_rows * row_width
+        _ddtree_kv_compact_rows_kernel[(triton.cdiv(total_elems, block_size),)](
+            cache_flat,
+            source_slots,
+            dest_slots,
+            num_rows,
+            ROW_WIDTH=row_width,
+            BLOCK_SIZE=block_size,
+        )
+        return True
+
     def _compact_ddtree_accepted_kv_cache(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3941,16 +4069,31 @@ class GPUModelRunner(
             for kv_cache in group_kv_caches:
                 if kv_cache.dim() == 3:
                     kv_cache_flat = kv_cache.flatten(0, 1)
-                    values = kv_cache_flat.index_select(0, source_slots)
-                    kv_cache_flat.index_copy_(0, dest_slots, values)
+                    if not self._ddtree_kv_compact_rows_inplace(
+                        kv_cache_flat, source_slots, dest_slots
+                    ):
+                        values = self._ddtree_kv_compact_index_select(
+                            kv_cache_flat, source_slots
+                        )
+                        kv_cache_flat.index_copy_(0, dest_slots, values)
                 else:
                     key_cache, value_cache = kv_cache.unbind(0)
                     key_cache_flat = key_cache.flatten(0, 1)
                     value_cache_flat = value_cache.flatten(0, 1)
-                    key_values = key_cache_flat.index_select(0, source_slots)
-                    value_values = value_cache_flat.index_select(0, source_slots)
-                    key_cache_flat.index_copy_(0, dest_slots, key_values)
-                    value_cache_flat.index_copy_(0, dest_slots, value_values)
+                    if not self._ddtree_kv_compact_rows_inplace(
+                        key_cache_flat, source_slots, dest_slots
+                    ):
+                        key_values = self._ddtree_kv_compact_index_select(
+                            key_cache_flat, source_slots
+                        )
+                        key_cache_flat.index_copy_(0, dest_slots, key_values)
+                    if not self._ddtree_kv_compact_rows_inplace(
+                        value_cache_flat, source_slots, dest_slots
+                    ):
+                        value_values = self._ddtree_kv_compact_index_select(
+                            value_cache_flat, source_slots
+                        )
+                        value_cache_flat.index_copy_(0, dest_slots, value_values)
 
         return accepted_counts
 
@@ -4446,6 +4589,10 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            force_eager_for_ddtree = bool(
+                scheduler_output.scheduled_spec_decode_metadata
+                and self._ddtree_force_eager
+            )
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4459,8 +4606,16 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
-                force_eager=bool(scheduler_output.scheduled_spec_decode_metadata),
+                force_eager=force_eager_for_ddtree,
             )
+            if self._spec_decode_debug_context is not None:
+                self._spec_debug_record(
+                    cudagraph_mode=str(cudagraph_mode),
+                    num_tokens_padded=int(batch_desc.num_tokens),
+                    num_reqs_padded=batch_desc.num_reqs,
+                    force_eager=force_eager_for_ddtree,
+                    ddtree_force_eager=bool(self._ddtree_force_eager),
+                )
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -4794,6 +4949,11 @@ class GPUModelRunner(
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
         if spec_config is not None:
+            ddtree_metadata_active = (
+                spec_config.use_ddtree()
+                and spec_decode_metadata is not None
+                and spec_decode_metadata.ddtree_metadata is not None
+            )
             # Decide whether to run the drafter or zero out draft tokens.
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
@@ -4802,7 +4962,7 @@ class GPUModelRunner(
             use_gpu_toks = (
                 (
                     spec_config.use_eagle()
-                    and not spec_config.use_ddtree()
+                    and not ddtree_metadata_active
                 )
                 or spec_config.uses_draft_model()
                 or spec_config.uses_extract_hidden_states()
@@ -5249,7 +5409,11 @@ class GPUModelRunner(
 
             use_cpu_sampled_tokens = (
                 spec_config.disable_padded_drafter_batch
-                or spec_config.use_ddtree()
+                or (
+                    spec_config.use_ddtree()
+                    and spec_decode_metadata is not None
+                    and spec_decode_metadata.ddtree_metadata is not None
+                )
             )
             if use_cpu_sampled_tokens:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -6800,6 +6964,11 @@ class GPUModelRunner(
 
         torch.accelerator.synchronize()
         torch.accelerator.empty_cache()
+
+        if self.model_config.use_mla:
+            current_workspace_manager().reserve_for_all_ubatches(
+                ((envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,), torch.uint8)
+            )
 
         # Lock workspace to prevent resizing during execution.
         # Max workspace sizes should have been captured during warmup/profiling.
