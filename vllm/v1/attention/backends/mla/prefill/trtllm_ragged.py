@@ -65,6 +65,12 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             device=device,
             layer_names=layer_names,
         )
+        current_workspace_manager().reserve_for_all_ubatches(
+            (
+                (envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,),
+                torch.uint8,
+            ),
+        )
 
     def _get_workspace_buffer(self) -> torch.Tensor:
         (workspace_buffer,) = current_workspace_manager().get_simultaneous(

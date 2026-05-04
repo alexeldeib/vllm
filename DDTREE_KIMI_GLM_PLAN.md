@@ -71,6 +71,80 @@ Kimi K2.5 model-side aux hidden states are already available through
 `KimiK25ForConditionalGeneration`, which delegates to the DeepSeek-V2 language
 model. The target can expose the hidden states needed by DFlash/DDTree.
 
+## K2.5 DFlash E2E Validation
+
+Validation date: May 4, 2026.
+
+The public DFlash head at `https://huggingface.co/z-lab/Kimi-K2.5-DFlash` was
+validated in `cw4637-dev-us-e-01a`, namespace `ace-inference`, using the
+existing NVFP4 target weights:
+
+- Target: `s3://infr/raw/nvidia/Kimi-K2.5-NVFP4/e4e908c073784de20ad3af0be653421f1088922d`
+- Runtime image: `ghcr.io/coreweave/ml-containers/vllm-tensorizer:alex-ddtree-vllm-image-7cf4eae-6acdb096fea8723d337292251068ee5928ce00a2`
+- Draft: `/tmp/z-lab/Kimi-K2.5-DFlash`, downloaded from Hugging Face `main`
+- Spec config: `method=dflash`, `num_speculative_tokens=8`,
+  `draft_tensor_parallel_size=4`
+- Target config: TP4, NVFP4, TRT-LLM ragged DeepSeek prefill, block size 32,
+  `max_model_len=32768`, `max_num_batched_tokens=8192`, `max_num_seqs=8`
+
+The first unpatched pod loaded the target and draft successfully, but a
+two-request mixed prefill/decode batch crashed the engine:
+
+```text
+Workspace is locked but allocation from 'trtllm_ragged.py:70:_get_workspace_buffer'
+requires 394.00 MB, current size is 0.00 MB.
+```
+
+The Kimi branch now fixes that class of failure by reserving the fixed
+FlashInfer/MLA workspace during backend initialization, before workspace lock
+and CUDA graph capture. The patched validation pod confirmed the reserve before
+lock on every TP rank:
+
+```text
+[WORKSPACE DEBUG] Resized workspace from 'trtllm_ragged.py:68:__init__':
+0.00 MB -> 394.00 MB
+[WORKSPACE DEBUG] Workspace locked. Current sizes: [394.0]
+```
+
+The patched pod reached readiness with no restarts. Engine init took 130.21 s,
+including 53.15 s compilation. KV cache sizing reported 470,080 tokens and
+maximum concurrency 14.35x at the 32,768-token smoke-test context limit.
+
+Correctness and API smoke results:
+
+- `/v1/models` returned the served K2.5 model and `max_model_len=32768`.
+- Chat math prompt `19 + 23` returned content `42` with Kimi reasoning parsed
+  into the `reasoning` field.
+- Text completion prompt `19 + 23 =` returned `42` in the generated text.
+- Sequential chat requests returned HTTP 200.
+- A 4-way no-delay mixed prefill/decode burst returned HTTP 200 for all
+  requests and did not reproduce the workspace crash.
+
+Bounded no-delay workload smoke:
+
+- 32 chat requests, concurrency 8, `max_tokens=64`
+- Wall time: 3.511 s
+- Request rate: 9.115 req/s
+- Output throughput: 583.345 generated tokens/s
+- Total token throughput: 781.591 tokens/s
+- Latency: mean 0.837 s, p50 0.836 s, p95 1.266 s
+- All 32 requests completed with HTTP 200 and `finish_reason=length`
+
+Spec decode was active during the burst. The final vLLM spec metric line after
+the workload reported:
+
+```text
+Mean acceptance length: 3.21, Accepted throughput: 47.43 tokens/s,
+Drafted throughput: 171.46 tokens/s, Accepted: 1423 tokens, Drafted: 5144
+tokens, Avg Draft acceptance rate: 27.7%
+```
+
+This is an e2e smoke validation for DFlash on K2.5 NVFP4, not a full Rebench or
+AIPerf sweep. The run intentionally used a shorter context limit and lower
+`max_num_seqs` than the production baseline to keep validation bounded. DDTree
+on K2.5 remains guarded until native MLA tree verification and MLA accepted-KV
+compaction are implemented.
+
 ## Why K2.5 DDTree Is Still Guarded
 
 The serving K2.5 pods use MLA attention and FP8 KV cache with TRT-LLM ragged

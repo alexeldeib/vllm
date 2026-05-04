@@ -76,6 +76,12 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
             device=device,
             layer_names=layer_names,
         )
+        current_workspace_manager().reserve_for_all_ubatches(
+            (
+                (envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,),
+                torch.uint8,
+            ),
+        )
 
         self._prefill_main: BatchPrefillWithRaggedKVCacheWrapper | None = None
         self._prefill_chunks: list[BatchPrefillWithRaggedKVCacheWrapper] = []

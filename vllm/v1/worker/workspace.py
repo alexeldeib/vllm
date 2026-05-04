@@ -116,7 +116,25 @@ class WorkspaceManager:
             for i in range(len(shapes_and_dtypes))
         ]
 
-    def _ensure_workspace_size(self, required_bytes: int) -> torch.Tensor:
+    def reserve_for_all_ubatches(
+        self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
+    ) -> None:
+        """Reserve enough workspace for every ubatch slot.
+
+        Backends with fixed workspace requirements should call this during
+        initialization or warmup so runtime execution cannot grow the workspace
+        after it has been locked.
+        """
+        actual_bytes = [_compute_bytes(s, d) for s, d in shapes_and_dtypes]
+        aligned_bytes = [round_up(actual, 256) for actual in actual_bytes]
+        total_bytes = sum(aligned_bytes)
+
+        for ubatch_id in range(self._num_ubatches):
+            self._ensure_workspace_size(total_bytes, ubatch_id=ubatch_id)
+
+    def _ensure_workspace_size(
+        self, required_bytes: int, ubatch_id: int | None = None
+    ) -> torch.Tensor:
         """Ensure workspace is allocated and large enough, return current workspace.
 
         Args:
@@ -125,7 +143,8 @@ class WorkspaceManager:
         Returns:
             The current workspace tensor.
         """
-        ubatch_id = dbo_current_ubatch_id()
+        if ubatch_id is None:
+            ubatch_id = dbo_current_ubatch_id()
         current_workspace = self._current_workspaces[ubatch_id]
         current_size = self._workspace_size_bytes(current_workspace)
 
