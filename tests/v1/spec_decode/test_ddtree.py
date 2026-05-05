@@ -85,13 +85,19 @@ def test_ddtree_verifier_is_greedy_only():
     assert not ddtree_can_use_tree_verifier(with_logprobs)
 
 
-def test_mla_tree_attention_split_policy_defaults_to_full_only(monkeypatch):
+def test_mla_tree_attention_split_policy_is_opt_in(monkeypatch):
     monkeypatch.delenv("VLLM_DDTREE_MLA_SPLIT_VERIFIER", raising=False)
     full_context = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL)
     piecewise_context = SimpleNamespace(
         cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE
     )
 
+    with override_forward_context(full_context):
+        assert not _use_mla_tree_attention_split()
+    with override_forward_context(piecewise_context):
+        assert not _use_mla_tree_attention_split()
+
+    monkeypatch.setenv("VLLM_DDTREE_MLA_SPLIT_VERIFIER", "full")
     with override_forward_context(full_context):
         assert _use_mla_tree_attention_split()
     with override_forward_context(piecewise_context):

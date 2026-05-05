@@ -4619,7 +4619,7 @@ class GPUModelRunner(
                 )
                 if spec_config is not None and spec_config.use_ddtree():
                     policy = os.environ.get(
-                        "VLLM_DDTREE_MLA_SPLIT_VERIFIER", "full"
+                        "VLLM_DDTREE_MLA_SPLIT_VERIFIER", "unified"
                     ).lower()
                     split_policy = policy in ("1", "true", "on", "always")
                     split_policy = split_policy or (

@@ -2179,7 +2179,7 @@ def _next_power_of_2_int(value: int) -> int:
 
 
 def _use_mla_tree_attention_split() -> bool:
-    policy = os.environ.get("VLLM_DDTREE_MLA_SPLIT_VERIFIER", "full").lower()
+    policy = os.environ.get("VLLM_DDTREE_MLA_SPLIT_VERIFIER", "unified").lower()
     if policy in ("0", "false", "off", "unified"):
         return False
     if policy in ("1", "true", "on", "always"):

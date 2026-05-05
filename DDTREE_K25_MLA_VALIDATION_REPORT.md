@@ -64,19 +64,21 @@ DFlash target-forward p95 was **25.7 ms**, while DDTree target-forward p95 was
 **511 ms**. That points to the current unified DDTree verifier's long-prefix
 cost.
 
-The split MLA verifier path was tested next. It is correct and promising only
-when the batch runs in `FULL` CUDA graph mode: target-forward p50/p95 were
-**16.0 ms / 16.7 ms** for those rows. It is not ready as a default because
-`PIECEWISE` rows were about **207 ms p50** target-forward on the warmed short
-smoke. I did not run a full split-verifier Rebench pass from that state.
+The split MLA verifier path was tested next. It is fast when the batch runs in
+`FULL` CUDA graph mode: target-forward p50/p95 were **16.0 ms / 16.7 ms** for
+those rows on the short smoke. A hybrid policy that used split for `FULL` and
+unified for `PIECEWISE`/`NONE` was then validated on the full C=8 Rebench trace.
+It fixed normal decode verifier latency but regressed end-to-end throughput:
 
-Follow-up change after that split-verifier smoke: the MLA verifier now defaults
-to a hybrid policy. It uses the split prefix/suffix verifier only when the
-runtime batch is in `FULL` CUDA graph mode, and keeps the unified verifier for
-`PIECEWISE` and `NONE` modes. This is designed to take the observed 16 ms split
-path where it is actually fast without taking the 200 ms `PIECEWISE` regression.
-The hybrid pod is queued in-cluster for validation, but the GB200 pool currently
-has no node with 4 free GPUs.
+- Hybrid DDTree+DFlash: **268.0 output tok/s**.
+- Unified DDTree+DFlash: **294.5 output tok/s**.
+- DFlash-only: **352.3 output tok/s**.
+
+The hybrid run reduced target-forward p95 from **511 ms** to **26.3 ms**, but
+acceptance dropped from **34.6%** to **28.7%**, increasing the number of target
+steps enough to lose overall. Therefore the split verifier remains opt-in for
+debugging and follow-up optimization. The production default is the unified MLA
+verifier.
 
 ## Branch And Scope
 
@@ -115,16 +117,17 @@ channels and slicing them off afterward.
 
 A split verifier reuses the existing MLA decode kernel for prefix attention and
 separately computes the small tree suffix mask, then merges prefix and suffix
-states by log-sum-exp. On the K2.5 smoke it is correct, fast under `FULL` graph
-capture, and too slow under `PIECEWISE` capture/eager fallback.
+states by log-sum-exp. On the K2.5 smoke it is fast under `FULL` graph capture,
+but it is not default-ready after the full Rebench acceptance regression.
 
-The default policy is now `VLLM_DDTREE_MLA_SPLIT_VERIFIER=full`: split verifier
-under `CUDAGraphMode.FULL`, unified verifier otherwise. Operators can still force
-the old behaviors:
+The default policy is now `VLLM_DDTREE_MLA_SPLIT_VERIFIER=unified`: unified
+verifier for all graph modes. Operators can still force the experimental
+behaviors:
 
 - `VLLM_DDTREE_MLA_SPLIT_VERIFIER=always` forces split verifier everywhere.
-- `VLLM_DDTREE_MLA_SPLIT_VERIFIER=off` or `unified` forces unified verifier.
-- `auto`, `full`, `full_only`, and `hybrid` use the production hybrid policy.
+- `VLLM_DDTREE_MLA_SPLIT_VERIFIER=off` or `unified` uses unified verifier.
+- `auto`, `full`, `full_only`, and `hybrid` use split only under
+  `CUDAGraphMode.FULL` and unified otherwise.
 
 Debug events now include `ddtree_mla_verifier_policy` and
 `ddtree_mla_verifier_expected` so a smoke or Rebench run can confirm whether
@@ -211,7 +214,7 @@ python3 -m py_compile \
 
 Result: passed after the final reverse-copy compaction hardening.
 
-Additional local checks after the hybrid verifier policy and debug-metric
+Additional local checks after the split-verifier policy and debug-metric
 instrumentation:
 
 ```text
@@ -341,16 +344,39 @@ expensive. The next verifier optimization should focus on making this path graph
 stable for all common padded decode sizes, or replacing the Python/Triton split
 with a native fused MLA tree verifier.
 
-Hybrid verifier validation is the next queued measurement. Expected success
-criteria:
+Hybrid verifier full C=8 Rebench result:
 
-- `FULL` rows report `ddtree_mla_verifier_expected=split`.
-- `PIECEWISE` and `NONE` rows report `ddtree_mla_verifier_expected=unified`.
-- Accepted-token sum equals compacted-token sum.
-- Short-smoke target-forward p95 does not inherit the forced-split 200 ms
-  `PIECEWISE` regression.
-- Full Rebench C=8 target-forward p95 moves materially closer to DFlash's
-  25.7 ms p95 before starting a production image build.
+| Metric | Hybrid split-on-FULL | Unified DDTree | DFlash-only |
+| --- | ---: | ---: | ---: |
+| Output throughput | 268.0 tok/s | 294.5 tok/s | 352.3 tok/s |
+| Request throughput | 0.973 req/s | 1.099 req/s | 1.301 req/s |
+| Benchmark duration | 1,549.5 s | 1,371.8 s | 1,158.3 s |
+| Successful requests | 1,507 | 1,507 | 1,507 |
+| Context-limit errors | 518 | 517 | 517 |
+| Other errors | 0 | 1 | 1 |
+| Total output tokens | 415,290 | 403,989 | 408,040 |
+| TTFT p50 / p95 | 727 ms / 1,356 ms | 738 ms / 1,343 ms | 442 ms / 837 ms |
+| ITL p50 / p95 | 22.2 ms / 38.5 ms | 23.3 ms / 40.2 ms | 17.8 ms / 31.2 ms |
+
+Hybrid verifier server-side debug:
+
+| Metric | Hybrid split-on-FULL |
+| --- | ---: |
+| Acceptance rate | 28.7% |
+| Accepted token sum | 1,171,708 |
+| Compacted token sum | 1,171,708 |
+| CUDA graph FULL events | 106,432 |
+| CUDA graph PIECEWISE events | 200 |
+| CUDA graph NONE events | 5,368 |
+| `FULL` target-forward p50 / p95 | 15.0 ms / 25.2 ms |
+| `PIECEWISE` target-forward p50 / p95 | 31.4 ms / 565.0 ms |
+| `NONE` target-forward p50 / p95 | 531.7 ms / 624.6 ms |
+| Overall target-forward p50 / p95 | 19.8 ms / 26.3 ms |
+
+This shows the split path solved the normal `FULL` verifier latency problem, but
+not the end-to-end performance problem. The next optimization target is
+acceptance parity and the remaining `NONE`/long-context verifier path, not a
+container build.
 
 ## Apples-To-Apples Baselines
 
@@ -446,8 +472,8 @@ Ready enough for code review:
 
 Not ready to merge as a production default until:
 
-- The hybrid or split/native MLA verifier closes the long-context Rebench gap to
-  DFlash without regressing `PIECEWISE` or `NONE` graph modes.
+- The split/native MLA verifier closes the long-context Rebench gap to DFlash
+  without reducing acceptance or regressing `PIECEWISE`/`NONE` graph modes.
 - Full Rebench sweep runs at C=1,2,4,8,16,32,48 on a pod configured for
   `max_num_seqs >= 48`.
 - Compaction kernel warmup is added.
