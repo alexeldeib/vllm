@@ -4609,6 +4609,7 @@ class GPUModelRunner(
                 force_eager=force_eager_for_ddtree,
             )
             if self._spec_decode_debug_context is not None:
+                spec_config = self.speculative_config
                 self._spec_debug_record(
                     cudagraph_mode=str(cudagraph_mode),
                     num_tokens_padded=int(batch_desc.num_tokens),
@@ -4616,6 +4617,21 @@ class GPUModelRunner(
                     force_eager=force_eager_for_ddtree,
                     ddtree_force_eager=bool(self._ddtree_force_eager),
                 )
+                if spec_config is not None and spec_config.use_ddtree():
+                    policy = os.environ.get(
+                        "VLLM_DDTREE_MLA_SPLIT_VERIFIER", "full"
+                    ).lower()
+                    split_policy = policy in ("1", "true", "on", "always")
+                    split_policy = split_policy or (
+                        policy in ("auto", "full", "full_only", "hybrid")
+                        and cudagraph_mode == CUDAGraphMode.FULL
+                    )
+                    self._spec_debug_record(
+                        ddtree_mla_verifier_policy=policy,
+                        ddtree_mla_verifier_expected=(
+                            "split" if split_policy else "unified"
+                        ),
+                    )
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "

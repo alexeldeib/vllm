@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn.functional as F
 
+from vllm.config import CUDAGraphMode
+from vllm.forward_context import override_forward_context
 from vllm.model_executor.layers.attention.mla_attention import (
     MLACommonDecodeMetadata,
     MLACommonMetadata,
     _mla_tree_attention_ref,
+    _use_mla_tree_attention_split,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.ddtree import (
@@ -78,6 +83,27 @@ def test_ddtree_verifier_is_greedy_only():
     assert ddtree_can_use_tree_verifier(greedy)
     assert not ddtree_can_use_tree_verifier(random)
     assert not ddtree_can_use_tree_verifier(with_logprobs)
+
+
+def test_mla_tree_attention_split_policy_defaults_to_full_only(monkeypatch):
+    monkeypatch.delenv("VLLM_DDTREE_MLA_SPLIT_VERIFIER", raising=False)
+    full_context = SimpleNamespace(cudagraph_runtime_mode=CUDAGraphMode.FULL)
+    piecewise_context = SimpleNamespace(
+        cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE
+    )
+
+    with override_forward_context(full_context):
+        assert _use_mla_tree_attention_split()
+    with override_forward_context(piecewise_context):
+        assert not _use_mla_tree_attention_split()
+
+    monkeypatch.setenv("VLLM_DDTREE_MLA_SPLIT_VERIFIER", "always")
+    with override_forward_context(piecewise_context):
+        assert _use_mla_tree_attention_split()
+
+    monkeypatch.setenv("VLLM_DDTREE_MLA_SPLIT_VERIFIER", "off")
+    with override_forward_context(full_context):
+        assert not _use_mla_tree_attention_split()
 
 
 def test_ddtree_proposer_falls_back_to_linear_dflash_for_non_greedy():

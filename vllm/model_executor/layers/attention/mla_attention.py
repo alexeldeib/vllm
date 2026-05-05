@@ -204,6 +204,7 @@ from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import (
     CacheConfig,
+    CUDAGraphMode,
     ModelConfig,
     VllmConfig,
     get_current_vllm_config,
@@ -766,7 +767,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 )
                 assert isinstance(mqa_q, tuple)
                 mqa_ql_nope, mqa_q_pe = mqa_q
-                if os.environ.get("VLLM_DDTREE_MLA_SPLIT_VERIFIER") == "1":
+                if _use_mla_tree_attention_split():
                     try:
                         attn_out = _mla_tree_attention_split(
                             mqa_ql_nope[:, : self.num_heads],
@@ -2175,6 +2176,17 @@ def _next_power_of_2_int(value: int) -> int:
     if value <= 1:
         return 1
     return 1 << (value - 1).bit_length()
+
+
+def _use_mla_tree_attention_split() -> bool:
+    policy = os.environ.get("VLLM_DDTREE_MLA_SPLIT_VERIFIER", "full").lower()
+    if policy in ("0", "false", "off", "unified"):
+        return False
+    if policy in ("1", "true", "on", "always"):
+        return True
+    if policy in ("auto", "full", "full_only", "hybrid"):
+        return get_forward_context().cudagraph_runtime_mode == CUDAGraphMode.FULL
+    return False
 
 
 def _mla_tree_attention_split(
