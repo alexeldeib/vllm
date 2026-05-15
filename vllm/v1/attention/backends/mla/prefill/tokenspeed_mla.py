@@ -46,6 +46,10 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
             return False
 
     @classmethod
+    def supports_prefill_query_quantization(cls) -> bool:
+        return True
+
+    @classmethod
     def validate_configuration(
         cls,
         device_capability,
@@ -81,7 +85,7 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
             vllm_config=vllm_config,
         )
 
-        # Pre-JIT BF16 and FP8 prefill kernels. Idempotent — also called from
+        # Pre-JIT BF16 and FP8 prefill kernels. Idempotent; also called from
         # TokenspeedMLAImpl.__init__; second call is a no-op.
         from tokenspeed_mla import warmup_compile_prefill
 
@@ -103,7 +107,7 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
         # for parity with trtllm_ragged. cuda-graph padding in
         # `query_start_loc` is saturated to `total_num_tokens`
         # (gpu_model_runner.py:1905), so trailing diffs are 0 and padded batches
-        # are kernel no-ops — same reason trtllm passes the padded length as
+        # are kernel no-ops; same reason trtllm passes the padded length as
         # batch_size directly.
         self._query_seq_lens = (
             prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
@@ -115,11 +119,16 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         return_softmax_lse: bool,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from tokenspeed_mla import tokenspeed_mla_prefill
 
+        softmax_scale, output_scale = self._get_bmm_scales(q_scale, k_scale, v_scale)
+
         # `v` arrives as the second half of `kv_nope.split(...)` in
-        # mla_attention.forward_mha — a non-contiguous view of `kv_nope` along
+        # mla_attention.forward_mha: a non-contiguous view of `kv_nope` along
         # dim=-1. The kernel does `v.reshape(1, total_kv, h_k, 1, d_v)` which
         # would silently copy on a non-contiguous tensor; force contiguity here
         # so the copy (if any) happens once outside the kernel call.
@@ -133,11 +142,12 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
             cum_seq_lens=self._prefill_metadata.query_start_loc,
             max_seq_len=self._prefill_metadata.max_query_len,
             batch_size=self._query_seq_lens.shape[0],
-            softmax_scale=self.scale,
+            softmax_scale=softmax_scale,
             is_causal=True,
             return_lse=return_softmax_lse,
             enable_pdl=False,
         )
+        ret = self._scale_output(ret, output_scale)
 
         if isinstance(ret, tuple):
             # Convert from (q_len, num_heads) to (num_heads, q_len)
@@ -150,13 +160,17 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from tokenspeed_mla import tokenspeed_mla_prefill
 
         assert self._prefill_metadata.chunked_context is not None
         chunked = self._prefill_metadata.chunked_context
+        softmax_scale, output_scale = self._get_bmm_scales(q_scale, k_scale, v_scale)
 
-        # See note in run_prefill_new_tokens — `v` is a split-view of `kv_nope`
+        # See note in run_prefill_new_tokens: `v` is a split-view of `kv_nope`
         # in `_compute_prefill_context` and arrives non-contiguous.
         v = v.contiguous()
 
@@ -168,13 +182,45 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
             cum_seq_lens=chunked.cu_seq_lens[chunk_idx],
             max_seq_len=chunked.max_seq_lens[chunk_idx],
             batch_size=chunked.seq_lens[chunk_idx].shape[0],
-            softmax_scale=self.scale,
+            softmax_scale=softmax_scale,
             is_causal=False,
             return_lse=True,
             cum_seq_lens_q=self._prefill_metadata.query_start_loc,
             max_seq_len_q=self._prefill_metadata.max_query_len,
             enable_pdl=False,
         )
+        attn_out, lse = self._scale_output((attn_out, lse), output_scale)
 
         # Convert from (q_len, num_heads) to (num_heads, q_len)
         return attn_out, lse.transpose(0, 1).contiguous()
+
+    def _get_bmm_scales(
+        self,
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+    ) -> tuple[float, float]:
+        # TokenSpeed does not expose q/k/v descale parameters in its public
+        # wrapper. For static per-tensor FP8, applying q_scale * k_scale to the
+        # logits scale and v_scale to the BF16 output is equivalent to
+        # dequantizing Q/K before QK and V before PV.
+        if q_scale is None and k_scale is None and v_scale is None:
+            return self.scale, 1.0
+
+        if q_scale is None or k_scale is None or v_scale is None:
+            raise ValueError(
+                "TokenSpeed MLA prefill requires q, k, and v scales together"
+            )
+        return self.scale * q_scale * k_scale, v_scale
+
+    @staticmethod
+    def _scale_output(
+        ret: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        output_scale: float,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if output_scale == 1.0:
+            return ret
+        if isinstance(ret, tuple):
+            ret[0].mul_(output_scale)
+            return ret
+        return ret.mul_(output_scale)

@@ -42,10 +42,12 @@ class AttentionConfig:
 
     mla_prefill_backend: MLAPrefillBackendEnum | None = None
     """MLA prefill backend to use. If None, will be selected automatically.
-    Valid options: FLASH_ATTN (FA3/FA4), FLASHINFER, TRTLLM_RAGGED."""
+    Valid options: FLASH_ATTN (FA3/FA4), FLASHINFER, TRTLLM_RAGGED,
+    TOKENSPEED_MLA."""
 
     use_prefill_query_quantization: bool = False
-    """If set, quantize query for attention in prefill."""
+    """If set, quantize MLA prefill Q/K/V attention inputs with static FP8
+    descales."""
 
     use_fp4_indexer_cache: bool = False
     """If set, use fp4 indexer cache for dsv32 family model (not support yet)"""

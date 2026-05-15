@@ -24,6 +24,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionLayer,
     CommonAttentionMetadata,
+    MLAPrefillLayer,
     MultipleOf,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
@@ -812,6 +813,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
         attn_metadata: MLACommonMetadata,
         k_scale: torch.Tensor,
         output: torch.Tensor,
+        layer: MLAPrefillLayer,
     ) -> None:
         """Dispatch prefill to the FP8 ASM kernel when available.
 
@@ -837,6 +839,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 attn_metadata,
                 k_scale,
                 output,
+                layer,
             )
 
         assert attn_metadata.prefill is not None
@@ -852,6 +855,7 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
                 attn_metadata,
                 k_scale,
                 output,
+                layer,
             )
 
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(

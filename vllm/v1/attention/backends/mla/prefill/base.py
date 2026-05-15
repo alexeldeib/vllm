@@ -45,6 +45,10 @@ class MLAPrefillBackend(ABC):
         return True
 
     @classmethod
+    def supports_prefill_query_quantization(cls) -> bool:
+        return False
+
+    @classmethod
     def validate_configuration(
         cls,
         device_capability: "DeviceCapability",
@@ -63,6 +67,14 @@ class MLAPrefillBackend(ABC):
 
         if not cls.is_available():
             invalid_reasons.append("required dependencies not available")
+
+        if (
+            selector_config.use_prefill_query_quantization
+            and not cls.supports_prefill_query_quantization()
+        ):
+            invalid_reasons.append(
+                "backend does not support prefill query quantization"
+            )
 
         if cls.requires_r1_mla_dimensions and not selector_config.is_r1_compatible:
             invalid_reasons.append(
@@ -107,6 +119,9 @@ class MLAPrefillBackend(ABC):
         k: torch.Tensor,
         v: torch.Tensor,
         return_softmax_lse: bool,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
@@ -117,5 +132,8 @@ class MLAPrefillBackend(ABC):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError

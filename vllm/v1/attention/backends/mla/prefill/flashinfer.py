@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FlashInfer backend for MLA prefill."""
 
+import functools
+from inspect import signature
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,6 +32,23 @@ except ImportError:
 _DEFAULT_NUM_CHUNKS = 32
 
 
+@functools.cache
+def _flashinfer_ragged_run_accepts_scales() -> bool:
+    run = getattr(BatchPrefillWithRaggedKVCacheWrapper, "run", None)
+    if run is None:
+        return False
+
+    try:
+        parameters = signature(run).parameters
+    except (TypeError, ValueError):
+        return False
+
+    # Treat only explicit q/k/v scale parameters as support. Some wrappers
+    # accept **kwargs but older kernels still ignore unknown descale arguments,
+    # which would silently run scaled FP8 inputs in the encoded domain.
+    return all(name in parameters for name in ("q_scale", "k_scale", "v_scale"))
+
+
 class FlashInferPrefillBackend(MLAPrefillBackend):
     """FlashInfer backend for MLA prefill."""
 
@@ -53,6 +72,10 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
             return True
         except ImportError:
             return False
+
+    @classmethod
+    def supports_prefill_query_quantization(cls) -> bool:
+        return _flashinfer_ragged_run_accepts_scales()
 
     def __init__(
         self,
@@ -188,14 +211,19 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         return_softmax_lse: bool,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         assert self._prefill_main is not None
+        scale_kwargs = self._scale_kwargs(q_scale, k_scale, v_scale)
 
         ret = self._prefill_main.run(
             q=q,
             k=k,
             v=v,
             return_lse=return_softmax_lse,
+            **scale_kwargs,
         )
 
         if isinstance(ret, tuple):
@@ -209,13 +237,38 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        scale_kwargs = self._scale_kwargs(q_scale, k_scale, v_scale)
         attn_out, lse = self._prefill_chunks[chunk_idx].run(
             q=q,
             k=k,
             v=v,
             return_lse=True,
+            **scale_kwargs,
         )
 
         # Convert from (q_len, num_heads) to (num_heads, q_len)
         return attn_out, lse.transpose(0, 1).contiguous()
+
+    @classmethod
+    def _scale_kwargs(
+        cls,
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+    ) -> dict[str, float]:
+        if q_scale is None and k_scale is None and v_scale is None:
+            return {}
+        if q_scale is None or k_scale is None or v_scale is None:
+            raise ValueError(
+                "FlashInfer ragged MLA prefill requires q, k, and v scales together"
+            )
+        if not cls.supports_prefill_query_quantization():
+            raise NotImplementedError(
+                "FlashInfer ragged MLA prefill does not support scaled FP8 "
+                "input descales with this flashinfer version"
+            )
+        return {"q_scale": q_scale, "k_scale": k_scale, "v_scale": v_scale}

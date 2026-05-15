@@ -13,6 +13,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.platforms.interface import DeviceCapability
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ class MLAPrefillSelectorConfig(NamedTuple):
 
     dtype: torch.dtype
     is_r1_compatible: bool
+    use_prefill_query_quantization: bool = False
 
 
 def is_deepseek_r1_mla_compatible(vllm_config: "VllmConfig") -> bool:
@@ -100,10 +102,16 @@ def get_mla_prefill_backend(
         return MLAPrefillBackendEnum.FLASH_ATTN.get_class()
 
     attention_config = vllm_config.attention_config
+    cache_config = getattr(vllm_config, "cache_config", None)
+    cache_dtype = getattr(cache_config, "cache_dtype", "auto")
 
     selector_config = MLAPrefillSelectorConfig(
         dtype=vllm_config.model_config.dtype,
         is_r1_compatible=is_deepseek_r1_mla_compatible(vllm_config),
+        use_prefill_query_quantization=(
+            attention_config.use_prefill_query_quantization
+            and is_quantized_kv_cache(cache_dtype)
+        ),
     )
 
     if attention_config.mla_prefill_backend is not None:

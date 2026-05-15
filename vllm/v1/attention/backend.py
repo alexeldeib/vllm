@@ -840,6 +840,22 @@ class AttentionImpl(AttentionImplBase[T], Generic[T]):
         raise NotImplementedError
 
 
+class MLAPrefillLayer(Protocol):
+    _q_scale: torch.Tensor
+    _k_scale: torch.Tensor
+    _v_scale: torch.Tensor
+    _q_scale_float: float
+    _k_scale_float: float
+    _v_scale_float: float
+
+    def _scaled_fp8_prefill_input(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        scale_float: float | None = None,
+    ) -> torch.Tensor: ...
+
+
 class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     """MLA attention implementation with forward_mqa and forward_mha methods."""
 
@@ -879,6 +895,7 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
         attn_metadata: T,
         k_scale: torch.Tensor,
         output: torch.Tensor,
+        layer: MLAPrefillLayer,
     ) -> None:
         """MHA-style prefill forward pass."""
         raise NotImplementedError

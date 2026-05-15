@@ -24,6 +24,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     QueryLenSupport,
     _DecodeConcatQuantFP8,
 )
+from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -314,6 +315,7 @@ class MockSparseMLAAttentionLayer:
         W_UV: torch.Tensor,
         q_scale: float,
         k_scale: float,
+        v_scale: float,
     ):
         self.impl = impl
         self.num_heads = num_heads
@@ -331,13 +333,18 @@ class MockSparseMLAAttentionLayer:
         # Scale attributes needed by attention backends
         self._q_scale = torch.tensor(q_scale, device=device)
         self._k_scale = torch.tensor(k_scale, device=device)
-        self._v_scale = torch.tensor(float("nan"), device=device)
+        self._v_scale = torch.tensor(v_scale, device=device)
         self._prob_scale = torch.tensor(1.0, device=device)
         self._q_scale_float = q_scale
         self._k_scale_float = k_scale
-        self._v_scale_float = float("nan")
+        self._v_scale_float = v_scale
 
         self._decode_concat_quant_fp8_op = _DecodeConcatQuantFP8(
+            static=True,
+            group_shape=GroupShape.PER_TENSOR,
+            compile_native=True,
+        )
+        self._quant_fp8_op = QuantFP8(
             static=True,
             group_shape=GroupShape.PER_TENSOR,
             compile_native=True,
@@ -420,7 +427,7 @@ class MockMLAAttentionLayer(MLAAttention):
     `static_forward_context` by `isinstance(layer, MLAAttention)` (e.g.
     FlashInfer prefill, which reads sm_scale through that filter) see the
     mock as a real MLA layer. MLAAttention.__init__ is intentionally
-    skipped — it would create its own impl/prefill_backend and self-register
+    skipped; it would create its own impl/prefill_backend and self-register
     in static_forward_context, which fights what the test sets up below.
     """
 
@@ -436,6 +443,7 @@ class MockMLAAttentionLayer(MLAAttention):
         kv_b_proj,
         q_scale: float,
         k_scale: float,
+        v_scale: float,
     ):
         torch.nn.Module.__init__(self)
         self.impl = impl
@@ -462,13 +470,18 @@ class MockMLAAttentionLayer(MLAAttention):
         # Scale attributes needed by attention backends
         self._q_scale = torch.tensor(q_scale, device=device)
         self._k_scale = torch.tensor(k_scale, device=device)
-        self._v_scale = torch.tensor(float("nan"), device=device)
+        self._v_scale = torch.tensor(v_scale, device=device)
         self._prob_scale = torch.tensor(1.0, device=device)
         self._q_scale_float = q_scale
         self._k_scale_float = k_scale
-        self._v_scale_float = float("nan")
+        self._v_scale_float = v_scale
 
         self._decode_concat_quant_fp8_op = _DecodeConcatQuantFP8(
+            static=True,
+            group_shape=GroupShape.PER_TENSOR,
+            compile_native=True,
+        )
+        self._quant_fp8_op = QuantFP8(
             static=True,
             group_shape=GroupShape.PER_TENSOR,
             compile_native=True,
@@ -524,6 +537,7 @@ class MockMLAAttentionLayer(MLAAttention):
                 attn_metadata,
                 self._k_scale,
                 output=output[num_decode_tokens:],
+                layer=self,
             )
 
         # Run decode with forward_mqa
@@ -587,6 +601,7 @@ def run_attention_backend(
     mock_kv_b_proj,
     q_scale: float,
     k_scale: float,
+    v_scale: float,
     kv_cache_dtype: str = "auto",
     prefill_backend: MLAPrefillBackendEnum | None = None,
 ) -> torch.Tensor:
@@ -654,6 +669,7 @@ def run_attention_backend(
             kv_b_proj=mock_kv_b_proj,
             q_scale=q_scale,
             k_scale=k_scale,
+            v_scale=v_scale,
         )
 
         # Attach prefill backend (normally created by MLAAttention.__init__)
@@ -681,6 +697,10 @@ def run_attention_backend(
             common_prefix_len=0,
             common_attn_metadata=common_attn_metadata,
         )
+        if vllm_config.attention_config.use_prefill_query_quantization:
+            prefill_metadata = getattr(attn_metadata, "prefill", None)
+            if prefill_metadata is not None:
+                assert prefill_metadata.q_data_type == current_platform.fp8_dtype()
 
         # Create output buffer
         num_tokens = query.shape[0]
@@ -716,7 +736,9 @@ def run_attention_backend(
 @pytest.mark.parametrize("model", ["deepseek-ai/DeepSeek-R1"])
 @pytest.mark.parametrize("tensor_parallel_size", [1, 4, 8, 16])
 @pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8", "fp8_e4m3"])
-@pytest.mark.parametrize(("q_scale", "k_scale"), [(1.0, 1.0), (2.0, 3.0)])
+@pytest.mark.parametrize(
+    ("q_scale", "k_scale", "v_scale"), [(1.0, 1.0, 1.0), (2.0, 3.0, 5.0)]
+)
 @pytest.mark.parametrize("prefill_backend", PREFILL_BACKENDS_TO_TEST)
 def test_backend_correctness(
     default_vllm_config,
@@ -728,6 +750,7 @@ def test_backend_correctness(
     kv_cache_dtype: str,
     q_scale: float,
     k_scale: float,
+    v_scale: float,
     prefill_backend: MLAPrefillBackendEnum,
 ):
     """
@@ -751,16 +774,26 @@ def test_backend_correctness(
     head counts.
     """
 
+    batch_spec = BATCH_SPECS[batch_spec_name]
+    use_prefill_query_quantization = kv_cache_dtype.startswith("fp8") and (
+        q_scale != 1.0 or k_scale != 1.0 or v_scale != 1.0
+    )
+
     # Filter backends to those that support the requested kv_cache_dtype
     backends_to_test = [
         b
         for b in BACKENDS_TO_TEST
         if kv_cache_dtype in b.get_class().supported_kv_cache_dtypes
     ]
+    has_single_token_decode = any(q_len == 1 for q_len in batch_spec.query_lens)
     if (
-        q_scale != 1.0 or k_scale != 1.0
-    ) and AttentionBackendEnum.CUTLASS_MLA in backends_to_test:
-        # CUTLASS_MLA does not support non-1 Q/K scales
+        use_prefill_query_quantization
+        and has_single_token_decode
+        and AttentionBackendEnum.CUTLASS_MLA in backends_to_test
+    ):
+        # CUTLASS_MLA decode does not support non-1 FP8 input descales yet.
+        # Keep CUTLASS_MLA in pure-prefill rows so the shared FP8 prefill path
+        # stays covered for CUTLASS attention backends.
         backends_to_test.remove(AttentionBackendEnum.CUTLASS_MLA)
     if not backends_to_test:
         pytest.skip(f"No backends support kv_cache_dtype={kv_cache_dtype}")
@@ -773,7 +806,11 @@ def test_backend_correctness(
     try:
         prefill_invalid_reasons = prefill_backend.get_class().validate_configuration(
             current_platform.get_device_capability(),
-            MLAPrefillSelectorConfig(dtype=torch.bfloat16, is_r1_compatible=True),
+            MLAPrefillSelectorConfig(
+                dtype=torch.bfloat16,
+                is_r1_compatible=True,
+                use_prefill_query_quantization=use_prefill_query_quantization,
+            ),
         )
     except ImportError:
         prefill_invalid_reasons = ["ImportError"]
@@ -783,7 +820,6 @@ def test_backend_correctness(
             f"{prefill_invalid_reasons}"
         )
 
-    batch_spec = BATCH_SPECS[batch_spec_name]
     is_spec_decode_test = batch_spec_name.startswith("spec_decode")
     unique_block_sizes = sorted(set(BACKEND_BLOCK_SIZES[b] for b in backends_to_test))
     default_block_size = unique_block_sizes[0]
@@ -820,6 +856,10 @@ def test_backend_correctness(
         hf_config_override=hf_config_override,
     )
     vllm_config.cache_config.cache_dtype = kv_cache_dtype
+    vllm_config.cache_config.calculate_kv_scales = False
+    vllm_config.attention_config.use_prefill_query_quantization = (
+        use_prefill_query_quantization
+    )
 
     # For spec decode tests, add a speculative_config to set the reorder_batch_threshold
     if is_spec_decode_test:
@@ -1153,6 +1193,7 @@ def test_backend_correctness(
             prefill_backend=prefill_backend,
             q_scale=q_scale,
             k_scale=k_scale,
+            v_scale=v_scale,
             kv_cache_dtype=kv_cache_dtype,
         )
 

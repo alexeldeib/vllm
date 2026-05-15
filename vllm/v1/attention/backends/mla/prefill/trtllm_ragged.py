@@ -42,6 +42,10 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
         except ImportError:
             return False
 
+    @classmethod
+    def supports_prefill_query_quantization(cls) -> bool:
+        return True
+
     def __init__(
         self,
         num_heads: int,
@@ -83,8 +87,13 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         return_softmax_lse: bool,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
+
+        bmm1_scale, bmm2_scale = self._get_bmm_scales(q_scale, k_scale, v_scale)
 
         out = torch.empty(
             q.shape[0],
@@ -102,8 +111,8 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             seq_lens=self._query_seq_lens,
             max_q_len=self._prefill_metadata.max_query_len,
             max_kv_len=self._prefill_metadata.max_query_len,
-            bmm1_scale=self.scale,
-            bmm2_scale=1.0,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
             o_sf_scale=1.0,
             batch_size=self._query_seq_lens.shape[0],
             window_left=-1,
@@ -126,11 +135,16 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from flashinfer.prefill import trtllm_ragged_attention_deepseek
 
         assert self._prefill_metadata.chunked_context is not None
         assert self._prefill_metadata.chunked_context.seq_lens[chunk_idx] is not None
+
+        bmm1_scale, bmm2_scale = self._get_bmm_scales(q_scale, k_scale, v_scale)
 
         out = torch.empty(
             q.shape[0],
@@ -148,8 +162,8 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             seq_lens=self._prefill_metadata.chunked_context.seq_lens[chunk_idx],
             max_q_len=self._prefill_metadata.max_query_len,
             max_kv_len=self._prefill_metadata.chunked_context.max_seq_lens[chunk_idx],
-            bmm1_scale=self.scale,
-            bmm2_scale=1.0,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
             o_sf_scale=1.0,
             batch_size=self._prefill_metadata.chunked_context.seq_lens[chunk_idx].shape[
                 0
@@ -167,3 +181,18 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
 
         # Convert from (q_len, num_heads) to (num_heads, q_len)
         return attn_out, lse.transpose(0, 1).contiguous()
+
+    def _get_bmm_scales(
+        self,
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+    ) -> tuple[float, float]:
+        if q_scale is None and k_scale is None and v_scale is None:
+            return self.scale, 1.0
+
+        if q_scale is None or k_scale is None or v_scale is None:
+            raise ValueError(
+                "TRT-LLM ragged MLA prefill requires q, k, and v scales together"
+            )
+        return self.scale * q_scale * k_scale, v_scale

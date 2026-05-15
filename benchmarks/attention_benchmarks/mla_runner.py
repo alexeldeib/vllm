@@ -835,6 +835,7 @@ def _run_single_benchmark(
                     metadata,
                     prefill_inputs["k_scale"],
                     prefill_inputs["output"],
+                    layer,
                 )
             )
         return results[0] if len(results) == 1 else tuple(results)
