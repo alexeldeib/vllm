@@ -7,9 +7,11 @@ import pytest
 
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.parser.abstract_parser import _WrappedParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
 from vllm.reasoning.kimi_k2_reasoning_parser import KimiK2ReasoningParser
 from vllm.tokenizers import get_tokenizer
+from vllm.tool_parsers.kimi_k2_tool_parser import KimiK2ToolParser
 
 REASONING_MODEL_NAME = "moonshotai/Kimi-K2.5"
 
@@ -90,6 +92,175 @@ def test_extract_reasoning_tool_section_ends_reasoning(kimi_k2_tokenizer):
     reasoning, content = parser.extract_reasoning(text, request)
     assert reasoning == "some reasoning"
     assert content == "<|tool_calls_section_begin|>tool call data"
+
+
+def test_extract_reasoning_json_response_format_bypasses_reasoning(
+    mock_kimi_k2_tokenizer,
+):
+    parser = KimiK2ReasoningParser(mock_kimi_k2_tokenizer)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[],
+        response_format={"type": "json_object"},
+    )
+
+    reasoning, content = parser.extract_reasoning('{"answer": 42}', request)
+
+    assert reasoning is None
+    assert content == '{"answer": 42}'
+
+
+def test_extract_reasoning_text_response_format_keeps_reasoning(
+    mock_kimi_k2_tokenizer,
+):
+    parser = KimiK2ReasoningParser(mock_kimi_k2_tokenizer)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[],
+        response_format={"type": "text"},
+    )
+
+    reasoning, content = parser.extract_reasoning('{"answer": 42}', request)
+
+    assert reasoning == '{"answer": 42}'
+    assert content is None
+
+
+def test_extract_reasoning_auto_tool_embedded_json_stays_content(
+    mock_kimi_k2_tokenizer,
+):
+    parser = KimiK2ReasoningParser(mock_kimi_k2_tokenizer)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+
+    text = (
+        '<think>done</think>Here is JSON, not a tool call: '
+        '[{"name": "get_weather", "parameters": {"city": "Paris"}}] '
+        "and this sentence is still assistant content."
+    )
+    reasoning, content = parser.extract_reasoning(text, request)
+
+    assert reasoning == "done"
+    assert content == (
+        'Here is JSON, not a tool call: '
+        '[{"name": "get_weather", "parameters": {"city": "Paris"}}] '
+        "and this sentence is still assistant content."
+    )
+
+
+def test_parse_delta_response_format_json_bypasses_reasoning(
+    mock_kimi_k2_tokenizer,
+):
+    class KimiReasoningParser(_WrappedParser):
+        reasoning_parser_cls = KimiK2ReasoningParser
+        tool_parser_cls = None
+
+    parser = KimiReasoningParser(mock_kimi_k2_tokenizer)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[],
+        response_format={"type": "json_object"},
+    )
+
+    result = parser.parse_delta(
+        '{"answer": 42}',
+        [999],
+        request,
+        prompt_token_ids=[],
+    )
+
+    assert result is not None
+    assert result.content == '{"answer": 42}'
+    assert result.reasoning is None
+    assert result.tool_calls == []
+
+
+def test_parse_delta_text_response_format_keeps_reasoning(
+    mock_kimi_k2_tokenizer,
+):
+    class KimiReasoningParser(_WrappedParser):
+        reasoning_parser_cls = KimiK2ReasoningParser
+        tool_parser_cls = None
+
+    parser = KimiReasoningParser(mock_kimi_k2_tokenizer)
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[],
+        response_format={"type": "text"},
+    )
+
+    result = parser.parse_delta(
+        '{"answer": 42}',
+        [999],
+        request,
+        prompt_token_ids=[],
+    )
+
+    assert result is not None
+    assert result.reasoning == '{"answer": 42}'
+    assert result.content is None
+    assert result.tool_calls == []
+
+
+def test_parse_delta_auto_tool_embedded_json_stays_content(
+    mock_kimi_k2_tokenizer,
+):
+    class KimiReasoningAndToolParser(_WrappedParser):
+        reasoning_parser_cls = KimiK2ReasoningParser
+        tool_parser_cls = KimiK2ToolParser
+
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get the weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                    },
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+    parser = KimiReasoningAndToolParser(mock_kimi_k2_tokenizer, request.tools)
+    content = (
+        'Here is JSON, not a tool call: '
+        '[{"name": "get_weather", "parameters": {"city": "Paris"}}] '
+        "and this sentence is still assistant content."
+    )
+
+    result = parser.parse_delta(
+        content,
+        [999],
+        request,
+        prompt_token_ids=[parser._reasoning_parser._end_token_id],
+    )
+
+    assert result is not None
+    assert result.content == content
+    assert result.reasoning is None
+    assert result.tool_calls == []
 
 
 def test_streaming_reasoning_then_content(kimi_k2_tokenizer):

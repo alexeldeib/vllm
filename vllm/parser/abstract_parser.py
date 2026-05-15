@@ -48,6 +48,27 @@ from vllm.utils import random_uuid
 logger = init_logger(__name__)
 
 
+def _request_bypasses_reasoning_parser(
+    request: ChatCompletionRequest | ResponsesRequest,
+) -> bool:
+    """Return True when the response should be parsed as machine/content text.
+
+    These request modes force guided machine output. Waiting for a
+    model-specific reasoning end token in those cases can route the whole stream
+    into `reasoning`.
+    """
+    response_format = getattr(request, "response_format", None)
+    if response_format is not None and getattr(response_format, "type", None) != "text":
+        return True
+    if getattr(request, "structured_outputs", None) is not None:
+        return True
+
+    tool_choice = getattr(request, "tool_choice", None)
+    return tool_choice == "required" or isinstance(
+        tool_choice, (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam)
+    )
+
+
 @dataclass
 class StreamState:
     """Mutable state for ``Parser.parse_delta()``. One per stream."""
@@ -658,10 +679,15 @@ class DelegatingParser(Parser):
     ) -> DeltaMessage | None:
         state = self._stream_state
 
-        if not state.prompt_reasoning_checked and prompt_token_ids is not None:
+        if not state.prompt_reasoning_checked:
             state.prompt_reasoning_checked = True
-            if self._reasoning_parser is None or self.is_reasoning_end(
-                prompt_token_ids
+            if (
+                self._reasoning_parser is None
+                or _request_bypasses_reasoning_parser(request)
+                or (
+                    prompt_token_ids is not None
+                    and self.is_reasoning_end(prompt_token_ids)
+                )
             ):
                 state.reasoning_ended = True
 
