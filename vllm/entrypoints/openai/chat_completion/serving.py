@@ -79,6 +79,21 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _request_bypasses_reasoning_parser(request: ChatCompletionRequest) -> bool:
+    """Return True when reasoning parsing should not own the output stream."""
+    if (
+        request.response_format is not None
+        and getattr(request.response_format, "type", None) != "text"
+    ):
+        return True
+    if request.structured_outputs is not None:
+        return True
+
+    return request.tool_choice == "required" or isinstance(
+        request.tool_choice, ChatCompletionNamedToolChoiceParam
+    )
+
+
 class OpenAIServingChat(OpenAIServing):
     def __init__(
         self,
@@ -330,7 +345,10 @@ class OpenAIServingChat(OpenAIServing):
                     trace_headers=trace_headers,
                 )
             else:
-                if not request.include_reasoning:
+                if (
+                    not request.include_reasoning
+                    or _request_bypasses_reasoning_parser(request)
+                ):
                     reasoning_ended = True
                 elif request._grammar_from_tool_parser:
                     # The Mistral grammar already includes an optional
@@ -1105,7 +1123,7 @@ class OpenAIServingChat(OpenAIServing):
                 choices.append(choice_data)
                 continue
 
-            if reasoning_parser:
+            if reasoning_parser and not _request_bypasses_reasoning_parser(request):
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
                 reasoning, content = reasoning_parser.extract_reasoning(
