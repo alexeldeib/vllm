@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,34 @@ from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+
+
+def _is_json_document(text: str | None) -> bool:
+    if not text:
+        return False
+    stripped = text.strip()
+    if not stripped.startswith(("{", "[")):
+        return False
+    try:
+        json.loads(stripped)
+    except Exception:
+        return False
+    return True
+
+
+def _request_wants_machine_output(
+    request: "ChatCompletionRequest | ResponsesRequest",
+) -> bool:
+    response_format = getattr(request, "response_format", None)
+    if response_format is not None and getattr(response_format, "type", None) != "text":
+        return True
+    if getattr(request, "structured_outputs", None) is not None:
+        return True
+
+    tool_choice = getattr(request, "tool_choice", None)
+    return tool_choice == "required" or (
+        tool_choice is not None and not isinstance(tool_choice, str)
+    )
 
 
 class KimiK2ReasoningParser(ReasoningParser):
@@ -162,6 +191,14 @@ class KimiK2ReasoningParser(ReasoningParser):
         """
         if self._identity_parser is not None:
             return self._identity_parser.extract_reasoning(model_output, request)
+
+        if (
+            _request_wants_machine_output(request)
+            and _is_json_document(model_output)
+            and self._end_token not in model_output
+            and self._tool_section_start_token not in model_output
+        ):
+            return None, model_output
 
         # thinking does not require a think start token but consume it if present
         start_token_index = model_output.find(self._start_token)

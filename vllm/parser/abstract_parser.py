@@ -44,6 +44,22 @@ from vllm.utils import random_uuid
 logger = init_logger(__name__)
 
 
+def _request_bypasses_reasoning_parser(
+    request: ChatCompletionRequest | ResponsesRequest,
+) -> bool:
+    """Return True when output should start in content/tool-call mode."""
+    response_format = getattr(request, "response_format", None)
+    if response_format is not None and getattr(response_format, "type", None) != "text":
+        return True
+    if getattr(request, "structured_outputs", None) is not None:
+        return True
+
+    tool_choice = getattr(request, "tool_choice", None)
+    return tool_choice == "required" or isinstance(
+        tool_choice, (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam)
+    )
+
+
 @dataclass
 class StreamState:
     """Mutable state for ``Parser.parse_delta()``. One per stream."""
@@ -571,15 +587,11 @@ class DelegatingParser(Parser):
     def _in_reasoning_phase(self, state: StreamState) -> bool:
         if self._reasoning_parser is None:
             return False
-        if self._tool_parser is None:
-            return True
         return not state.reasoning_ended
 
     def _in_tool_call_phase(self, state: StreamState) -> bool:
         if self._tool_parser is None:
             return False
-        if self._reasoning_parser is None:
-            return True
         return state.reasoning_ended
 
     def parse_delta(
@@ -591,9 +603,16 @@ class DelegatingParser(Parser):
     ) -> DeltaMessage | None:
         state = self._stream_state
 
-        if not state.prompt_reasoning_checked and prompt_token_ids is not None:
+        if not state.prompt_reasoning_checked:
             state.prompt_reasoning_checked = True
-            if self.is_reasoning_end(prompt_token_ids):
+            if (
+                _request_bypasses_reasoning_parser(request)
+                or self._reasoning_parser is None
+                or (
+                    prompt_token_ids is not None
+                    and self.is_reasoning_end(prompt_token_ids)
+                )
+            ):
                 state.reasoning_ended = True
 
         current_text = state.previous_text + delta_text
@@ -638,8 +657,12 @@ class DelegatingParser(Parser):
                 request=request,  # type: ignore[arg-type]
             )
 
-        # No parsers: pass through as content
-        if self._reasoning_parser is None and self._tool_parser is None:
+        # No phase active: pass through as content
+        if (
+            delta_message is None
+            and not self._in_reasoning_phase(state)
+            and not self._in_tool_call_phase(state)
+        ):
             delta_message = DeltaMessage(content=delta_text)
 
         state.previous_text = current_text
