@@ -140,7 +140,14 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         return_softmax_lse: bool,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if q_scale is not None or k_scale is not None or v_scale is not None:
+            raise NotImplementedError(
+                "FlashAttention MLA prefill does not support scaled FP8 inputs"
+            )
         return self._flash_attn_varlen_diff_headdims(
             q=q,
             k=k,
@@ -160,7 +167,14 @@ class FlashAttnPrefillBackend(MLAPrefillBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if q_scale is not None or k_scale is not None or v_scale is not None:
+            raise NotImplementedError(
+                "FlashAttention MLA prefill does not support scaled FP8 inputs"
+            )
         assert self._prefill_metadata.chunked_context is not None
         return self._flash_attn_varlen_diff_headdims(
             q=q,

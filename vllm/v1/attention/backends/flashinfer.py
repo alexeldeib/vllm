@@ -1312,11 +1312,24 @@ class FlashInferImpl(AttentionImpl):
                 )
             self.sinks = sinks
 
-        self.support_trtllm_attn = can_use_trtllm_attention(num_heads, num_kv_heads)
         vllm_config = get_current_vllm_config_or_none()
+        num_qo_heads = (
+            vllm_config.model_config.get_num_attention_heads(
+                vllm_config.parallel_config
+            )
+            if vllm_config is not None
+            else num_heads
+        )
+        dcp_size = (
+            vllm_config.parallel_config.decode_context_parallel_size
+            if vllm_config is not None
+            else 1
+        )
+        self.support_trtllm_attn = can_use_trtllm_attention(num_qo_heads, num_kv_heads)
         self.supports_quant_query_input = (
             self.support_trtllm_attn
             and vllm_config is not None
+            and dcp_size == 1
             and not vllm_config.attention_config.disable_flashinfer_q_quantization
         )
         self.bmm1_scale: float | None = None

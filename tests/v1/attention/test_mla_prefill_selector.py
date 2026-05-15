@@ -8,7 +8,20 @@ import pytest
 import torch
 
 from vllm.config import AttentionConfig, ModelConfig, VllmConfig
+from vllm.config.vllm import set_current_vllm_config
+from vllm.model_executor.layers.attention import mla_attention as mla_attention_module
+from vllm.model_executor.layers.attention.mla_attention import (
+    MLAAttention,
+    MLACommonMetadataBuilder,
+    backend_supports_prefill_query_quantization,
+)
 from vllm.platforms.interface import DeviceCapability
+from vllm.v1.attention.backends.mla.prefill.flash_attn import (
+    FlashAttnPrefillBackend,
+)
+from vllm.v1.attention.backends.mla.prefill.flashinfer import (
+    FlashInferPrefillBackend,
+)
 from vllm.v1.attention.backends.mla.prefill.registry import MLAPrefillBackendEnum
 from vllm.v1.attention.backends.mla.prefill.selector import (
     MLAPrefillSelectorConfig,
@@ -16,12 +29,19 @@ from vllm.v1.attention.backends.mla.prefill.selector import (
     get_mla_prefill_backend,
     is_deepseek_r1_mla_compatible,
 )
+from vllm.v1.attention.backends.mla.prefill.tokenspeed_mla import (
+    TokenspeedMLAPrefillBackend,
+)
+from vllm.v1.attention.backends.mla.prefill.trtllm_ragged import (
+    TrtllmRaggedPrefillBackend,
+)
 
 
 @pytest.fixture(autouse=True)
 def clear_cache():
     """Clear lru cache to ensure each test case runs without caching."""
     _auto_select_mla_prefill_backend.cache_clear()
+    backend_supports_prefill_query_quantization.cache_clear()
 
 
 def _make_mock_model_config(
@@ -50,6 +70,11 @@ def _make_vllm_config(
     mock_vllm_config = MagicMock(spec=VllmConfig)
     mock_vllm_config.model_config = model_config
     mock_vllm_config.attention_config = attention_config
+    mock_vllm_config.cache_config = MagicMock()
+    mock_vllm_config.cache_config.cache_dtype = "auto"
+    mock_vllm_config.cache_config.calculate_kv_scales = False
+    mock_vllm_config.parallel_config = MagicMock()
+    mock_vllm_config.parallel_config.decode_context_parallel_size = 1
     return mock_vllm_config
 
 
@@ -143,6 +168,171 @@ class TestGetMLAPrefillBackend:
             ):
                 backend = get_mla_prefill_backend(vllm_config)
                 assert backend.get_name() == "FLASH_ATTN"
+
+
+class TestPrefillQueryQuantization:
+    @staticmethod
+    def _mock_backend(name: str):
+        backend = MagicMock()
+        backend.get_name.return_value = name
+        return backend
+
+    @pytest.mark.parametrize(
+        ("backend_name", "expected"),
+        [
+            ("TRTLLM_RAGGED", True),
+            ("FLASHINFER", False),
+            ("TOKENSPEED_MLA", False),
+            ("FLASH_ATTN", False),
+        ],
+    )
+    def test_backend_supports_only_trtllm_ragged(self, backend_name, expected):
+        with (
+            set_current_vllm_config(_make_vllm_config()),
+            patch.object(
+                mla_attention_module.current_platform,
+                "is_device_capability_family",
+                return_value=True,
+            ),
+            patch(
+                "vllm.v1.attention.backends.mla.prefill.get_mla_prefill_backend",
+                return_value=self._mock_backend(backend_name),
+            ),
+        ):
+            assert backend_supports_prefill_query_quantization() is expected
+
+    def test_backend_support_requires_sm100(self):
+        with patch.object(
+            mla_attention_module.current_platform,
+            "is_device_capability_family",
+            return_value=False,
+        ):
+            assert backend_supports_prefill_query_quantization() is False
+
+    @pytest.mark.parametrize(
+        ("cache_dtype", "backend_support", "expected_dtype"),
+        [
+            ("auto", True, torch.bfloat16),
+            ("fp8_e4m3", False, torch.bfloat16),
+            ("fp8_e4m3", True, torch.float8_e4m3fn),
+        ],
+    )
+    def test_prefill_query_quantization_requires_fp8_cache_and_backend(
+        self,
+        cache_dtype,
+        backend_support,
+        expected_dtype,
+    ):
+        vllm_config = _make_vllm_config()
+        vllm_config.cache_config = MagicMock()
+        vllm_config.cache_config.cache_dtype = cache_dtype
+        vllm_config.cache_config.calculate_kv_scales = False
+        vllm_config.attention_config.use_prefill_query_quantization = True
+
+        with (
+            patch(
+                "vllm.model_executor.layers.attention.mla_attention."
+                "backend_supports_prefill_query_quantization",
+                return_value=backend_support,
+            ),
+            patch(
+                "vllm.model_executor.layers.attention.mla_attention."
+                "current_platform.fp8_dtype",
+                return_value=torch.float8_e4m3fn,
+            ),
+        ):
+            assert (
+                MLACommonMetadataBuilder.determine_prefill_query_data_type(
+                    vllm_config,
+                    torch.bfloat16,
+                )
+                == expected_dtype
+            )
+
+    @pytest.mark.parametrize(
+        "config_attr",
+        ["decode_context_parallel_size", "calculate_kv_scales"],
+    )
+    def test_prefill_query_quantization_disabled_for_unsupported_modes(
+        self,
+        config_attr,
+    ):
+        vllm_config = _make_vllm_config()
+        vllm_config.cache_config.cache_dtype = "fp8_e4m3"
+        vllm_config.attention_config.use_prefill_query_quantization = True
+        if config_attr == "decode_context_parallel_size":
+            vllm_config.parallel_config.decode_context_parallel_size = 2
+        else:
+            vllm_config.cache_config.calculate_kv_scales = True
+
+        with patch(
+            "vllm.model_executor.layers.attention.mla_attention."
+            "backend_supports_prefill_query_quantization",
+            return_value=True,
+        ):
+            assert (
+                MLACommonMetadataBuilder.determine_prefill_query_data_type(
+                    vllm_config,
+                    torch.bfloat16,
+                )
+                is torch.bfloat16
+            )
+
+    def test_trtllm_ragged_bmm_scales_include_fp8_input_descales(self):
+        backend = object.__new__(TrtllmRaggedPrefillBackend)
+        backend.scale = 0.125
+
+        assert backend._get_bmm_scales(None, None, None) == (0.125, 1.0)
+        assert backend._get_bmm_scales(2.0, 3.0, 5.0) == (0.75, 5.0)
+
+        with pytest.raises(ValueError, match="requires q, k, and v scales"):
+            backend._get_bmm_scales(2.0, None, 5.0)
+
+    def test_scaled_fp8_prefill_input_uses_supplied_scale(self):
+        layer = object.__new__(MLAAttention)
+        x = torch.arange(24, dtype=torch.float32).reshape(3, 2, 4).transpose(0, 1)
+        scale = torch.tensor(0.25)
+        captured = {}
+
+        def fake_quant_fp8(x_2d, scale_arg):
+            captured["shape"] = x_2d.shape
+            captured["is_contiguous"] = x_2d.is_contiguous()
+            captured["scale"] = scale_arg
+            return torch.ones_like(x_2d), scale_arg
+
+        layer._quant_fp8_op = fake_quant_fp8
+
+        out = MLAAttention._scaled_fp8_prefill_input(layer, x, scale)
+
+        assert out.shape == x.shape
+        assert captured == {
+            "shape": torch.Size((6, 4)),
+            "is_contiguous": True,
+            "scale": scale,
+        }
+
+    @pytest.mark.parametrize(
+        "backend_cls",
+        [
+            FlashAttnPrefillBackend,
+            FlashInferPrefillBackend,
+            TokenspeedMLAPrefillBackend,
+        ],
+    )
+    def test_non_trtllm_prefill_backends_reject_scaled_fp8_inputs(self, backend_cls):
+        backend = object.__new__(backend_cls)
+        q = k = v = torch.empty(1)
+
+        with pytest.raises(NotImplementedError, match="does not support scaled FP8"):
+            backend.run_prefill_new_tokens(
+                q,
+                k,
+                v,
+                return_softmax_lse=False,
+                q_scale=2.0,
+                k_scale=3.0,
+                v_scale=5.0,
+            )
 
 
 class TestAutoSelectMLAPrefillBackend:

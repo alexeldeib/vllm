@@ -24,6 +24,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     QueryLenSupport,
     _DecodeConcatQuantFP8,
 )
+from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
 from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
@@ -331,13 +332,18 @@ class MockSparseMLAAttentionLayer:
         # Scale attributes needed by attention backends
         self._q_scale = torch.tensor(q_scale, device=device)
         self._k_scale = torch.tensor(k_scale, device=device)
-        self._v_scale = torch.tensor(float("nan"), device=device)
+        self._v_scale = torch.tensor(k_scale, device=device)
         self._prob_scale = torch.tensor(1.0, device=device)
         self._q_scale_float = q_scale
         self._k_scale_float = k_scale
-        self._v_scale_float = float("nan")
+        self._v_scale_float = k_scale
 
         self._decode_concat_quant_fp8_op = _DecodeConcatQuantFP8(
+            static=True,
+            group_shape=GroupShape.PER_TENSOR,
+            compile_native=True,
+        )
+        self._quant_fp8_op = QuantFP8(
             static=True,
             group_shape=GroupShape.PER_TENSOR,
             compile_native=True,
@@ -462,11 +468,11 @@ class MockMLAAttentionLayer(MLAAttention):
         # Scale attributes needed by attention backends
         self._q_scale = torch.tensor(q_scale, device=device)
         self._k_scale = torch.tensor(k_scale, device=device)
-        self._v_scale = torch.tensor(float("nan"), device=device)
+        self._v_scale = torch.tensor(k_scale, device=device)
         self._prob_scale = torch.tensor(1.0, device=device)
         self._q_scale_float = q_scale
         self._k_scale_float = k_scale
-        self._v_scale_float = float("nan")
+        self._v_scale_float = k_scale
 
         self._decode_concat_quant_fp8_op = _DecodeConcatQuantFP8(
             static=True,
@@ -524,6 +530,7 @@ class MockMLAAttentionLayer(MLAAttention):
                 attn_metadata,
                 self._k_scale,
                 output=output[num_decode_tokens:],
+                layer=self,
             )
 
         # Run decode with forward_mqa
