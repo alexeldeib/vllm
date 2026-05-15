@@ -25,6 +25,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.engine.protocol import (
+    DeltaMessage,
     ErrorResponse,
     RequestResponseMetadata,
 )
@@ -1992,6 +1993,93 @@ async def test_streaming_n_gt1_independent_tool_parsers():
         assert parsed_args == {"city": "Tokyo"}, (
             f"Choice {choice_idx}: expected {{'city': 'Tokyo'}}, got {parsed_args}"
         )
+
+
+@pytest.mark.asyncio
+async def test_streaming_parser_keeps_prompt_ids_from_empty_prefill_chunk():
+    engine = MagicMock(spec=AsyncLLM)
+    engine.errored = False
+    engine.model_config = MockModelConfig()
+    engine.input_processor = MagicMock()
+    engine.renderer = _build_renderer(engine.model_config)
+    serving_chat = _build_serving_chat(engine)
+    seen_prompt_token_ids = []
+
+    class RecordingParser:
+        def __init__(self, _tokenizer, _tools, chat_template_kwargs=None):
+            _ = chat_template_kwargs
+            self.tool_parser = None
+            self._stream_state = MagicMock()
+
+        def parse_delta(
+            self,
+            delta_text,
+            delta_token_ids,
+            request,
+            prompt_token_ids=None,
+            finished=False,
+        ):
+            _ = delta_token_ids, request, finished
+            seen_prompt_token_ids.append(prompt_token_ids)
+            return DeltaMessage(content=delta_text)
+
+    serving_chat.parser_cls = RecordingParser
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "test"}],
+        stream=True,
+    )
+
+    async def result_generator():
+        yield RequestOutput(
+            request_id="test-req",
+            prompt="test",
+            prompt_token_ids=[1, 2, 3],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="",
+                    token_ids=[],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                )
+            ],
+            finished=False,
+        )
+        yield RequestOutput(
+            request_id="test-req",
+            prompt="test",
+            prompt_token_ids=None,
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text="ok",
+                    token_ids=[42],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                    finish_reason="stop",
+                )
+            ],
+            finished=True,
+        )
+
+    async for _ in serving_chat.chat_completion_stream_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="test-req",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=get_tokenizer(MODEL_NAME),
+        request_metadata=RequestResponseMetadata(
+            request_id="test-req",
+            model_name=MODEL_NAME,
+        ),
+    ):
+        pass
+
+    assert seen_prompt_token_ids == [[1, 2, 3]]
 
 
 class TestCreateRemainingArgsDelta:

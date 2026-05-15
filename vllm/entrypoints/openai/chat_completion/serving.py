@@ -65,7 +65,12 @@ from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import ParserManager
-from vllm.parser.abstract_parser import Parser
+from vllm.parser.abstract_parser import Parser, parse_delta_with_optional_finished
+from vllm.parser.request_utils import (
+    extract_reasoning_with_machine_output_contract,
+    request_allows_auto_tool_output,
+    request_has_machine_output_contract,
+)
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
 from vllm.sampling_params import BeamSearchParams, SamplingParams
@@ -330,7 +335,9 @@ class OpenAIServingChat(OpenAIServing):
                     trace_headers=trace_headers,
                 )
             else:
-                if not request.include_reasoning:
+                if not request.include_reasoning or request_has_machine_output_contract(
+                    request
+                ):
                     reasoning_ended = True
                 elif request._grammar_from_tool_parser:
                     # The Mistral grammar already includes an optional
@@ -457,8 +464,10 @@ class OpenAIServingChat(OpenAIServing):
             all_previous_token_ids = [[] for _ in range(num_choices)]
             reasoning_end_arr = [False] * num_choices
             prompt_is_reasoning_end_arr: list[bool | None] = [None] * num_choices
+            prompt_token_ids_for_parser: list[list[int] | None] = [None] * num_choices
         else:
             all_previous_token_ids = None
+            prompt_token_ids_for_parser = [None] * num_choices
 
         try:
             if self.parser_cls is not None:
@@ -498,6 +507,9 @@ class OpenAIServingChat(OpenAIServing):
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
                         num_prompt_tokens += len(res.encoder_prompt_token_ids)
+                    for i in range(num_choices):
+                        if prompt_token_ids_for_parser[i] is None:
+                            prompt_token_ids_for_parser[i] = res.prompt_token_ids
 
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
@@ -594,13 +606,15 @@ class OpenAIServingChat(OpenAIServing):
 
                     if (
                         reasoning_parser
-                        and res.prompt_token_ids
+                        and prompt_token_ids_for_parser[i]
                         and prompt_is_reasoning_end_arr[i] is None
                     ):
                         # only check once per choice, because prompt_token_ids
                         # are the same for all deltas in that choice
                         prompt_is_reasoning_end_arr[i] = (
-                            reasoning_parser.is_reasoning_end(res.prompt_token_ids)
+                            reasoning_parser.is_reasoning_end(
+                                prompt_token_ids_for_parser[i]
+                            )
                         )
                     if finish_reason_sent[i]:
                         continue
@@ -715,11 +729,13 @@ class OpenAIServingChat(OpenAIServing):
                             tools_streamed[i] = True
 
                     elif parser is not None:
-                        delta_message = parser.parse_delta(
+                        delta_message = parse_delta_with_optional_finished(
+                            parser,
                             delta_text=delta_text,
                             delta_token_ids=as_list(output.token_ids),
                             request=request,
-                            prompt_token_ids=res.prompt_token_ids,
+                            prompt_token_ids=prompt_token_ids_for_parser[i],
+                            finished=output.finish_reason is not None,
                         )
                         if delta_message and delta_message.tool_calls:
                             tools_streamed[i] = True
@@ -1108,8 +1124,10 @@ class OpenAIServingChat(OpenAIServing):
             if reasoning_parser:
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
-                reasoning, content = reasoning_parser.extract_reasoning(
-                    output.text, request=request
+                reasoning, content = extract_reasoning_with_machine_output_contract(
+                    model_output=output.text,
+                    request=request,
+                    reasoning_parser=reasoning_parser,
                 )
                 if not request.include_reasoning:
                     reasoning = None
@@ -1511,10 +1529,9 @@ class OpenAIServingChat(OpenAIServing):
         choice field indicates that "auto" tool choice should be used.
         """
         return (
-            request.tools
-            and self.tool_parser
+            self.tool_parser
             and self.enable_auto_tools
-            and request.tool_choice in ["auto", None]
+            and request_allows_auto_tool_output(request)
         )
 
     def _should_check_for_unstreamed_tool_arg_tokens(

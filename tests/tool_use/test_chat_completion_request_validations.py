@@ -3,7 +3,13 @@
 
 import pytest
 
-from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedFunction,
+    ChatCompletionNamedToolChoiceParam,
+    ChatCompletionRequest,
+    ChatCompletionToolsParam,
+)
+from vllm.entrypoints.openai.engine.protocol import FunctionDefinition
 
 
 def test_chat_completion_request_with_no_tools():
@@ -61,3 +67,28 @@ def test_chat_completion_request_with_tool_choice_but_no_tools(tool_choice):
                 "tools": None,
             }
         )
+
+
+def test_chat_completion_named_tool_choice_accepts_materialized_tool_objects():
+    request = ChatCompletionRequest.model_validate(
+        {
+            "messages": [{"role": "user", "content": "Hello"}],
+            "model": "facebook/opt-125m",
+            "tools": [
+                ChatCompletionToolsParam(
+                    type="function",
+                    function=FunctionDefinition(
+                        name="get_weather",
+                        description="Get the weather",
+                        parameters={"type": "object"},
+                    ),
+                )
+            ],
+            "tool_choice": ChatCompletionNamedToolChoiceParam(
+                type="function",
+                function=ChatCompletionNamedFunction(name="get_weather"),
+            ),
+        }
+    )
+
+    assert request.tool_choice.function.name == "get_weather"

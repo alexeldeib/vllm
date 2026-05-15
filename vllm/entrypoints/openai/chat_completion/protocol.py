@@ -748,17 +748,19 @@ class ChatCompletionRequest(OpenAIBaseModel):
 
         # if "tool_choice" is specified -- validation
         if "tool_choice" in data and data["tool_choice"] is not None:
+            tool_choice = data["tool_choice"]
             # ensure that if "tool choice" is specified, tools are present
             if "tools" not in data or data["tools"] is None:
                 raise ValueError("When using `tool_choice`, `tools` must be set.")
 
             # make sure that tool choice is either a named tool
             # OR that it's set to "auto" or "required"
-            if data["tool_choice"] not in ["auto", "required"] and not isinstance(
-                data["tool_choice"], dict
-            ):
+            is_named_tool_choice = isinstance(
+                tool_choice, (dict, ChatCompletionNamedToolChoiceParam)
+            )
+            if tool_choice not in ["auto", "required"] and not is_named_tool_choice:
                 raise ValueError(
-                    f"Invalid value for `tool_choice`: {data['tool_choice']}! "
+                    f"Invalid value for `tool_choice`: {tool_choice}! "
                     'Only named tools, "none", "auto" or "required" '
                     "are supported."
                 )
@@ -769,27 +771,45 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 'Correct usage: `{"type": "function",'
                 ' "function": {"name": "my_function"}}`'
             )
-            if isinstance(data["tool_choice"], dict):
+            if is_named_tool_choice:
                 valid_tool = False
-                function = data["tool_choice"].get("function")
-                if not isinstance(function, dict):
+                function = (
+                    tool_choice.get("function")
+                    if isinstance(tool_choice, dict)
+                    else tool_choice.function
+                )
+                if not isinstance(function, dict) and not hasattr(function, "name"):
                     raise ValueError(
                         f"Invalid value for `function`: `{function}` in "
                         f"`tool_choice`! {correct_usage_message}"
                     )
-                if "name" not in function:
+                function_name = (
+                    function.get("name")
+                    if isinstance(function, dict)
+                    else getattr(function, "name", None)
+                )
+                if function_name is None:
                     raise ValueError(
                         f"Expected field `name` in `function` in "
                         f"`tool_choice`! {correct_usage_message}"
                     )
-                function_name = function["name"]
                 if not isinstance(function_name, str) or len(function_name) == 0:
                     raise ValueError(
                         f"Invalid `name` in `function`: `{function_name}`"
                         f" in `tool_choice`! {correct_usage_message}"
                     )
                 for tool in data["tools"]:
-                    if tool["function"]["name"] == function_name:
+                    fn = (
+                        tool.get("function")
+                        if isinstance(tool, dict)
+                        else getattr(tool, "function", None)
+                    )
+                    fn_name = (
+                        fn.get("name")
+                        if isinstance(fn, dict)
+                        else getattr(fn, "name", None)
+                    )
+                    if fn_name == function_name:
                         valid_tool = True
                         break
                 if not valid_tool:

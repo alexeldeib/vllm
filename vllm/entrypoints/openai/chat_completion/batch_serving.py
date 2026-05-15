@@ -11,6 +11,7 @@ from fastapi import Request
 from vllm.entrypoints.chat_utils import ConversationMessage
 from vllm.entrypoints.openai.chat_completion.protocol import (
     BatchChatCompletionRequest,
+    ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionResponseChoice,
     ChatMessage,
@@ -25,6 +26,10 @@ from vllm.entrypoints.utils import get_max_tokens
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
+from vllm.parser.request_utils import (
+    extract_reasoning_with_machine_output_contract,
+    request_has_machine_output_contract,
+)
 from vllm.reasoning import ReasoningParser
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
@@ -43,6 +48,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
     async def render_batch_chat_request(
         self,
         request: BatchChatCompletionRequest,
+        single_requests: list[ChatCompletionRequest],
     ) -> tuple[list[list[ConversationMessage]], list[EngineInput]] | ErrorResponse:
         """Validate the model and preprocess a batched chat completion request.
 
@@ -80,8 +86,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
         all_conversations: list[list[ConversationMessage]] = []
         all_engine_prompts: list[EngineInput] = []
 
-        for messages in request.messages:
-            single_request = request.to_chat_completion_request(messages)
+        for single_request, messages in zip(single_requests, request.messages):
             if render.use_harmony:
                 conversation, engine_prompts = render._make_request_with_harmony(
                     single_request, should_include_tools=tool_dicts is not None
@@ -95,6 +100,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                     default_template_kwargs=render.default_chat_template_kwargs,
                     tool_dicts=tool_dicts,
                     tool_parser=tool_parser,
+                    reasoning_parser=render.reasoning_parser,
                 )
             all_conversations.append(conversation)
             all_engine_prompts.append(engine_prompts[0])
@@ -119,17 +125,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
             for messages in request.messages
         ]
 
-        reasoning_parser: ReasoningParser | None = None
-        if self.reasoning_parser_cls:
-            chat_template_kwargs = self._effective_chat_template_kwargs(
-                single_requests[0]
-            )
-            reasoning_parser = self.reasoning_parser_cls(
-                tokenizer,
-                chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
-            )
-
-        render_result = await self.render_batch_chat_request(request)
+        render_result = await self.render_batch_chat_request(request, single_requests)
         if isinstance(render_result, ErrorResponse):
             return render_result
         all_conversations, engine_prompts = render_result
@@ -173,6 +169,28 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 if raw_request is None
                 else await self._get_trace_headers(raw_request.headers)
             )
+            reasoning_ended = None
+            reasoning_parser_kwargs = None
+            if self.reasoning_parser_cls is not None:
+                chat_template_kwargs = self._effective_chat_template_kwargs(
+                    single_request
+                )
+                reasoning_parser_kwargs = {
+                    "chat_template_kwargs": chat_template_kwargs,
+                }
+                if request_has_machine_output_contract(single_request):
+                    reasoning_ended = True
+                else:
+                    reasoning_parser = self.reasoning_parser_cls(
+                        tokenizer,
+                        chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+                    )
+                    prompt_token_ids = self._extract_prompt_components(
+                        engine_prompt
+                    ).token_ids
+                    reasoning_ended = reasoning_parser.is_reasoning_end(
+                        prompt_token_ids or []
+                    )
             generators.append(
                 self.engine_client.generate(
                     engine_prompt,
@@ -182,24 +200,27 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                     trace_headers=trace_headers,
                     priority=request.priority if hasattr(request, "priority") else 0,
                     data_parallel_rank=data_parallel_rank,
-                    reasoning_ended=None,
+                    reasoning_ended=reasoning_ended,
+                    reasoning_parser_kwargs=reasoning_parser_kwargs,
                 )
             )
 
         return await self.chat_completion_full_generator_batch(
             request,  # type: ignore[arg-type]
+            single_requests,
             generators,
             request_id,
             model_name,
             all_conversations,
             tokenizer,
             request_metadata,
-            reasoning_parser,
+            None,
         )
 
     async def chat_completion_full_generator_batch(
         self,
         request: BatchChatCompletionRequest,  # type: ignore[override]
+        single_requests: list[ChatCompletionRequest],
         generators: list[AsyncGenerator[RequestOutput, None]],
         request_id: str,
         model_name: str,
@@ -264,10 +285,24 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                 else:
                     logprobs = None
 
-                if reasoning_parser:
-                    reasoning, content = reasoning_parser.extract_reasoning(
-                        output.text,
-                        request=request,  # type: ignore[arg-type]
+                single_request = single_requests[prompt_idx]
+                reasoning_parser_for_prompt: ReasoningParser | None = None
+                if self.reasoning_parser_cls is not None:
+                    chat_template_kwargs = self._effective_chat_template_kwargs(
+                        single_request
+                    )
+                    reasoning_parser_for_prompt = self.reasoning_parser_cls(
+                        tokenizer,
+                        chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+                    )
+                elif reasoning_parser is not None:
+                    reasoning_parser_for_prompt = reasoning_parser
+
+                if reasoning_parser_for_prompt:
+                    reasoning, content = extract_reasoning_with_machine_output_contract(
+                        model_output=output.text,
+                        request=single_request,
+                        reasoning_parser=reasoning_parser_for_prompt,
                     )
                     if not getattr(request, "include_reasoning", True):
                         reasoning = None

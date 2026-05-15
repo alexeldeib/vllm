@@ -46,6 +46,7 @@ from vllm.inputs import (
 )
 from vllm.logger import init_logger
 from vllm.parser import ParserManager
+from vllm.parser.request_utils import preserve_request_machine_output_contract
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs.preprocess import (
@@ -573,6 +574,7 @@ class OpenAIServingRender:
 
         if reasoning_parser is not None:
             tokenizer = renderer.get_tokenizer()
+            preserve_request_machine_output_contract(request)
             request = reasoning_parser(
                 tokenizer,
                 model_config=self.model_config,

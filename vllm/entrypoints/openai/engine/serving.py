@@ -57,6 +57,7 @@ from vllm.logger import init_logger
 from vllm.logprobs import Logprob, PromptLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.parser.request_utils import request_allows_auto_tool_output
 from vllm.renderers import ChatParams, TokenizeParams
 from vllm.renderers.inputs.preprocess import (
     extract_prompt_components,
@@ -721,8 +722,7 @@ class OpenAIServing:
             or (
                 enable_auto_tools
                 and (
-                    request.tool_choice == "auto"
-                    or request.tool_choice is None
+                    request_allows_auto_tool_output(request)
                     or (
                         not tool_parser_cls.supports_required_and_named
                         and request.tools

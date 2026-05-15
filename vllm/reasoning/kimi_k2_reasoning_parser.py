@@ -7,6 +7,11 @@ from typing import TYPE_CHECKING
 from transformers import PreTrainedTokenizerBase
 
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.parser.request_utils import (
+    output_is_exact_reasoning_boundary,
+    output_starts_with_reasoning_boundary,
+    request_has_machine_output_contract,
+)
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
 
@@ -72,6 +77,10 @@ class KimiK2ReasoningParser(ReasoningParser):
     @property
     def reasoning_end_str(self) -> str | None:
         return self._end_token
+
+    @property
+    def reasoning_end_strs(self) -> tuple[str, ...]:
+        return (self._end_token, self._tool_section_start_token)
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
@@ -163,9 +172,14 @@ class KimiK2ReasoningParser(ReasoningParser):
         if self._identity_parser is not None:
             return self._identity_parser.extract_reasoning(model_output, request)
 
+        if request_has_machine_output_contract(request):
+            if output_is_exact_reasoning_boundary(model_output, self):
+                return None, model_output
+            if not output_starts_with_reasoning_boundary(model_output, self):
+                return None, model_output
+
         # thinking does not require a think start token but consume it if present
-        start_token_index = model_output.find(self._start_token)
-        start_token_index = 0 if start_token_index != 0 else len(self._start_token)
+        start_token_index = self._strip_start_token_for_full_output(model_output)
         end_token_index = model_output.find(self._end_token)
 
         if end_token_index != -1:
@@ -186,6 +200,45 @@ class KimiK2ReasoningParser(ReasoningParser):
             model_output[start_token_index:],
             None,
         )
+
+    def _strip_start_token_for_full_output(self, model_output: str) -> int:
+        start_token_index = model_output.find(self._start_token)
+        if start_token_index == -1:
+            return 0
+        if model_output[:start_token_index].strip():
+            return 0
+        return start_token_index + len(self._start_token)
+
+    def _strip_start_token_from_stream_delta(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+    ) -> str | None:
+        previous_stripped = previous_text.lstrip()
+        current_stripped = current_text.lstrip()
+
+        if not current_stripped:
+            return delta_text
+
+        if self._start_token.startswith(current_stripped):
+            return None
+
+        if not current_stripped.startswith(self._start_token):
+            if previous_stripped and self._start_token.startswith(previous_stripped):
+                return previous_stripped + delta_text
+            return delta_text
+
+        current_reasoning = current_stripped[len(self._start_token) :]
+        if previous_stripped.startswith(self._start_token):
+            previous_reasoning = previous_stripped[len(self._start_token) :]
+            if current_reasoning.startswith(previous_reasoning):
+                return current_reasoning[len(previous_reasoning) :]
+
+        if self._start_token.startswith(previous_stripped) or not previous_stripped:
+            return current_reasoning
+
+        return delta_text
 
     def extract_reasoning_streaming(
         self,
@@ -219,6 +272,26 @@ class KimiK2ReasoningParser(ReasoningParser):
             self._end_token_id,
         ]:
             return None
+
+        delta_text = self._strip_start_token_from_stream_delta(
+            previous_text, current_text, delta_text
+        )
+        if delta_text is None:
+            return None
+
+        if self._end_token in delta_text:
+            end_index = delta_text.find(self._end_token)
+            reasoning = delta_text[:end_index]
+            content = delta_text[end_index + len(self._end_token) :]
+            return DeltaMessage(
+                reasoning=reasoning, content=content if content else None
+            )
+
+        if self._tool_section_start_token in delta_text:
+            tool_index = delta_text.find(self._tool_section_start_token)
+            reasoning = delta_text[:tool_index]
+            content = delta_text[tool_index:]
+            return DeltaMessage(reasoning=reasoning, content=content)
 
         if self._end_token_id in delta_token_ids:
             if self._end_token not in delta_text:

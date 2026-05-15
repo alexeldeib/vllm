@@ -102,6 +102,8 @@ from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput
 from vllm.parser import ParserManager
+from vllm.parser.abstract_parser import parse_delta_with_optional_finished
+from vllm.parser.request_utils import request_has_machine_output_contract
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
@@ -481,6 +483,8 @@ class OpenAIServingResponses(OpenAIServing):
                 else:
                     context = SimpleContext()
 
+            reasoning_ended: bool | None = None
+            machine_output_contract = request_has_machine_output_contract(request)
             if self.parser and self.parser.reasoning_parser_cls is not None:
                 chat_template_kwargs = self._effective_chat_template_kwargs(request)
                 reasoning_parser_kwargs = {
@@ -503,6 +507,8 @@ class OpenAIServingResponses(OpenAIServing):
                             struct_out.structural_tag, self.tool_server
                         ),
                     )
+                if machine_output_contract:
+                    reasoning_ended = True
             generator = self._generate_with_builtin_tools(
                 request_id=request.request_id,
                 engine_input=engine_input,
@@ -514,6 +520,11 @@ class OpenAIServingResponses(OpenAIServing):
                 reasoning_parser_kwargs=reasoning_parser_kwargs
                 if self.parser and self.parser.reasoning_parser_cls is not None
                 else None,
+                reasoning_ended=reasoning_ended,
+                reasoning_parser=reasoning_parser
+                if self.parser and self.parser.reasoning_parser_cls is not None
+                else None,
+                machine_output_contract=machine_output_contract,
             )
             generators.append(generator)
 
@@ -661,6 +672,9 @@ class OpenAIServingResponses(OpenAIServing):
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        reasoning_ended: bool | None = None,
+        reasoning_parser: Any | None = None,
+        machine_output_contract: bool = False,
     ):
         max_model_len = self.model_config.max_model_len
 
@@ -677,6 +691,19 @@ class OpenAIServingResponses(OpenAIServing):
                 lora_request=lora_request,
             )
 
+            current_reasoning_ended = reasoning_ended
+            if (
+                reasoning_parser is not None
+                and current_reasoning_ended is None
+                and not machine_output_contract
+            ):
+                prompt_token_ids = self._extract_prompt_components(
+                    engine_input
+                ).token_ids
+                current_reasoning_ended = reasoning_parser.is_reasoning_end(
+                    prompt_token_ids or []
+                )
+
             generator = self.engine_client.generate(
                 engine_input,
                 sampling_params,
@@ -685,6 +712,7 @@ class OpenAIServingResponses(OpenAIServing):
                 trace_headers=trace_headers,
                 priority=priority,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                reasoning_ended=current_reasoning_ended,
             )
 
             async for res in generator:
@@ -1040,7 +1068,11 @@ class OpenAIServingResponses(OpenAIServing):
 
         # Use parser to extract and create response output items
         if self.parser:
-            parser = self.parser(tokenizer, request.tools)
+            parser = self.parser(
+                tokenizer,
+                request.tools,
+                chat_template_kwargs=self._effective_chat_template_kwargs(request),
+            )
             return parser.extract_response_outputs(
                 model_output=final_output.text,
                 model_output_token_ids=final_output.token_ids,
@@ -1377,7 +1409,15 @@ class OpenAIServingResponses(OpenAIServing):
         ],
     ) -> AsyncGenerator[StreamingResponsesResponse, None]:
         processor = SimpleStreamingEventProcessor()
-        parser = self.parser(tokenizer, request.tools) if self.parser else None
+        parser = (
+            self.parser(
+                tokenizer,
+                request.tools,
+                chat_template_kwargs=self._effective_chat_template_kwargs(request),
+            )
+            if self.parser
+            else None
+        )
 
         def _get_logprobs(
             output: CompletionOutput,
@@ -1402,11 +1442,13 @@ class OpenAIServingResponses(OpenAIServing):
             delta_token_ids = as_list(output.token_ids)
 
             if parser:
-                delta_message = parser.parse_delta(
+                delta_message = parse_delta_with_optional_finished(
+                    parser,
                     delta_text=delta_text,
                     delta_token_ids=delta_token_ids,
                     request=request,
                     prompt_token_ids=ctx.last_output.prompt_token_ids,
+                    finished=output.finish_reason is not None,
                 )
             else:
                 delta_message = DeltaMessage(content=output.text)

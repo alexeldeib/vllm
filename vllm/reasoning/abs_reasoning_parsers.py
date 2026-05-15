@@ -57,6 +57,16 @@ class ReasoningParser:
         """
         return None
 
+    @property
+    def reasoning_end_strs(self) -> tuple[str, ...]:
+        """Strings whose visible output ends the reasoning phase.
+
+        Most parsers have a single reasoning end delimiter. Parsers that also
+        hand off directly into another machine-readable section can include
+        those visible section delimiters here.
+        """
+        return (self.reasoning_end_str,) if self.reasoning_end_str else ()
+
     @abstractmethod
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
