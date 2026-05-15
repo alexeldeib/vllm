@@ -107,6 +107,9 @@ class MLAPrefillBackend(ABC):
         k: torch.Tensor,
         v: torch.Tensor,
         return_softmax_lse: bool,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
 
@@ -117,5 +120,8 @@ class MLAPrefillBackend(ABC):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError

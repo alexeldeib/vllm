@@ -15,6 +15,10 @@ from batch_spec import get_batch_type, parse_batch_spec
 from rich.console import Console
 from rich.table import Table
 
+from vllm.model_executor.layers.quantization.input_quant_fp8 import QuantFP8
+from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
+from vllm.platforms import current_platform
+
 
 def batch_spec_sort_key(spec: str) -> tuple[int, int, int]:
     """
@@ -149,10 +153,30 @@ class MockLayer(AttentionLayerBase):
         self._k_scale_float = float(self._k_scale.item())
         self._v_scale_float = float(self._v_scale.item())
         self._q_scale_float = float(self._q_scale.item())
+        self._quant_fp8_op = QuantFP8(
+            static=True,
+            group_shape=GroupShape.PER_TENSOR,
+            compile_native=True,
+        )
         # AttentionImpl for metadata builders to query
         self.impl = impl
         # KV cache spec for get_kv_cache_spec
         self._kv_cache_spec = kv_cache_spec
+
+    def _scaled_fp8_prefill_input(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.dtype == current_platform.fp8_dtype():
+            return x
+
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1])
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
+        fp8_data, _ = self._quant_fp8_op(x_2d, scale)
+        return fp8_data.reshape(orig_shape)
 
     def get_attn_backend(self):
         """Get the attention backend class (required by AttentionLayerBase)."""

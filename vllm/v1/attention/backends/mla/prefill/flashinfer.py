@@ -188,7 +188,13 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         return_softmax_lse: bool,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        assert q_scale is None and k_scale is None and v_scale is None, (
+            "FlashInfer MLA prefill does not support scaled FP8 inputs"
+        )
         assert self._prefill_main is not None
 
         ret = self._prefill_main.run(
@@ -209,7 +215,13 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert q_scale is None and k_scale is None and v_scale is None, (
+            "FlashInfer MLA prefill does not support scaled FP8 inputs"
+        )
         attn_out, lse = self._prefill_chunks[chunk_idx].run(
             q=q,
             k=k,

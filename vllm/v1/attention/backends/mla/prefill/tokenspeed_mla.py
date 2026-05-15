@@ -115,7 +115,13 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
         k: torch.Tensor,
         v: torch.Tensor,
         return_softmax_lse: bool,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        assert q_scale is None and k_scale is None and v_scale is None, (
+            "TokenSpeed MLA prefill does not support scaled FP8 inputs"
+        )
         from tokenspeed_mla import tokenspeed_mla_prefill
 
         # `v` arrives as the second half of `kv_nope.split(...)` in
@@ -150,7 +156,13 @@ class TokenspeedMLAPrefillBackend(MLAPrefillBackend):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
+        q_scale: float | None = None,
+        k_scale: float | None = None,
+        v_scale: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert q_scale is None and k_scale is None and v_scale is None, (
+            "TokenSpeed MLA prefill does not support scaled FP8 inputs"
+        )
         from tokenspeed_mla import tokenspeed_mla_prefill
 
         assert self._prefill_metadata.chunked_context is not None

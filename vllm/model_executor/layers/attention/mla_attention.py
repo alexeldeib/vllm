@@ -599,6 +599,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             )
             return output
 
+    def _scaled_fp8_prefill_input(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        if x.dtype == current_platform.fp8_dtype():
+            return x
+
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, orig_shape[-1])
+        if not x_2d.is_contiguous():
+            x_2d = x_2d.contiguous()
+        fp8_data, _ = self._quant_fp8_op(x_2d, scale)
+        return fp8_data.reshape(orig_shape)
+
     def forward_impl(
         self,
         q: torch.Tensor,
@@ -695,6 +710,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 attn_metadata,
                 self._k_scale,
                 output=output[num_mqa_tokens:],
+                layer=self,
             )
 
         if num_mqa_tokens > 0:
@@ -1330,12 +1346,14 @@ def get_mla_dims(model_config: ModelConfig) -> MLADims:
 def backend_supports_prefill_query_quantization() -> bool:
     """Check if the selected MLA prefill backend supports query quantization.
 
-    Currently supported backends:
-    - FlashInfer
-    - TRT-LLM Ragged
+    FP8 MLA prefill must use calibrated static FP8 inputs and pass their
+    descale factors into the kernel. At the moment only the TRT-LLM ragged
+    DeepSeek prefill wrapper exposes the required bmm scale hooks.
 
     Not supported:
+    - FlashInfer ragged prefill
     - FlashAttention (FA3/FA4)
+    - TokenSpeed MLA prefill
     - Non-GB200 devices (FP8 prefill requires device capability 100)
     """
     # FP8 prefill query quantization requires GB200 (device capability 100)
@@ -1348,11 +1366,7 @@ def backend_supports_prefill_query_quantization() -> bool:
 
     vllm_config = get_current_vllm_config()
     backend_cls = get_mla_prefill_backend(vllm_config)
-    return backend_cls.get_name() in (
-        "FLASHINFER",
-        "TRTLLM_RAGGED",
-        "TOKENSPEED_MLA",
-    )
+    return backend_cls.get_name() == "TRTLLM_RAGGED"
 
 
 class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
@@ -1518,7 +1532,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     self.chunked_prefill_workspace_size,
                     self.model_config.get_head_size(),
                 ),
-                dtype=self.q_data_type,
+                dtype=self.model_config.dtype,
                 device=device,
             )
 
@@ -2032,6 +2046,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         kv_c_and_k_pe_cache: torch.Tensor,
         attn_metadata: MLACommonMetadata,
         k_scale: torch.Tensor,
+        layer: MLAAttention,
     ):
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
@@ -2046,32 +2061,21 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         workspace = prefill_metadata.chunked_context.workspace
 
         if use_fp8_prefill:
-            q = q.to(prefill_metadata.q_data_type)
+            q = layer._scaled_fp8_prefill_input(q, layer._q_scale)
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            if not use_fp8_prefill:
-                ops.gather_and_maybe_dequant_cache(
-                    src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace,
-                    block_table=prefill_metadata.block_table,
-                    cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
-                    token_to_seq=prefill_metadata.chunked_context.token_to_seq[i],
-                    num_tokens=prefill_metadata.chunked_context.chunk_total_token[i],
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    scale=k_scale,
-                    seq_starts=prefill_metadata.chunked_context.starts[i],
-                )
-            else:
-                # FP8 path: gather cache without dequantization
-                ops.cp_gather_cache(
-                    src_cache=kv_c_and_k_pe_cache,
-                    dst=workspace,
-                    block_table=prefill_metadata.block_table,
-                    cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
-                    batch_size=attn_metadata.num_prefills,
-                    seq_starts=prefill_metadata.chunked_context.starts[i],
-                )
+            ops.gather_and_maybe_dequant_cache(
+                src_cache=kv_c_and_k_pe_cache,
+                dst=workspace,
+                block_table=prefill_metadata.block_table,
+                cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
+                token_to_seq=prefill_metadata.chunked_context.token_to_seq[i],
+                num_tokens=prefill_metadata.chunked_context.chunk_total_token[i],
+                kv_cache_dtype=self.kv_cache_dtype,
+                scale=k_scale,
+                seq_starts=prefill_metadata.chunked_context.starts[i],
+            )
 
             # Extract kv_c_normed from workspace
             kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
@@ -2096,13 +2100,15 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
 
-            # To Do: Use epilogue of kv_b_proj to generate fp8 kv_nope.
-            if use_fp8_prefill:
-                kv_nope = kv_nope.to(prefill_metadata.q_data_type)
-                k_pe = k_pe.to(prefill_metadata.q_data_type)
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
+            if use_fp8_prefill and k_pe.dtype != k_nope.dtype:
+                k_pe = k_pe.to(k_nope.dtype)
             k = self._concat_k_nope_k_pe(k_nope, k_pe)
+
+            if use_fp8_prefill:
+                k = layer._scaled_fp8_prefill_input(k, layer._k_scale)
+                v = layer._scaled_fp8_prefill_input(v, layer._v_scale)
 
             attn_output, attn_softmax_lse = (
                 prefill_metadata.prefill_backend.run_prefill_context_chunk(
@@ -2110,6 +2116,9 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     q=q,
                     k=k,
                     v=v,
+                    q_scale=layer._q_scale_float if use_fp8_prefill else None,
+                    k_scale=layer._k_scale_float if use_fp8_prefill else None,
+                    v_scale=layer._v_scale_float if use_fp8_prefill else None,
                 )
             )
 
@@ -2250,6 +2259,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         attn_metadata: MLACommonMetadata,
         k_scale: torch.Tensor,
         output: torch.Tensor,
+        layer: MLAAttention,
     ) -> None:
         assert attn_metadata.prefill is not None
         assert self.dcp_world_size != -1
@@ -2260,7 +2270,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         # Convert q to FP8 if FP8 prefill attention is enabled
         if use_fp8_prefill:
-            q = q.to(prefill_metadata.q_data_type)
+            q = layer._scaled_fp8_prefill_input(q, layer._q_scale)
 
         has_context = prefill_metadata.chunked_context is not None
 
@@ -2271,14 +2281,17 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         k = self._concat_k_nope_k_pe(k_nope, k_pe)
 
         if use_fp8_prefill:
-            k = k.to(prefill_metadata.q_data_type)
-            v = v.to(prefill_metadata.q_data_type)
+            k = layer._scaled_fp8_prefill_input(k, layer._k_scale)
+            v = layer._scaled_fp8_prefill_input(v, layer._v_scale)
 
         output_prefill = prefill_metadata.prefill_backend.run_prefill_new_tokens(
             q=q,
             k=k,
             v=v,
             return_softmax_lse=has_context,
+            q_scale=layer._q_scale_float if use_fp8_prefill else None,
+            k_scale=layer._k_scale_float if use_fp8_prefill else None,
+            v_scale=layer._v_scale_float if use_fp8_prefill else None,
         )
 
         if has_context:
@@ -2296,7 +2309,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 )
             else:
                 context_output, context_lse = self._compute_prefill_context(
-                    q, kv_c_and_k_pe_cache, attn_metadata, k_scale
+                    q, kv_c_and_k_pe_cache, attn_metadata, k_scale, layer
                 )
 
             output = output.view(-1, self.num_heads, self.v_head_dim)

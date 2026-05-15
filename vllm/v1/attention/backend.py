@@ -879,6 +879,7 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
         attn_metadata: T,
         k_scale: torch.Tensor,
         output: torch.Tensor,
+        layer: Any,
     ) -> None:
         """MHA-style prefill forward pass."""
         raise NotImplementedError
