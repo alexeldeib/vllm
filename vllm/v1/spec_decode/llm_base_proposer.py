@@ -63,6 +63,7 @@ class SpecDecodeBaseProposer:
         self.vllm_config = vllm_config
         assert vllm_config.speculative_config is not None
         self.speculative_config = vllm_config.speculative_config
+        self._draft_vllm_config: VllmConfig | None = None
         self.draft_model_config = self.speculative_config.draft_model_config
         self.method = self.speculative_config.method
         self.pass_hidden_states_to_model = pass_hidden_states_to_model
@@ -450,7 +451,7 @@ class SpecDecodeBaseProposer:
 
         with set_forward_context(
             per_layer_attn_metadata,
-            self.vllm_config,
+            self._get_draft_vllm_config(),
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -570,7 +571,7 @@ class SpecDecodeBaseProposer:
 
             with set_forward_context(
                 per_layer_attn_metadata,
-                self.vllm_config,
+                self._get_draft_vllm_config(),
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -1129,6 +1130,11 @@ class SpecDecodeBaseProposer:
 
         return base
 
+    def _get_draft_vllm_config(self) -> VllmConfig:
+        if self._draft_vllm_config is None:
+            self._draft_vllm_config = self._create_draft_vllm_config()
+        return self._draft_vllm_config
+
     def _get_model(self) -> nn.Module:
         """
         Default method to call get_model(). Can be overridden by subclasses which
@@ -1136,7 +1142,7 @@ class SpecDecodeBaseProposer:
         """
         from vllm.compilation.backends import set_model_tag
 
-        draft_vllm_config = self._create_draft_vllm_config()
+        draft_vllm_config = self._get_draft_vllm_config()
         with set_model_tag("eagle_head"):
             model = get_model(
                 vllm_config=draft_vllm_config,
@@ -1440,7 +1446,7 @@ class SpecDecodeBaseProposer:
 
             with set_forward_context(
                 None,
-                self.vllm_config,
+                self._get_draft_vllm_config(),
                 num_tokens=num_input_tokens,
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
@@ -1549,7 +1555,7 @@ class SpecDecodeBaseProposer:
                         kv_cache_group_id=self.kv_cache_gid,
                     )
                     attn_group.create_metadata_builders(
-                        self.vllm_config,
+                        self._get_draft_vllm_config(),
                         self.device,
                         kernel_block_size=kernel_block_size,
                     )

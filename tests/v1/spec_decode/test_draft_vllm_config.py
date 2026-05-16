@@ -3,6 +3,7 @@
 
 from dataclasses import dataclass
 
+import vllm.v1.spec_decode.llm_base_proposer as llm_base_proposer
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 
 
@@ -51,6 +52,52 @@ class _VllmConfig:
     attention_config: _AttentionConfig
     cache_config: _CacheConfig
     speculative_config: _SpeculativeConfig
+
+
+@dataclass(frozen=True)
+class _KVCacheSpec:
+    block_size: int = 16
+
+
+@dataclass
+class _KVCacheGroup:
+    layer_names: list[str]
+    kv_cache_spec: _KVCacheSpec
+
+
+@dataclass
+class _KVCacheConfig:
+    kv_cache_groups: list[_KVCacheGroup]
+
+
+class _FakeMetadataBuilder:
+    def __init__(
+        self,
+        kv_cache_spec: _KVCacheSpec,
+        layer_names: list[str],
+        vllm_config: _VllmConfig,
+        device: object,
+    ) -> None:
+        self.kv_cache_spec = kv_cache_spec
+        self.layer_names = layer_names
+        self.vllm_config = vllm_config
+        self.device = device
+
+
+class _FakeAttentionBackend:
+    @staticmethod
+    def full_cls_name() -> str:
+        return "fake.attention"
+
+    @staticmethod
+    def get_builder_cls() -> type[_FakeMetadataBuilder]:
+        return _FakeMetadataBuilder
+
+
+class _FakeAttentionLayer:
+    @staticmethod
+    def get_attn_backend() -> type[_FakeAttentionBackend]:
+        return _FakeAttentionBackend
 
 
 def _create_draft_config(vllm_config: _VllmConfig) -> _VllmConfig:
@@ -129,3 +176,53 @@ def test_eagle_draft_config_uses_draft_kv_cache_dtype_override():
 
     assert target_config.cache_config.cache_dtype == "fp8_e4m3"
     assert draft_config.cache_config.cache_dtype == "bfloat16"
+
+
+def test_eagle_draft_metadata_builders_use_draft_config(monkeypatch):
+    target_config = _VllmConfig(
+        parallel_config=_ParallelConfig(
+            tensor_parallel_size=4,
+            rank=0,
+            decode_context_parallel_size=2,
+            prefill_context_parallel_size=1,
+        ),
+        model_config=_ModelConfig(name="target"),
+        kernel_config=_KernelConfig(moe_backend="auto"),
+        attention_config=_AttentionConfig(backend="TRITON_MLA"),
+        cache_config=_CacheConfig(cache_dtype="fp8_e4m3"),
+        speculative_config=_SpeculativeConfig(
+            draft_parallel_config=_ParallelConfig(tensor_parallel_size=4, rank=0),
+            draft_model_config=_ModelConfig(name="draft"),
+            draft_kv_cache_dtype="bfloat16",
+        ),
+    )
+    draft_config = _create_draft_config(target_config)
+    kv_cache_spec = _KVCacheSpec(block_size=32)
+
+    proposer = object.__new__(SpecDecodeBaseProposer)
+    proposer.vllm_config = target_config
+    proposer.speculative_config = target_config.speculative_config
+    proposer._draft_vllm_config = draft_config
+    proposer._draft_attn_layer_names = {"draft.layer"}
+    proposer.device = object()
+    proposer.kv_cache_gid = -1
+
+    monkeypatch.setattr(
+        llm_base_proposer,
+        "get_layers_from_vllm_config",
+        lambda vllm_config, layer_type: {"draft.layer": _FakeAttentionLayer()},
+    )
+
+    proposer.initialize_attn_backend(
+        _KVCacheConfig(
+            kv_cache_groups=[
+                _KVCacheGroup(layer_names=["draft.layer"], kv_cache_spec=kv_cache_spec)
+            ]
+        )
+    )
+
+    builder = proposer.draft_attn_groups[0].get_metadata_builder()
+    assert isinstance(builder, _FakeMetadataBuilder)
+    assert builder.vllm_config is draft_config
+    assert builder.vllm_config.parallel_config.decode_context_parallel_size == 1
+    assert builder.vllm_config.cache_config.cache_dtype == "bfloat16"

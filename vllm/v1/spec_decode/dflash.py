@@ -236,7 +236,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         self.model.precompute_and_store_context_kv(context_states, context_positions)
         with set_forward_context(
             None,
-            self.vllm_config,
+            self._get_draft_vllm_config(),
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,

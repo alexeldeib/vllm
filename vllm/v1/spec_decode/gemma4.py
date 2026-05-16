@@ -249,7 +249,7 @@ class Gemma4Proposer(SpecDecodeBaseProposer):
                     kv_cache_group_id=gid,
                 )
                 attn_group.create_metadata_builders(
-                    self.vllm_config,
+                    self._get_draft_vllm_config(),
                     self.device,
                     kernel_block_size=kernel_block_size,
                 )
