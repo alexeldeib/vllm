@@ -8,6 +8,7 @@ from pydantic import Field, SkipValidation, field_validator, model_validator
 from typing_extensions import Self
 
 from vllm.config import LoadConfig
+from vllm.config.cache import CacheDType
 from vllm.config.kernel import MoEBackend
 from vllm.config.model import ModelConfig
 from vllm.config.parallel import ParallelConfig
@@ -111,6 +112,9 @@ class SpeculativeConfig:
     """Attention backend to use for the draft model. When `None`, the backend is
     automatically selected. Useful when the drafter requires a different attention
     backend (e.g. DFlash needs a non-causal-capable backend like FLASH_ATTN)."""
+    draft_kv_cache_dtype: CacheDType | None = None
+    """KV cache dtype to use for the draft model. When `None`, the draft model
+    inherits the target model's KV cache dtype."""
     max_model_len: int | None = Field(default=None, ge=1)
     """The maximum model length of the draft model. Used when testing the
     ability to skip speculation for some sequences."""

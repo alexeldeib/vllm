@@ -30,11 +30,17 @@ class _AttentionConfig:
 
 
 @dataclass
+class _CacheConfig:
+    cache_dtype: str
+
+
+@dataclass
 class _SpeculativeConfig:
     draft_parallel_config: _ParallelConfig
     draft_model_config: _ModelConfig
     moe_backend: str | None = None
     attention_backend: object | None = None
+    draft_kv_cache_dtype: str | None = None
 
 
 @dataclass
@@ -43,6 +49,7 @@ class _VllmConfig:
     model_config: _ModelConfig
     kernel_config: _KernelConfig
     attention_config: _AttentionConfig
+    cache_config: _CacheConfig
     speculative_config: _SpeculativeConfig
 
 
@@ -67,6 +74,7 @@ def test_eagle_draft_config_uses_draft_parallel_config():
         model_config=_ModelConfig(name="target"),
         kernel_config=_KernelConfig(moe_backend="auto"),
         attention_config=_AttentionConfig(backend="TRITON_MLA"),
+        cache_config=_CacheConfig(cache_dtype="fp8_e4m3"),
         speculative_config=_SpeculativeConfig(
             draft_parallel_config=draft_parallel_config,
             draft_model_config=draft_model_config,
@@ -88,6 +96,7 @@ def test_eagle_draft_config_keeps_draft_kernel_overrides():
         model_config=_ModelConfig(name="target"),
         kernel_config=_KernelConfig(moe_backend="flashinfer_trtllm"),
         attention_config=_AttentionConfig(backend="TRITON_MLA"),
+        cache_config=_CacheConfig(cache_dtype="fp8_e4m3"),
         speculative_config=_SpeculativeConfig(
             draft_parallel_config=_ParallelConfig(tensor_parallel_size=1, rank=0),
             draft_model_config=_ModelConfig(name="draft"),
@@ -100,3 +109,23 @@ def test_eagle_draft_config_keeps_draft_kernel_overrides():
 
     assert draft_config.kernel_config.moe_backend == "triton"
     assert draft_config.attention_config.backend is None
+
+
+def test_eagle_draft_config_uses_draft_kv_cache_dtype_override():
+    target_config = _VllmConfig(
+        parallel_config=_ParallelConfig(tensor_parallel_size=1, rank=0),
+        model_config=_ModelConfig(name="target"),
+        kernel_config=_KernelConfig(moe_backend="auto"),
+        attention_config=_AttentionConfig(backend=None),
+        cache_config=_CacheConfig(cache_dtype="fp8_e4m3"),
+        speculative_config=_SpeculativeConfig(
+            draft_parallel_config=_ParallelConfig(tensor_parallel_size=1, rank=0),
+            draft_model_config=_ModelConfig(name="draft"),
+            draft_kv_cache_dtype="bfloat16",
+        ),
+    )
+
+    draft_config = _create_draft_config(target_config)
+
+    assert target_config.cache_config.cache_dtype == "fp8_e4m3"
+    assert draft_config.cache_config.cache_dtype == "bfloat16"
