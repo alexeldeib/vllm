@@ -2364,12 +2364,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                     raise NotImplementedError(
                         "DCP > 1 with `kv_cache_dtype='fp8_ds_mla'` is not supported."
                     )
-                assert not use_fp8_prefill, (
-                    "DCP>1 with FP8 prefill query quantization is not "
-                    "supported. Use --attention-config "
-                    "'{\"use_prefill_query_quantization\": false}' "
-                    "or reduce decode_context_parallel_size to 1."
-                )
+                if use_fp8_prefill:
+                    raise NotImplementedError(
+                        "DCP>1 with FP8 prefill query quantization is not "
+                        "supported. Use --attention-config "
+                        "'{\"use_prefill_query_quantization\": false}' "
+                        "or reduce decode_context_parallel_size to 1."
+                    )
                 context_output, context_lse = (
                     self._context_parallel_compute_prefill_context(
                         q,
