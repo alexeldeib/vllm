@@ -57,6 +57,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
     MultipleOf,
+    resolve_effective_cp_state_for_vllm_config,
 )
 from vllm.v1.attention.backends.utils import (
     KVCacheLayoutType,
@@ -603,6 +604,22 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+            self.dcp_kv_cache_interleave_size = 1
+        (
+            self.dcp_world_size,
+            self.dcp_rank,
+            _,
+            _,
+            _,
+            _,
+        ) = resolve_effective_cp_state_for_vllm_config(
+            self.dcp_world_size,
+            self.dcp_rank,
+            1,
+            0,
+            vllm_config,
+        )
+        if self.dcp_world_size <= 1:
             self.dcp_kv_cache_interleave_size = 1
         self.use_dcp = self.dcp_world_size > 1
         self.dcp_a2a = (

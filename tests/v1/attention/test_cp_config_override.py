@@ -3,7 +3,10 @@
 
 from dataclasses import dataclass
 
-from vllm.v1.attention.backend import AttentionImplBase
+from vllm.v1.attention.backend import (
+    AttentionImplBase,
+    resolve_effective_cp_state_for_vllm_config,
+)
 
 
 @dataclass
@@ -73,3 +76,32 @@ def test_attention_impl_keeps_cp_state_for_cp_config():
     assert impl.total_cp_world_size == 4
     assert impl.total_cp_rank == 3
     assert impl.need_to_return_lse_for_decode
+
+
+def test_resolve_effective_cp_state_clears_builder_dcp_for_draft_config():
+    (
+        dcp_world_size,
+        dcp_rank,
+        pcp_world_size,
+        pcp_rank,
+        total_cp_world_size,
+        total_cp_rank,
+    ) = resolve_effective_cp_state_for_vllm_config(
+        dcp_world_size=2,
+        dcp_rank=1,
+        pcp_world_size=1,
+        pcp_rank=0,
+        vllm_config=_VllmConfig(
+            parallel_config=_ParallelConfig(
+                decode_context_parallel_size=1,
+                prefill_context_parallel_size=1,
+            )
+        ),
+    )
+
+    assert dcp_world_size == 1
+    assert dcp_rank == 0
+    assert pcp_world_size == 1
+    assert pcp_rank == 0
+    assert total_cp_world_size == 1
+    assert total_cp_rank == 0

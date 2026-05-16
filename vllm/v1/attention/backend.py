@@ -513,6 +513,41 @@ class AttentionCGSupport(Enum):
     """NO cudagraph support"""
 
 
+def resolve_effective_cp_state_for_vllm_config(
+    dcp_world_size: int,
+    dcp_rank: int,
+    pcp_world_size: int,
+    pcp_rank: int,
+    vllm_config: "VllmConfig | None",
+) -> tuple[int, int, int, int, int, int]:
+    """Resolve CP process-group state for the active model config.
+
+    Speculative draft models are built after the target model has initialized
+    process-global CP groups. Draft configs can still request CP=1, so runtime
+    attention state must follow the active VllmConfig rather than blindly using
+    the global groups.
+    """
+    if vllm_config is not None:
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.decode_context_parallel_size <= 1 and dcp_world_size > 1:
+            dcp_world_size = 1
+            dcp_rank = 0
+        if parallel_config.prefill_context_parallel_size <= 1 and pcp_world_size > 1:
+            pcp_world_size = 1
+            pcp_rank = 0
+
+    total_cp_world_size = pcp_world_size * dcp_world_size
+    total_cp_rank = pcp_rank * dcp_world_size + dcp_rank
+    return (
+        dcp_world_size,
+        dcp_rank,
+        pcp_world_size,
+        pcp_rank,
+        total_cp_world_size,
+        total_cp_rank,
+    )
+
+
 class AttentionMetadataBuilder(ABC, Generic[M]):
     # Does this backend/builder support CUDA Graphs for attention (default: no).
     # Do not access directly. Call get_cudagraph_support() instead.
@@ -760,25 +795,20 @@ class AttentionImplBase(ABC, Generic[T]):
         self,
         vllm_config: "VllmConfig | None",
     ) -> None:
-        if vllm_config is None:
-            return
-
-        parallel_config = vllm_config.parallel_config
-        if (
-            parallel_config.decode_context_parallel_size <= 1
-            and self.dcp_world_size > 1
-        ):
-            self.dcp_world_size = 1
-            self.dcp_rank = 0
-        if (
-            parallel_config.prefill_context_parallel_size <= 1
-            and self.pcp_world_size > 1
-        ):
-            self.pcp_world_size = 1
-            self.pcp_rank = 0
-
-        self.total_cp_world_size = self.pcp_world_size * self.dcp_world_size
-        self.total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        (
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.pcp_world_size,
+            self.pcp_rank,
+            self.total_cp_world_size,
+            self.total_cp_rank,
+        ) = resolve_effective_cp_state_for_vllm_config(
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.pcp_world_size,
+            self.pcp_rank,
+            vllm_config,
+        )
         self.need_to_return_lse_for_decode = (
             self.dcp_world_size > 1 and self.can_return_lse_for_decode
         )

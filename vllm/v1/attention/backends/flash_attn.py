@@ -57,6 +57,7 @@ from vllm.v1.attention.backend import (
     AttentionCGSupport,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    resolve_effective_cp_state_for_vllm_config,
 )
 from vllm.v1.attention.backends.utils import (
     get_kv_cache_layout,
@@ -344,6 +345,20 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # DCP might not be initialized in testing
             self.dcp_world_size = 1
             self.dcp_rank = 0
+        (
+            self.dcp_world_size,
+            self.dcp_rank,
+            _,
+            _,
+            _,
+            _,
+        ) = resolve_effective_cp_state_for_vllm_config(
+            self.dcp_world_size,
+            self.dcp_rank,
+            1,
+            0,
+            vllm_config,
+        )
 
         self.cp_kv_cache_interleave_size = (
             self.parallel_config.cp_kv_cache_interleave_size
