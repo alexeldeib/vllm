@@ -1089,7 +1089,14 @@ class SpecDecodeBaseProposer:
         Subclasses may override to apply additional config changes.
         """
         spec_cfg = self.speculative_config
-        base = self.vllm_config
+        base = replace(
+            self.vllm_config,
+            parallel_config=replace(
+                spec_cfg.draft_parallel_config,
+                rank=self.vllm_config.parallel_config.rank,
+            ),
+            model_config=spec_cfg.draft_model_config,
+        )
 
         if spec_cfg.moe_backend is not None:
             base = replace(
