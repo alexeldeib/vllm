@@ -1503,6 +1503,10 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self.q_data_type = self.determine_prefill_query_data_type(
             vllm_config, self.model_config.dtype
         )
+        self._needs_dcp_fp8_token_to_seq = (
+            is_quantized_kv_cache(vllm_config.cache_config.cache_dtype)
+            and vllm_config.cache_config.cache_dtype != "fp8_ds_mla"
+        )
 
         try:
             self.dcp_world_size = get_dcp_group().world_size
@@ -1768,23 +1772,26 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         dtype=torch.int32,
                     )
 
-                    # Compute padded-local token_to_seq and total_token
-                    # for gather_and_maybe_dequant_cache (FP8 DCP support)
-                    padded_local_chunk_total_token = padded_local_cu_chunk_seq_lens_cpu[
-                        :, -1
-                    ]
-                    padded_local_max_token_num = (
-                        padded_local_chunk_total_token.max().item()
-                    )
-                    padded_local_token_to_seq_cpu = torch.zeros(
-                        [num_chunks, padded_local_max_token_num],
-                        dtype=torch.int32,
-                    )
-                    for i in range(num_chunks):
-                        t2s = torch.repeat_interleave(
-                            range_idx, padded_local_chunk_seq_lens[i]
+                    padded_local_token_to_seq_cpu = None
+                    padded_local_chunk_total_token = None
+                    if self._needs_dcp_fp8_token_to_seq:
+                        # Only FP8 KV cache gather/dequant needs padded-local
+                        # token_to_seq metadata. Keep BF16 DCP metadata unchanged.
+                        padded_local_chunk_total_token = (
+                            padded_local_cu_chunk_seq_lens_cpu[:, -1]
                         )
-                        padded_local_token_to_seq_cpu[i, : t2s.shape[0]] = t2s
+                        padded_local_max_token_num = (
+                            padded_local_chunk_total_token.max().item()
+                        )
+                        padded_local_token_to_seq_cpu = torch.zeros(
+                            [num_chunks, padded_local_max_token_num],
+                            dtype=torch.int32,
+                        )
+                        for i in range(num_chunks):
+                            t2s = torch.repeat_interleave(
+                                range_idx, padded_local_chunk_seq_lens[i]
+                            )
+                            padded_local_token_to_seq_cpu[i, : t2s.shape[0]] = t2s
 
                 prefill_tokens_with_context = None
                 if num_prefills_with_context_cpu > 0:
@@ -1814,9 +1821,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         prefill_tokens_with_context=prefill_tokens_with_context,
                         padded_local_token_to_seq=(
                             padded_local_token_to_seq_cpu.to(device, non_blocking=True)
+                            if padded_local_token_to_seq_cpu is not None
+                            else None
                         ),
                         padded_local_chunk_total_token=(
                             padded_local_chunk_total_token.tolist()
+                            if padded_local_chunk_total_token is not None
+                            else None
                         ),
                     )
                 else:

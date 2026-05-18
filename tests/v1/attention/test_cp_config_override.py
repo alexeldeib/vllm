@@ -3,6 +3,8 @@
 
 from dataclasses import dataclass
 
+import pytest
+
 from vllm.v1.attention.backend import (
     AttentionImplBase,
     resolve_effective_cp_state_for_vllm_config,
@@ -105,3 +107,35 @@ def test_resolve_effective_cp_state_clears_builder_dcp_for_draft_config():
     assert pcp_rank == 0
     assert total_cp_world_size == 1
     assert total_cp_rank == 0
+
+
+def test_resolve_effective_cp_state_rejects_mismatched_dcp_config():
+    with pytest.raises(NotImplementedError, match="DCP size 4.*DCP size 2"):
+        resolve_effective_cp_state_for_vllm_config(
+            dcp_world_size=4,
+            dcp_rank=3,
+            pcp_world_size=1,
+            pcp_rank=0,
+            vllm_config=_VllmConfig(
+                parallel_config=_ParallelConfig(
+                    decode_context_parallel_size=2,
+                    prefill_context_parallel_size=1,
+                )
+            ),
+        )
+
+
+def test_resolve_effective_cp_state_rejects_mismatched_pcp_config():
+    with pytest.raises(NotImplementedError, match="PCP size 4.*PCP size 2"):
+        resolve_effective_cp_state_for_vllm_config(
+            dcp_world_size=1,
+            dcp_rank=0,
+            pcp_world_size=4,
+            pcp_rank=3,
+            vllm_config=_VllmConfig(
+                parallel_config=_ParallelConfig(
+                    decode_context_parallel_size=1,
+                    prefill_context_parallel_size=2,
+                )
+            ),
+        )

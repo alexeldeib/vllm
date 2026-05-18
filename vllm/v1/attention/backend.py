@@ -529,12 +529,27 @@ def resolve_effective_cp_state_for_vllm_config(
     """
     if vllm_config is not None:
         parallel_config = vllm_config.parallel_config
-        if parallel_config.decode_context_parallel_size <= 1 and dcp_world_size > 1:
+        requested_dcp_world_size = parallel_config.decode_context_parallel_size
+        requested_pcp_world_size = parallel_config.prefill_context_parallel_size
+        if requested_dcp_world_size <= 1:
             dcp_world_size = 1
             dcp_rank = 0
-        if parallel_config.prefill_context_parallel_size <= 1 and pcp_world_size > 1:
+        elif requested_dcp_world_size != dcp_world_size:
+            raise NotImplementedError(
+                "Attention CP state cannot be remapped from initialized "
+                f"DCP size {dcp_world_size} to active config DCP size "
+                f"{requested_dcp_world_size}."
+            )
+
+        if requested_pcp_world_size <= 1:
             pcp_world_size = 1
             pcp_rank = 0
+        elif requested_pcp_world_size != pcp_world_size:
+            raise NotImplementedError(
+                "Attention CP state cannot be remapped from initialized "
+                f"PCP size {pcp_world_size} to active config PCP size "
+                f"{requested_pcp_world_size}."
+            )
 
     total_cp_world_size = pcp_world_size * dcp_world_size
     total_cp_rank = pcp_rank * dcp_world_size + dcp_rank
