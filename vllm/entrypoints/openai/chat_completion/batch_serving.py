@@ -27,7 +27,7 @@ from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.parser.request_utils import (
     extract_reasoning_with_machine_output_contract,
-    request_has_machine_output_contract,
+    request_has_generation_structured_text_contract,
 )
 from vllm.reasoning import ReasoningParser
 from vllm.tokenizers import TokenizerLike
@@ -187,7 +187,7 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                     priority=request.priority if hasattr(request, "priority") else 0,
                     data_parallel_rank=data_parallel_rank,
                     reasoning_ended=True
-                    if request_has_machine_output_contract(single_request)
+                    if request_has_generation_structured_text_contract(single_request)
                     else None,
                 )
             )

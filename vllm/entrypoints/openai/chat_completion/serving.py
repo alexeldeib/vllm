@@ -68,6 +68,7 @@ from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
 from vllm.parser.request_utils import (
     extract_reasoning_with_machine_output_contract,
+    request_has_generation_structured_text_contract,
     request_has_machine_output_contract,
 )
 from vllm.reasoning import ReasoningParser
@@ -347,8 +348,9 @@ class OpenAIServingChat(OpenAIServing):
                     trace_headers=trace_headers,
                 )
             else:
-                if not request.include_reasoning or request_has_machine_output_contract(
-                    request
+                if (
+                    not request.include_reasoning
+                    or request_has_generation_structured_text_contract(request)
                 ):
                     reasoning_ended = True
                 elif request._grammar_from_tool_parser:

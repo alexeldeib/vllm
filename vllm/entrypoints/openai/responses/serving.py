@@ -102,7 +102,7 @@ from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput
 from vllm.parser import ParserManager
-from vllm.parser.request_utils import request_has_machine_output_contract
+from vllm.parser.request_utils import request_has_generation_structured_text_contract
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
@@ -508,7 +508,7 @@ class OpenAIServingResponses(OpenAIServing):
             if (
                 self.parser
                 and self.parser.reasoning_parser_cls is not None
-                and request_has_machine_output_contract(request)
+                and request_has_generation_structured_text_contract(request)
             ):
                 reasoning_ended = True
             generator = self._generate_with_builtin_tools(

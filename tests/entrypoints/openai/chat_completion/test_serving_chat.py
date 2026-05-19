@@ -28,7 +28,9 @@ from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
     ExtractedToolCallInformation,
+    FunctionCall,
     RequestResponseMetadata,
+    ToolCall,
 )
 from vllm.entrypoints.openai.models.serving import (
     BaseModelPath,
@@ -1992,6 +1994,67 @@ async def test_named_tool_choice_nonstream_finish_reason_tool_calls():
     assert choice.finish_reason == "tool_calls"
     tool_calls = choice.message.tool_calls
     assert tool_calls
+    assert tool_calls[0].function.name == "get_weather"
+    assert tool_calls[0].function.arguments == '{"city":"Paris"}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        "required",
+        {"type": "function", "function": {"name": "get_weather"}},
+    ],
+)
+async def test_forced_tool_choice_can_use_native_tool_parser(tool_choice):
+    mock_engine = _mock_async_llm()
+    serving_chat = _build_serving_chat(mock_engine)
+
+    class NativeToolParser:
+        supports_required_and_named = False
+
+        def __init__(self, tokenizer, tools):
+            pass
+
+        def extract_tool_calls(self, model_output, request):
+            assert model_output == '<native>{"city":"Paris"}'
+            return ExtractedToolCallInformation(
+                tools_called=True,
+                tool_calls=[
+                    ToolCall(
+                        id="functions.get_weather:0",
+                        type="function",
+                        function=FunctionCall(
+                            name="get_weather",
+                            arguments='{"city":"Paris"}',
+                        ),
+                    )
+                ],
+                content=None,
+            )
+
+    serving_chat.enable_auto_tools = True
+    serving_chat.tool_parser = NativeToolParser
+
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Use get_weather for Paris."}],
+        tools=[_get_weather_tool()],
+        tool_choice=tool_choice,
+    )
+
+    response = await _single_output_response(
+        serving_chat,
+        request,
+        '<native>{"city":"Paris"}',
+    )
+
+    assert isinstance(response, ChatCompletionResponse)
+    choice = response.choices[0]
+    assert choice.finish_reason == "tool_calls"
+    tool_calls = choice.message.tool_calls
+    assert tool_calls
+    assert tool_calls[0].id == "functions.get_weather:0"
     assert tool_calls[0].function.name == "get_weather"
     assert tool_calls[0].function.arguments == '{"city":"Paris"}'
 

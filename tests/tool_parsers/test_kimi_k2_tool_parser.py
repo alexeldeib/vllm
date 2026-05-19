@@ -6,13 +6,17 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
+from xgrammar import StructuralTag
 
 from tests.tool_parsers.utils import (
     run_tool_extraction,
     run_tool_extraction_streaming,
 )
 from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedFunction,
+    ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
+    ChatCompletionToolsParam,
 )
 from vllm.tokenizers import get_tokenizer
 from vllm.tool_parsers.kimi_k2_tool_parser import KimiK2ToolParser
@@ -43,6 +47,83 @@ def _tool(tool_id: str, args: str) -> str:
 
 def _wrap(*tool_strs: str) -> str:
     return SECTION_BEGIN + "".join(tool_strs) + SECTION_END
+
+
+def _calculator_tool() -> ChatCompletionToolsParam:
+    return ChatCompletionToolsParam(
+        type="function",
+        function={
+            "name": "calculate",
+            "description": "Perform a calculation",
+            "parameters": {
+                "type": "object",
+                "properties": {"expression": {"type": "string"}},
+                "required": ["expression"],
+            },
+        },
+    )
+
+
+def _structural_tag_json(request: ChatCompletionRequest, parser: KimiK2ToolParser):
+    adjusted = parser.adjust_request(request)
+    assert adjusted.structured_outputs is not None
+    assert adjusted.structured_outputs.json is None
+    assert adjusted.structured_outputs.structural_tag is not None
+    return json.loads(adjusted.structured_outputs.structural_tag)
+
+
+def test_required_tool_choice_uses_kimi_native_structural_tag(
+    monkeypatch: pytest.MonkeyPatch,
+    parser: KimiK2ToolParser,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.tool_parsers.structural_tag_registry."
+        "_enable_structured_outputs_in_reasoning",
+        True,
+    )
+    request = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=[_calculator_tool()],
+        tool_choice="required",
+        chat_template_kwargs={"thinking": True},
+    )
+
+    tag = parser.get_structural_tag(request)
+    assert isinstance(tag, StructuralTag)
+    dumped = json.dumps(_structural_tag_json(request, parser))
+    assert "</think>" in dumped
+    assert SECTION_BEGIN in dumped
+    assert "functions.calculate:" in dumped
+
+
+def test_named_tool_choice_uses_kimi_native_structural_tag_without_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+    parser: KimiK2ToolParser,
+) -> None:
+    monkeypatch.setattr(
+        "vllm.tool_parsers.structural_tag_registry."
+        "_enable_structured_outputs_in_reasoning",
+        True,
+    )
+    request = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=[_calculator_tool()],
+        chat_template_kwargs={"thinking": False},
+    )
+    request.tool_choice = ChatCompletionNamedToolChoiceParam(
+        function=ChatCompletionNamedFunction(name="calculate")
+    )
+
+    dumped = json.dumps(_structural_tag_json(request, parser))
+    assert "</think>" not in dumped
+    assert SECTION_BEGIN in dumped
+    assert "functions.calculate:" in dumped
+
+
+def test_required_and_named_tool_choice_use_native_kimi_parser() -> None:
+    assert KimiK2ToolParser.supports_required_and_named is False
 
 
 class TestExtractToolCalls:

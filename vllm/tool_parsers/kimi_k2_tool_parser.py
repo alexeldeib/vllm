@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import json
 from collections.abc import Sequence
 
 import regex as re
 
 from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
 )
 from vllm.entrypoints.openai.engine.protocol import (
@@ -18,10 +20,15 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
+from vllm.sampling_params import StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import (
     Tool,
     ToolParser,
+)
+from vllm.tool_parsers.structural_tag_registry import (
+    get_enable_structured_outputs_in_reasoning,
+    get_model_structural_tag,
 )
 from vllm.tool_parsers.utils import partial_tag_overlap
 
@@ -29,6 +36,8 @@ logger = init_logger(__name__)
 
 
 class KimiK2ToolParser(ToolParser):
+    supports_required_and_named = False
+
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)
 
@@ -63,12 +72,43 @@ class KimiK2ToolParser(ToolParser):
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
-        request = super().adjust_request(request)
+        if (
+            isinstance(request, ChatCompletionRequest)
+            and request.tools
+            and (
+                request.tool_choice == "required"
+                or isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
+            )
+        ):
+            structure_tag = self.get_structural_tag(request)
+            if structure_tag is not None:
+                request.structured_outputs = StructuredOutputsParams(
+                    structural_tag=json.dumps(structure_tag.model_dump())
+                )
+                request.response_format = None
+            else:
+                request = super().adjust_request(request)
+        else:
+            request = super().adjust_request(request)
         if request.tools and request.tool_choice != "none":
             # Ensure special-token markers appear as literal text in
             # current_text so we can do pure text-based parsing.
             request.skip_special_tokens = False
         return request
+
+    def get_structural_tag(self, request: ChatCompletionRequest):
+        chat_template_kwargs = request.chat_template_kwargs or {}
+        thinking = bool(chat_template_kwargs.get("thinking", True))
+        return get_model_structural_tag(
+            model="kimi_k2",
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            reasoning=(
+                get_enable_structured_outputs_in_reasoning()
+                and request.include_reasoning
+                and thinking
+            ),
+        )
 
     def extract_tool_calls(
         self,

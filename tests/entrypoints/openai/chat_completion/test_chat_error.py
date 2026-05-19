@@ -259,6 +259,52 @@ async def test_renderer_only_chat_request_carries_reasoning_state():
 
 
 @pytest.mark.asyncio
+async def test_renderer_only_forced_tool_preserves_reasoning_state():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(
+        mock_engine,
+        reasoning_parser="kimi_k2",
+        default_chat_template_kwargs={"thinking": True},
+    )
+
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Use the calculator."}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "calculate",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"expression": {"type": "string"}},
+                        "required": ["expression"],
+                    },
+                },
+            }
+        ],
+        tool_choice="required",
+        chat_template_kwargs={"thinking": True},
+    )
+
+    result = await serving_chat.openai_serving_render.render_chat_request(request)
+
+    assert result.reasoning_ended is None
+    assert result.reasoning_parser_kwargs == {
+        "chat_template_kwargs": {
+            "add_generation_prompt": True,
+            "continue_final_message": False,
+            "thinking": True,
+        }
+    }
+
+
+@pytest.mark.asyncio
 async def test_chat_error_stream():
     """test finish_reason='error' returns 500 InternalServerError (streaming)"""
     mock_engine = MagicMock(spec=AsyncLLM)

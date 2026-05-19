@@ -13,6 +13,7 @@ from xgrammar.structural_tag import (
     AnyTextFormat,
     ConstStringFormat,
     JSONSchemaFormat,
+    RegexFormat,
     SequenceFormat,
     TagFormat,
     TagsWithSeparatorFormat,
@@ -328,3 +329,91 @@ def get_qwen_3_5_structural_tag(
         result = StructuralTag(format=SequenceFormat(elements=[prefix_tag, suffix_tag]))
 
     return result
+
+
+@register_model_structural_tag("kimi_k2")
+def get_kimi_k2_structural_tag(
+    tools: list[ChatCompletionToolsParam],
+    tool_choice: SimplifiedToolChoice,
+    reasoning: bool,
+) -> StructuralTag:
+    """Build Kimi K2 native tool-call structural tags."""
+
+    section_begin = "<|tool_calls_section_begin|>"
+    section_end = "<|tool_calls_section_end|>"
+    tool_call_begin_prefix = "<|tool_call_begin|>functions."
+    tool_call_begin_suffix = ":"
+    argument_begin = "<|tool_call_argument_begin|>"
+    tool_call_end = "<|tool_call_end|>"
+    think_tag_end = "</think>"
+    think_exclude_tokens = ["<think>", "</think>"]
+
+    tags = []
+    for tool in tools:
+        function = tool.function
+        tags.append(
+            TagFormat(
+                begin=(
+                    f"{tool_call_begin_prefix}{function.name}"
+                    f"{tool_call_begin_suffix}"
+                ),
+                content=SequenceFormat(
+                    elements=[
+                        RegexFormat(pattern=r"\d+"),
+                        ConstStringFormat(value=argument_begin),
+                        JSONSchemaFormat(
+                            json_schema=_get_function_parameters(function),
+                        ),
+                    ]
+                ),
+                end=tool_call_end,
+            )
+        )
+
+    if tool_choice == "auto":
+        suffix_tag = TriggeredTagsFormat(
+            triggers=[section_begin],
+            tags=[
+                TagFormat(
+                    begin=section_begin,
+                    content=TagsWithSeparatorFormat(
+                        tags=tags,
+                        separator="",
+                        at_least_one=True,
+                    ),
+                    end=section_end,
+                )
+            ],
+            excludes=think_exclude_tokens,
+        )
+
+    elif tool_choice == "forced":
+        if len(tags) != 1:
+            raise ValueError("Forced tool choice must resolve to exactly one tool.")
+        suffix_tag = SequenceFormat(
+            elements=[
+                ConstStringFormat(value=section_begin),
+                tags[0],
+                ConstStringFormat(value=section_end),
+            ]
+        )
+
+    elif tool_choice == "required":
+        assert len(tags) > 0
+        suffix_tag = SequenceFormat(
+            elements=[
+                ConstStringFormat(value=section_begin),
+                TagsWithSeparatorFormat(
+                    tags=tags,
+                    separator="",
+                    at_least_one=True,
+                ),
+                ConstStringFormat(value=section_end),
+            ]
+        )
+
+    if not reasoning:
+        return StructuralTag(format=suffix_tag)
+
+    prefix_tag = TagFormat(begin="", content=AnyTextFormat(), end=think_tag_end)
+    return StructuralTag(format=SequenceFormat(elements=[prefix_tag, suffix_tag]))

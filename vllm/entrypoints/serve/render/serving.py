@@ -48,7 +48,7 @@ from vllm.logger import init_logger
 from vllm.parser import ParserManager
 from vllm.parser.request_utils import (
     preserve_request_machine_output_contract,
-    request_has_machine_output_contract,
+    request_has_generation_structured_text_contract,
 )
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
@@ -190,7 +190,7 @@ class OpenAIServingRender:
             reasoning_parser_kwargs = {
                 "chat_template_kwargs": self._effective_chat_template_kwargs(request),
             }
-            if request_has_machine_output_contract(request):
+            if request_has_generation_structured_text_contract(request):
                 reasoning_ended = True
 
         request_id = f"chatcmpl-{random_uuid()}"
