@@ -61,3 +61,27 @@ def test_chat_completion_request_with_tool_choice_but_no_tools(tool_choice):
                 "tools": None,
             }
         )
+
+
+def test_chat_completion_named_tool_choice_skips_malformed_tool_entries():
+    with pytest.raises(
+        ValueError,
+        match="The tool specified in `tool_choice` does not match any",
+    ):
+        ChatCompletionRequest.model_validate(
+            {
+                "messages": [{"role": "user", "content": "Hello"}],
+                "model": "facebook/opt-125m",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    }
+                ],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "get_weather"},
+                },
+            }
+        )

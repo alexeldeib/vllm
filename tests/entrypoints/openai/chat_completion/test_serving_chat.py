@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import json
+import logging
 from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any
@@ -26,6 +27,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
+    ExtractedToolCallInformation,
     RequestResponseMetadata,
 )
 from vllm.entrypoints.openai.models.serving import (
@@ -595,6 +597,72 @@ def _build_serving_chat(engine: AsyncLLM) -> OpenAIServingChat:
     return serving_chat
 
 
+def _mock_async_llm() -> AsyncLLM:
+    engine = MagicMock(spec=AsyncLLM)
+    engine.errored = False
+    engine.model_config = MockModelConfig()
+    engine.input_processor = MagicMock()
+    engine.renderer = _build_renderer(engine.model_config)
+    return engine
+
+
+def _get_weather_tool(required_field: str = "city") -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get weather",
+            "parameters": {
+                "type": "object",
+                "properties": {required_field: {"type": "string"}},
+                "required": [required_field],
+            },
+        },
+    }
+
+
+async def _single_output_response(
+    serving_chat: OpenAIServingChat,
+    request: ChatCompletionRequest,
+    text: str,
+    *,
+    tokenizer: Any | None = None,
+    **kwargs,
+):
+    async def result_generator():
+        yield RequestOutput(
+            request_id="test-req",
+            prompt="test",
+            prompt_token_ids=[1, 2, 3],
+            prompt_logprobs=None,
+            outputs=[
+                CompletionOutput(
+                    index=0,
+                    text=text,
+                    token_ids=[4, 5, 6],
+                    cumulative_logprob=0.0,
+                    logprobs=None,
+                    finish_reason="stop",
+                )
+            ],
+            finished=True,
+        )
+
+    return await serving_chat.chat_completion_full_generator(
+        request=request,
+        result_generator=result_generator(),
+        request_id="test-req",
+        model_name=MODEL_NAME,
+        conversation=[],
+        tokenizer=tokenizer or MagicMock(),
+        request_metadata=RequestResponseMetadata(
+            request_id="test-req",
+            model_name=MODEL_NAME,
+        ),
+        **kwargs,
+    )
+
+
 @dataclass
 class MockEngine:
     model_config: MockModelConfig = field(default_factory=MockModelConfig)
@@ -652,6 +720,28 @@ async def test_serving_chat_returns_correct_model_name():
     # Test that full name is returned when no model is specified
     req = ChatCompletionRequest(messages=messages)
     assert await serving_chat.create_chat_completion(req) == MODEL_NAME
+
+
+@pytest.mark.asyncio
+async def test_serving_chat_invalid_streaming_sampling_params_returns_error_response():
+    mock_engine = _mock_async_llm()
+    mock_engine.input_processor.model_config = mock_engine.model_config
+    mock_engine.input_processor.speculative_config = None
+    mock_engine.input_processor.structured_outputs_config = None
+
+    serving_chat = _build_serving_chat(mock_engine)
+    req = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "hello"}],
+        stream=True,
+        min_p=-0.1,
+    )
+
+    response = await serving_chat.create_chat_completion(req)
+
+    assert isinstance(response, ErrorResponse)
+    assert "min_p must be in [0, 1]" in response.error.message
+    mock_engine.generate.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -1829,6 +1919,115 @@ async def test_tool_choice_validation_without_parser():
     assert isinstance(response_named, ErrorResponse)
     assert "tool_choice" in response_named.error.message
     assert "--tool-call-parser" in response_named.error.message
+
+
+@pytest.mark.asyncio
+async def test_auto_tools_with_json_response_format_returns_content_without_error(
+    caplog,
+):
+    mock_engine = _mock_async_llm()
+    serving_chat = _build_serving_chat(mock_engine)
+    parser_calls = []
+
+    class DummyToolParser:
+        supports_required_and_named = True
+
+        def __init__(self, tokenizer, tools):
+            pass
+
+        def extract_tool_calls(self, model_output, request):
+            parser_calls.append(model_output)
+            return ExtractedToolCallInformation(
+                tools_called=False,
+                tool_calls=[],
+                content=model_output,
+            )
+
+    serving_chat.enable_auto_tools = True
+    serving_chat.tool_parser = DummyToolParser
+
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Return JSON content."}],
+        tools=[_get_weather_tool()],
+        tool_choice="auto",
+        response_format={"type": "json_object"},
+    )
+
+    with caplog.at_level(logging.ERROR):
+        response = await _single_output_response(
+            serving_chat,
+            request,
+            '{"answer":42}',
+        )
+
+    assert isinstance(response, ChatCompletionResponse)
+    message = response.choices[0].message
+    assert message.content == '{"answer":42}'
+    assert not message.tool_calls
+    assert parser_calls == ['{"answer":42}']
+    assert not any("cannot determine if tools" in rec.message for rec in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_named_tool_choice_nonstream_finish_reason_tool_calls():
+    mock_engine = _mock_async_llm()
+    serving_chat = _build_serving_chat(mock_engine)
+
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Use get_weather for Paris."}],
+        tools=[_get_weather_tool()],
+        tool_choice={"type": "function", "function": {"name": "get_weather"}},
+    )
+
+    response = await _single_output_response(
+        serving_chat,
+        request,
+        '{"city":"Paris"}',
+    )
+
+    assert isinstance(response, ChatCompletionResponse)
+    choice = response.choices[0]
+    assert choice.finish_reason == "tool_calls"
+    tool_calls = choice.message.tool_calls
+    assert tool_calls
+    assert tool_calls[0].function.name == "get_weather"
+    assert tool_calls[0].function.arguments == '{"city":"Paris"}'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("include_reasoning", [True, False])
+async def test_json_response_format_strips_explicit_reasoning_nonstream(
+    include_reasoning,
+):
+    from vllm.reasoning.kimi_k2_reasoning_parser import KimiK2ReasoningParser
+
+    mock_engine = _mock_async_llm()
+    tokenizer = MagicMock()
+    tokenizer.get_vocab.return_value = {"<think>": 100, "</think>": 101}
+    reasoning_parser = KimiK2ReasoningParser(tokenizer)
+    serving_chat = _build_serving_chat(mock_engine)
+
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Return JSON content."}],
+        response_format={"type": "json_object"},
+        include_reasoning=include_reasoning,
+    )
+
+    response = await _single_output_response(
+        serving_chat,
+        request,
+        '<think>hidden</think>{"answer":42}',
+        tokenizer=tokenizer,
+        reasoning_parser=reasoning_parser,
+    )
+
+    assert isinstance(response, ChatCompletionResponse)
+    message = response.choices[0].message
+    assert message.content == '{"answer":42}'
+    assert message.reasoning == ("hidden" if include_reasoning else None)
 
 
 @pytest.mark.asyncio

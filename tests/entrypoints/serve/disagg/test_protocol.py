@@ -12,6 +12,8 @@ import json
 from vllm.entrypoints.serve.disagg.protocol import GenerateRequest
 from vllm.sampling_params import SamplingParams
 
+REASONING_PARSER_KWARGS = {"chat_template_kwargs": {"thinking": False}}
+
 
 def _base_payload() -> dict:
     return {"token_ids": [1, 2, 3], "sampling_params": {}}
@@ -56,6 +58,18 @@ def test_json_roundtrip_preserves_provided_keys():
     req = GenerateRequest.model_validate_json(json.dumps(payload))
     assert not req.is_sampling_param_provided("max_tokens")
     assert req.is_sampling_param_provided("temperature")
+
+
+def test_reasoning_state_roundtrip():
+    payload = _base_payload()
+    payload["reasoning_ended"] = True
+    payload["reasoning_parser_kwargs"] = REASONING_PARSER_KWARGS
+
+    req = GenerateRequest.model_validate_json(json.dumps(payload))
+    dumped = GenerateRequest.model_validate_json(req.model_dump_json())
+
+    assert dumped.reasoning_ended is True
+    assert dumped.reasoning_parser_kwargs == REASONING_PARSER_KWARGS
 
 
 def test_internal_instance_construction_treats_all_as_provided():

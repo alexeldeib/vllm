@@ -79,7 +79,12 @@ def _build_renderer(model_config: MockModelConfig):
     )
 
 
-def _build_serving_chat(engine: AsyncLLM) -> OpenAIServingChat:
+def _build_serving_chat(
+    engine: AsyncLLM,
+    *,
+    reasoning_parser: str = "",
+    default_chat_template_kwargs: dict[str, Any] | None = None,
+) -> OpenAIServingChat:
     models = OpenAIServingModels(
         engine_client=engine,
         base_model_paths=BASE_MODEL_PATHS,
@@ -91,6 +96,8 @@ def _build_serving_chat(engine: AsyncLLM) -> OpenAIServingChat:
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",
+        reasoning_parser=reasoning_parser,
+        default_chat_template_kwargs=default_chat_template_kwargs,
     )
     serving_chat = OpenAIServingChat(
         engine,
@@ -100,6 +107,8 @@ def _build_serving_chat(engine: AsyncLLM) -> OpenAIServingChat:
         request_logger=None,
         chat_template=None,
         chat_template_content_format="auto",
+        reasoning_parser=reasoning_parser,
+        default_chat_template_kwargs=default_chat_template_kwargs,
     )
 
     async def _fake_preprocess_chat(*args, **kwargs):
@@ -214,6 +223,39 @@ async def test_renderer_only_chat_request_skips_mm_cache():
         ]
         is True
     )
+
+
+@pytest.mark.asyncio
+async def test_renderer_only_chat_request_carries_reasoning_state():
+    mock_engine = MagicMock(spec=AsyncLLM)
+    mock_engine.errored = False
+    mock_engine.model_config = MockModelConfig()
+    mock_engine.input_processor = MagicMock()
+    mock_engine.renderer = _build_renderer(mock_engine.model_config)
+
+    serving_chat = _build_serving_chat(
+        mock_engine,
+        reasoning_parser="kimi_k2",
+        default_chat_template_kwargs={"thinking": True},
+    )
+
+    request = ChatCompletionRequest(
+        model=MODEL_NAME,
+        messages=[{"role": "user", "content": "Return JSON."}],
+        response_format={"type": "json_object"},
+        chat_template_kwargs={"thinking": False},
+    )
+
+    result = await serving_chat.openai_serving_render.render_chat_request(request)
+
+    assert result.reasoning_ended is True
+    assert result.reasoning_parser_kwargs == {
+        "chat_template_kwargs": {
+            "add_generation_prompt": True,
+            "continue_final_message": False,
+            "thinking": False,
+        }
+    }
 
 
 @pytest.mark.asyncio
