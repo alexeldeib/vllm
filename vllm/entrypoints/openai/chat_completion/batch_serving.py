@@ -25,6 +25,10 @@ from vllm.entrypoints.utils import get_max_tokens
 from vllm.inputs import EngineInput
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
+from vllm.parser.request_utils import (
+    extract_reasoning_with_machine_output_contract,
+    request_has_machine_output_contract,
+)
 from vllm.reasoning import ReasoningParser
 from vllm.tokenizers import TokenizerLike
 from vllm.utils.async_utils import merge_async_iterators
@@ -182,7 +186,9 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                     trace_headers=trace_headers,
                     priority=request.priority if hasattr(request, "priority") else 0,
                     data_parallel_rank=data_parallel_rank,
-                    reasoning_ended=None,
+                    reasoning_ended=True
+                    if request_has_machine_output_contract(single_request)
+                    else None,
                 )
             )
 
@@ -265,9 +271,10 @@ class OpenAIServingChatBatch(OpenAIServingChat):
                     logprobs = None
 
                 if reasoning_parser:
-                    reasoning, content = reasoning_parser.extract_reasoning(
-                        output.text,
+                    reasoning, content = extract_reasoning_with_machine_output_contract(
+                        model_output=output.text,
                         request=request,  # type: ignore[arg-type]
+                        reasoning_parser=reasoning_parser,
                     )
                     if not getattr(request, "include_reasoning", True):
                         reasoning = None

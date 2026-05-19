@@ -113,6 +113,16 @@ class GenerateRequest(BaseModel):
         default=None,
         description="KVTransfer parameters used for disaggregated serving.",
     )
+    reasoning_ended: bool | None = Field(
+        default=None,
+        description=(
+            "Whether reasoning has already ended for structured-output generation."
+        ),
+    )
+    reasoning_parser_kwargs: dict[str, Any] | None = Field(
+        default=None,
+        description="Reasoning-parser kwargs used by structured-output generation.",
+    )
 
     # Tracks which keys the caller explicitly set inside ``sampling_params``
     # when the request was parsed from a JSON body. Lets the server tell

@@ -22,6 +22,9 @@ from vllm.entrypoints.openai.responses.protocol import (
     ResponsesRequest,
 )
 from vllm.outputs import CompletionOutput
+from vllm.parser.request_utils import (
+    extract_reasoning_with_machine_output_contract,
+)
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
@@ -71,8 +74,10 @@ class ResponsesParser:
         # Store the finish_reason from the output
         self.finish_reason = output.finish_reason
 
-        reasoning, content = self.reasoning_parser_instance.extract_reasoning(
-            output.text, request=self.request
+        reasoning, content = extract_reasoning_with_machine_output_contract(
+            model_output=output.text,
+            request=self.request,
+            reasoning_parser=self.reasoning_parser_instance,
         )
         if reasoning:
             self.response_messages.append(

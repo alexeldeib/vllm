@@ -102,6 +102,7 @@ from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
 from vllm.outputs import CompletionOutput
 from vllm.parser import ParserManager
+from vllm.parser.request_utils import request_has_machine_output_contract
 from vllm.sampling_params import SamplingParams, StructuredOutputsParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
@@ -503,6 +504,13 @@ class OpenAIServingResponses(OpenAIServing):
                             struct_out.structural_tag, self.tool_server
                         ),
                     )
+            reasoning_ended = None
+            if (
+                self.parser
+                and self.parser.reasoning_parser_cls is not None
+                and request_has_machine_output_contract(request)
+            ):
+                reasoning_ended = True
             generator = self._generate_with_builtin_tools(
                 request_id=request.request_id,
                 engine_input=engine_input,
@@ -514,6 +522,7 @@ class OpenAIServingResponses(OpenAIServing):
                 reasoning_parser_kwargs=reasoning_parser_kwargs
                 if self.parser and self.parser.reasoning_parser_cls is not None
                 else None,
+                reasoning_ended=reasoning_ended,
             )
             generators.append(generator)
 
@@ -661,6 +670,7 @@ class OpenAIServingResponses(OpenAIServing):
         priority: int = 0,
         trace_headers: Mapping[str, str] | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
+        reasoning_ended: bool | None = None,
     ):
         max_model_len = self.model_config.max_model_len
 
@@ -685,6 +695,7 @@ class OpenAIServingResponses(OpenAIServing):
                 trace_headers=trace_headers,
                 priority=priority,
                 reasoning_parser_kwargs=reasoning_parser_kwargs,
+                reasoning_ended=reasoning_ended,
             )
 
             async for res in generator:
@@ -1407,6 +1418,7 @@ class OpenAIServingResponses(OpenAIServing):
                     delta_token_ids=delta_token_ids,
                     request=request,
                     prompt_token_ids=ctx.last_output.prompt_token_ids,
+                    finished=output.finish_reason is not None,
                 )
             else:
                 delta_message = DeltaMessage(content=output.text)

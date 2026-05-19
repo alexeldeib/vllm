@@ -7,6 +7,11 @@ from typing import TYPE_CHECKING
 from transformers import PreTrainedTokenizerBase
 
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
+from vllm.parser.request_utils import (
+    output_is_exact_reasoning_boundary,
+    output_starts_with_machine_output_contract,
+    request_has_machine_output_contract,
+)
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
 
@@ -72,6 +77,10 @@ class KimiK2ReasoningParser(ReasoningParser):
     @property
     def reasoning_end_str(self) -> str | None:
         return self._end_token
+
+    @property
+    def reasoning_implicit_end_strs(self) -> tuple[str, ...]:
+        return (self._tool_section_start_token,)
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
@@ -162,6 +171,12 @@ class KimiK2ReasoningParser(ReasoningParser):
         """
         if self._identity_parser is not None:
             return self._identity_parser.extract_reasoning(model_output, request)
+
+        if request_has_machine_output_contract(request):
+            if output_is_exact_reasoning_boundary(model_output, self):
+                return None, model_output
+            if output_starts_with_machine_output_contract(model_output, request, self):
+                return None, model_output
 
         # thinking does not require a think start token but consume it if present
         start_token_index = model_output.find(self._start_token)

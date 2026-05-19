@@ -35,6 +35,14 @@ from vllm.entrypoints.openai.engine.protocol import (
 )
 from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 from vllm.logger import init_logger
+from vllm.parser.request_utils import (
+    extract_reasoning_with_machine_output_contract,
+    output_is_exact_reasoning_boundary,
+    output_starts_with_machine_output_contract,
+    output_starts_with_reasoning_boundary,
+    preserve_request_machine_output_contract,
+    request_has_machine_output_contract,
+)
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers.abstract_tool_parser import ToolParser
@@ -320,6 +328,7 @@ class Parser:
         delta_token_ids: list[int],
         request: ChatCompletionRequest | ResponsesRequest,
         prompt_token_ids: list[int] | None = None,
+        finished: bool = False,
     ) -> DeltaMessage | None:
         """Parse a single streaming delta, orchestrating reasoning then
         tool call extraction via internal stream state.
@@ -359,8 +368,17 @@ class DelegatingParser(Parser):
         tool_call_id_type: str = "random",
         logprobs: list[Logprob] | None = None,
     ) -> list[ResponseOutputItem]:
-        # First extract reasoning
-        reasoning, content = self.extract_reasoning(model_output, request)
+        # First extract reasoning. Machine-output Responses requests need
+        # untagged model output to stay as content so the JSON/schema/tool
+        # parser can consume it directly.
+        if self._reasoning_parser is not None:
+            reasoning, content = extract_reasoning_with_machine_output_contract(
+                model_output=model_output,
+                request=request,
+                reasoning_parser=self._reasoning_parser,
+            )
+        else:
+            reasoning, content = self.extract_reasoning(model_output, request)
 
         # Then parse tool calls from the content
         tool_calls, content = self._parse_tool_calls(
@@ -513,6 +531,7 @@ class DelegatingParser(Parser):
     def adjust_request(
         self, request: ChatCompletionRequest | ResponsesRequest
     ) -> ChatCompletionRequest | ResponsesRequest:
+        preserve_request_machine_output_contract(request)
         if self._reasoning_parser is not None:
             request = self._reasoning_parser.adjust_request(request)
         if self._tool_parser is not None:
@@ -644,8 +663,14 @@ class DelegatingParser(Parser):
             return False
         return not state.reasoning_ended
 
-    def _in_tool_call_phase(self, state: StreamState) -> bool:
+    def _in_tool_call_phase(
+        self,
+        state: StreamState,
+        request: ChatCompletionRequest | ResponsesRequest,
+    ) -> bool:
         if self._tool_parser is None:
+            return False
+        if getattr(request, "tool_choice", None) == "none":
             return False
         return state.reasoning_ended
 
@@ -655,19 +680,76 @@ class DelegatingParser(Parser):
         delta_token_ids: list[int],
         request: ChatCompletionRequest | ResponsesRequest,
         prompt_token_ids: list[int] | None = None,
+        finished: bool = False,
     ) -> DeltaMessage | None:
         state = self._stream_state
+        machine_output_contract = request_has_machine_output_contract(request)
+        handoff_content_from_reasoning = False
 
-        if not state.prompt_reasoning_checked and prompt_token_ids is not None:
+        if not state.prompt_reasoning_checked and (
+            prompt_token_ids is not None or self._reasoning_parser is None
+        ):
             state.prompt_reasoning_checked = True
-            if self._reasoning_parser is None or self.is_reasoning_end(
-                prompt_token_ids
+            if self._reasoning_parser is None or (
+                not machine_output_contract and self.is_reasoning_end(prompt_token_ids)
             ):
                 state.reasoning_ended = True
 
         current_text = state.previous_text + delta_text
         current_token_ids = state.previous_token_ids + delta_token_ids
         delta_message: DeltaMessage | None = None
+        machine_output_started_content_phase = False
+
+        if (
+            self._reasoning_parser is not None
+            and machine_output_contract
+            and not state.reasoning_ended
+            and not current_text.strip()
+        ):
+            if not finished:
+                state.previous_text = current_text
+                state.previous_token_ids = current_token_ids
+                return None
+            state.reasoning_ended = True
+            machine_output_started_content_phase = True
+
+        if (
+            self._reasoning_parser is not None
+            and machine_output_contract
+            and not state.reasoning_ended
+            and not finished
+            and output_starts_with_reasoning_boundary(
+                current_text, self._reasoning_parser, allow_prefix=True
+            )
+            and not output_starts_with_reasoning_boundary(
+                current_text, self._reasoning_parser
+            )
+        ):
+            state.previous_text = current_text
+            state.previous_token_ids = current_token_ids
+            return None
+
+        if (
+            not state.reasoning_ended
+            and self._reasoning_parser is not None
+            and output_starts_with_machine_output_contract(
+                current_text,
+                request,
+                self._reasoning_parser,
+            )
+        ):
+            state.reasoning_ended = True
+            machine_output_started_content_phase = True
+
+        if (
+            self._reasoning_parser is not None
+            and machine_output_contract
+            and not state.reasoning_ended
+            and finished
+            and output_is_exact_reasoning_boundary(current_text, self._reasoning_parser)
+        ):
+            state.reasoning_ended = True
+            machine_output_started_content_phase = True
 
         # Reasoning extraction
         if self._in_reasoning_phase(state):
@@ -683,6 +765,7 @@ class DelegatingParser(Parser):
             if self._tool_parser and self.is_reasoning_end(delta_token_ids):
                 state.reasoning_ended = True
                 current_token_ids = self.extract_content_ids(delta_token_ids)
+                handoff_content_from_reasoning = True
                 if delta_message and delta_message.content:
                     current_text = delta_message.content
                     delta_message.content = None
@@ -690,7 +773,8 @@ class DelegatingParser(Parser):
                     current_text = ""
 
         # Tool call extraction
-        if self._in_tool_call_phase(state):
+        tool_call_phase_active = self._in_tool_call_phase(state, request)
+        if tool_call_phase_active:
             if not state.tool_call_text_started:
                 state.tool_call_text_started = True
                 state.previous_text = ""
@@ -723,9 +807,18 @@ class DelegatingParser(Parser):
         if (
             delta_message is None
             and not self._in_reasoning_phase(state)
-            and not self._in_tool_call_phase(state)
+            and not tool_call_phase_active
         ):
-            delta_message = DeltaMessage(content=delta_text)
+            content = (
+                current_text
+                if machine_output_started_content_phase
+                or handoff_content_from_reasoning
+                else delta_text
+            )
+            if content != "":
+                delta_message = DeltaMessage(
+                    content=content,
+                )
 
         state.previous_text = current_text
         state.previous_token_ids = current_token_ids

@@ -204,6 +204,8 @@ class ServingTokens(OpenAIServing):
             lora_request=lora_request,
             trace_headers=trace_headers,
             priority=request.priority,
+            reasoning_ended=request.reasoning_ended,
+            reasoning_parser_kwargs=request.reasoning_parser_kwargs,
         )
 
         assert result_generator is not None

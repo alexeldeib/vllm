@@ -66,6 +66,10 @@ from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import ParserManager
 from vllm.parser.abstract_parser import Parser
+from vllm.parser.request_utils import (
+    extract_reasoning_with_machine_output_contract,
+    request_has_machine_output_contract,
+)
 from vllm.reasoning import ReasoningParser
 from vllm.renderers import ChatParams
 from vllm.sampling_params import BeamSearchParams, SamplingParams
@@ -303,10 +307,23 @@ class OpenAIServingChat(OpenAIServing):
                     max_tokens, self.default_sampling_params
                 )
             else:
-                sampling_params = request.to_sampling_params(
-                    max_tokens,
-                    self.default_sampling_params,
-                )
+                # Validate request params before streaming returns 200 OK.
+                # Engine validation happens lazily on first iteration, which
+                # turns spec-decode / guided-output validation errors into 500s
+                # or torn SSE streams for chat completions.
+                try:
+                    sampling_params = request.to_sampling_params(
+                        max_tokens,
+                        self.default_sampling_params,
+                    )
+                    sampling_params.verify(
+                        self.input_processor.model_config,
+                        self.input_processor.speculative_config,
+                        self.input_processor.structured_outputs_config,
+                        tokenizer,
+                    )
+                except (ValueError, TypeError, OverflowError) as e:
+                    return self.create_error_response(e)
 
             self._log_inputs(
                 sub_request_id,
@@ -330,7 +347,9 @@ class OpenAIServingChat(OpenAIServing):
                     trace_headers=trace_headers,
                 )
             else:
-                if not request.include_reasoning:
+                if not request.include_reasoning or request_has_machine_output_contract(
+                    request
+                ):
                     reasoning_ended = True
                 elif request._grammar_from_tool_parser:
                     # The Mistral grammar already includes an optional
@@ -720,6 +739,7 @@ class OpenAIServingChat(OpenAIServing):
                             delta_token_ids=as_list(output.token_ids),
                             request=request,
                             prompt_token_ids=res.prompt_token_ids,
+                            finished=output.finish_reason is not None,
                         )
                         if delta_message and delta_message.tool_calls:
                             tools_streamed[i] = True
@@ -877,13 +897,11 @@ class OpenAIServingChat(OpenAIServing):
                             )
 
                         # Send the finish response for each request.n only once
-                        # In OpenAI's API, when a tool is called, the
-                        # finish_reason is:
-                        # "tool_calls" for "auto" or "required" tool calls,
-                        # and "stop" for named tool calls.
+                        # Tool-call chunks should finish with tool_calls even
+                        # when tool_choice forced a specific function.
                         if (
                             auto_tools_called
-                            or (tools_streamed[i] and not tool_choice_function_name)
+                            or tools_streamed[i]
                             or (self.use_harmony and harmony_tools_streamed[i])
                         ):
                             finish_reason_ = "tool_calls"
@@ -1106,10 +1124,12 @@ class OpenAIServingChat(OpenAIServing):
                 continue
 
             if reasoning_parser:
-                # If the reasoning parser is enabled,
-                # tool calls are extracted exclusively from the content.
-                reasoning, content = reasoning_parser.extract_reasoning(
-                    output.text, request=request
+                # If the reasoning parser is enabled, tool calls are extracted
+                # exclusively from content that has already had reasoning removed.
+                reasoning, content = extract_reasoning_with_machine_output_contract(
+                    model_output=output.text,
+                    request=request,
+                    reasoning_parser=reasoning_parser,
                 )
                 if not request.include_reasoning:
                     reasoning = None
@@ -1241,9 +1261,8 @@ class OpenAIServingChat(OpenAIServing):
                 and self.enable_auto_tools
                 and self.tool_parser
             ):
-                # In the OpenAI API the finish_reason is "tools_called"
-                # if the tool choice is auto and the model produced a tool
-                # call. The same is not true for named function calls
+                # In the OpenAI API, finish_reason is "tool_calls" when
+                # the model produced API tool calls.
                 auto_tools_called = tool_calls is not None and len(tool_calls) > 0
                 if tool_calls:
                     tool_call_items = []
@@ -1300,13 +1319,20 @@ class OpenAIServingChat(OpenAIServing):
                     "completion."
                 )
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
-            # In OpenAI's API, when a tool is called, the finish_reason is:
-            # "tool_calls" for "auto" or "required" tool calls,
-            # and "stop" for named tool calls.
-            is_finish_reason_tool_calls = auto_tools_called or (
-                request.tool_choice
-                and request.tool_choice == "required"
-                and output.finish_reason == "stop"
+            # Grammar-constrained forced tool generation may finish with
+            # "stop". Once vLLM materializes API tool_calls, expose the
+            # OpenAI-compatible finish_reason, including named tool_choice.
+            is_finish_reason_tool_calls = (
+                auto_tools_called
+                or (
+                    isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
+                    and bool(tool_calls)
+                )
+                or (
+                    request.tool_choice
+                    and request.tool_choice == "required"
+                    and output.finish_reason == "stop"
+                )
             )
 
             choice_data = ChatCompletionResponseChoice(

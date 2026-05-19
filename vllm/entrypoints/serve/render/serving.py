@@ -46,6 +46,10 @@ from vllm.inputs import (
 )
 from vllm.logger import init_logger
 from vllm.parser import ParserManager
+from vllm.parser.request_utils import (
+    preserve_request_machine_output_contract,
+    request_has_machine_output_contract,
+)
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs.preprocess import (
@@ -117,6 +121,18 @@ class OpenAIServingRender:
             else getattr(mc, "override_generation_config", {}).get("max_new_tokens")
         )
 
+    def _effective_chat_template_kwargs(
+        self, request: ChatCompletionRequest
+    ) -> dict[str, Any]:
+        return (
+            request.build_chat_params(
+                self.chat_template,
+                self.chat_template_content_format,
+            )
+            .with_defaults(self.default_chat_template_kwargs)
+            .chat_template_kwargs
+        )
+
     async def render_chat_request(
         self,
         request: ChatCompletionRequest,
@@ -168,6 +184,15 @@ class OpenAIServingRender:
         )
         params = request.to_sampling_params(max_tokens, self.default_sampling_params)
 
+        reasoning_ended = None
+        reasoning_parser_kwargs = None
+        if self.reasoning_parser is not None:
+            reasoning_parser_kwargs = {
+                "chat_template_kwargs": self._effective_chat_template_kwargs(request),
+            }
+            if request_has_machine_output_contract(request):
+                reasoning_ended = True
+
         request_id = f"chatcmpl-{random_uuid()}"
 
         return GenerateRequest(
@@ -180,6 +205,8 @@ class OpenAIServingRender:
             stream_options=(request.stream_options if request.stream else None),
             cache_salt=request.cache_salt,
             priority=request.priority,
+            reasoning_ended=reasoning_ended,
+            reasoning_parser_kwargs=reasoning_parser_kwargs,
         )
 
     async def render_chat(
@@ -573,6 +600,7 @@ class OpenAIServingRender:
 
         if reasoning_parser is not None:
             tokenizer = renderer.get_tokenizer()
+            preserve_request_machine_output_contract(request)
             request = reasoning_parser(
                 tokenizer,
                 model_config=self.model_config,
