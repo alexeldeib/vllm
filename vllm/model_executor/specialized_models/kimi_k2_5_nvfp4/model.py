@@ -103,6 +103,7 @@ _TARGET_MODEL_NAMES = {"nvidia/Kimi-K2.5-NVFP4"}
 logger = init_logger(__name__)
 
 _KIMI_TRTLLM_AR_WORLD_SIZES = {2, 4, 8, 16}
+_KIMI_MOE_FINALIZE_AR_DEFAULT_MAX_TOKENS = 2048
 _kimi_attention_ar_workspace: Any | None = None
 _kimi_attention_ar_workspace_key: tuple[int, int, int, torch.dtype, int] | None = None
 _kimi_attention_ar_workspace_max_tokens = 0
@@ -117,6 +118,22 @@ _kimi_moe_setup_log_lock = threading.Lock()
 _kimi_moe_setup_log_keys: set[tuple[int, int, int, int, int, int, bool]] = set()
 _kimi_moe_runtime_log_lock = threading.Lock()
 _kimi_moe_runtime_log_keys: set[tuple[int, int, int, int, bool]] = set()
+
+
+def _kimi_moe_finalize_ar_max_tokens() -> int:
+    raw = os.getenv(
+        "KIMI_NVFP4_MOE_FINALIZE_AR_MAX_TOKENS",
+        str(_KIMI_MOE_FINALIZE_AR_DEFAULT_MAX_TOKENS),
+    )
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning_once(
+            "Invalid KIMI_NVFP4_MOE_FINALIZE_AR_MAX_TOKENS=%r; using %s.",
+            raw,
+            _KIMI_MOE_FINALIZE_AR_DEFAULT_MAX_TOKENS,
+        )
+        return _KIMI_MOE_FINALIZE_AR_DEFAULT_MAX_TOKENS
 
 
 def _kimi_fp4_quantize_hidden_states(
@@ -2757,6 +2774,28 @@ class KimiK25Nvfp4MoE(nn.Module):
             float(norm_layer.variance_epsilon),
         )
 
+    def should_use_finalize_allreduce_norm(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> bool:
+        if get_node_count() > 1:
+            return False
+
+        max_tokens = _kimi_moe_finalize_ar_max_tokens()
+        if max_tokens <= 0:
+            return False
+
+        token_count = int(hidden_states.shape[0])
+        if token_count > max_tokens:
+            logger.info_once(
+                "Skipping Kimi-K2.5 NVFP4 MoE finalize/allreduce/norm fusion "
+                "for token batches above %s tokens to avoid FlashInfer TRTLLM "
+                "one-shot Lamport workspace limits.",
+                max_tokens,
+            )
+            return False
+        return True
+
     def _forward_finalize_allreduce_norm_impl(
         self,
         hidden_states: torch.Tensor,
@@ -2979,6 +3018,7 @@ class KimiK25Nvfp4DecoderLayer(nn.Module):
             next_input_layernorm is not None
             and self.is_moe
             and isinstance(self.mlp, KimiK25Nvfp4MoE)
+            and self.mlp.should_use_finalize_allreduce_norm(hidden_states)
         ):
             hidden_states, residual = self.mlp.forward_finalize_allreduce_norm(
                 hidden_states,
