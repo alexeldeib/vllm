@@ -18,6 +18,43 @@ logger = init_logger(__name__)
 
 current_platform.import_kernels()
 
+_merge_attn_states_extended_schema: bool | None = None
+
+
+def merge_attn_states_supports_extended_args() -> bool:
+    """Return whether the loaded CUDA extension has the newer op schema.
+
+    The Dynamo runtime image used for the Kimi K2.6 experiments may carry a
+    vLLM Python overlay on top of an older compiled extension. In that case the
+    Python wrapper can be newer than torch.ops._C.merge_attn_states, so inspect
+    the registered schema before passing newer optional arguments.
+    """
+    global _merge_attn_states_extended_schema
+    if _merge_attn_states_extended_schema is not None:
+        return _merge_attn_states_extended_schema
+
+    op = torch.ops._C.merge_attn_states
+    schemas = getattr(op, "_schemas", None)
+    if schemas is None:
+        schema = getattr(op, "_schema", None)
+        schema_values = [schema] if schema is not None else []
+    else:
+        schema_values = list(schemas.values())
+
+    for schema in schema_values:
+        arg_names = {
+            getattr(arg, "name", "")
+            for arg in getattr(schema, "arguments", ())
+        }
+        if {"prefill_tokens_with_context", "output_scale"} <= arg_names:
+            _merge_attn_states_extended_schema = True
+            return _merge_attn_states_extended_schema
+
+    # If PyTorch does not expose schema metadata, assume the extension matches
+    # this source tree. Known older Dynamo images expose the six-arg schema.
+    _merge_attn_states_extended_schema = not schema_values
+    return _merge_attn_states_extended_schema
+
 if TYPE_CHECKING:
 
     def register_fake(fn):
@@ -267,6 +304,22 @@ def merge_attn_states(
     prefill_tokens_with_context: int | None = None,
     output_scale: torch.Tensor | None = None,
 ) -> None:
+    if not merge_attn_states_supports_extended_args():
+        if prefill_tokens_with_context is not None or output_scale is not None:
+            raise NotImplementedError(
+                "The loaded merge_attn_states CUDA op does not support "
+                "prefill_tokens_with_context or output_scale."
+            )
+        torch.ops._C.merge_attn_states(
+            output,
+            output_lse,
+            prefix_output,
+            prefix_lse,
+            suffix_output,
+            suffix_lse,
+        )
+        return
+
     torch.ops._C.merge_attn_states(
         output,
         output_lse,

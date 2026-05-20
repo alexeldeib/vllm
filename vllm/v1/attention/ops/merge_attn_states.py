@@ -6,6 +6,18 @@ import torch
 from vllm.platforms import current_platform
 
 
+def _custom_cuda_merge_attn_states_supported(
+    prefill_tokens_with_context: int | None,
+    output_scale: torch.Tensor | None,
+) -> bool:
+    if prefill_tokens_with_context is None and output_scale is None:
+        return True
+
+    from vllm._custom_ops import merge_attn_states_supports_extended_args
+
+    return merge_attn_states_supports_extended_args()
+
+
 def merge_attn_states(
     output: torch.Tensor,
     prefix_output: torch.Tensor,
@@ -73,6 +85,9 @@ def merge_attn_states(
         current_platform.is_cuda()
         and supported_dtypes(prefix_output)
         and supported_headdim(prefix_output)
+        and _custom_cuda_merge_attn_states_supported(
+            prefill_tokens_with_context, output_scale
+        )
     ):
         from vllm._custom_ops import merge_attn_states
 
