@@ -322,12 +322,10 @@ class TrtLlmNvFp4ExpertsMonolithic(
             and self.routing_method_type != RoutingMethodType.Llama4
         )
 
-        # FlashInfer's NVFP4 path accepts the BF16 logits produced by the
-        # router GEMM.  Keep FP32 logits working for callers that still request
-        # them explicitly, but avoid converting the Kimi latency path back to
-        # FP32.
-        if router_logits.dtype not in (torch.bfloat16, torch.float32):
-            router_logits = router_logits.to(torch.bfloat16)
+        # The TRTLLM FP4 kernel in the Dynamo runtime requires FP32 routing
+        # logits even when the router GEMM naturally produces BF16.
+        if router_logits.dtype != torch.float32:
+            router_logits = router_logits.to(torch.float32)
 
         # Currently FI requires bfloat16 routing bias.
         # https://github.com/flashinfer-ai/flashinfer/issues/2909

@@ -338,7 +338,7 @@ class DeepseekV2MoE(nn.Module):
             "enable_eplb": self.enable_eplb,
             "num_redundant_experts": self.n_redundant_experts,
             "is_sequence_parallel": self.is_sequence_parallel,
-            "router_logits_dtype": torch.bfloat16 if self.is_modelopt_fp4 else None,
+            "router_logits_dtype": torch.float32 if self.is_modelopt_fp4 else None,
             "n_shared_experts": config.n_shared_experts
             if self.is_fusion_moe_shared_experts_enabled
             else None,
@@ -357,7 +357,6 @@ class DeepseekV2MoE(nn.Module):
         needs_fp32_router_logits = (
             self.experts.quant_method.is_monolithic
             and self.experts.routing_method_type == RoutingMethodType.DeepSeekV3
-            and not self.is_modelopt_fp4
         )
         self.gate.set_out_dtype(
             torch.float32 if needs_fp32_router_logits else torch.bfloat16
