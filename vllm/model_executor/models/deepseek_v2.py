@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import inspect
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -317,32 +318,38 @@ class DeepseekV2MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        self.experts = FusedMoE(
-            shared_experts=self.shared_experts,
-            gate=self.gate,
-            num_experts=config.n_routed_experts,
-            top_k=config.num_experts_per_tok,
-            hidden_size=config.hidden_size,
-            intermediate_size=config.moe_intermediate_size,
-            renormalize=config.norm_topk_prob,
-            quant_config=quant_config,
-            use_grouped_topk=True,
-            num_expert_group=getattr(config, "n_group", 1),
-            topk_group=getattr(config, "topk_group", 1),
-            prefix=f"{prefix}.experts",
-            scoring_func=getattr(config, "scoring_func", "softmax"),
+        fused_moe_kwargs = {
+            "shared_experts": self.shared_experts,
+            "gate": self.gate,
+            "num_experts": config.n_routed_experts,
+            "top_k": config.num_experts_per_tok,
+            "hidden_size": config.hidden_size,
+            "intermediate_size": config.moe_intermediate_size,
+            "renormalize": config.norm_topk_prob,
+            "quant_config": quant_config,
+            "use_grouped_topk": True,
+            "num_expert_group": getattr(config, "n_group", 1),
+            "topk_group": getattr(config, "topk_group", 1),
+            "prefix": f"{prefix}.experts",
+            "scoring_func": getattr(config, "scoring_func", "softmax"),
             # aiter applies routed_scaling_factor internally
-            routed_scaling_factor=self.routed_scaling_factor,
-            apply_routed_scale_to_output=not self.is_rocm_aiter_moe_enabled,
-            e_score_correction_bias=self.gate.e_score_correction_bias,
-            enable_eplb=self.enable_eplb,
-            num_redundant_experts=self.n_redundant_experts,
-            is_sequence_parallel=self.is_sequence_parallel,
-            router_logits_dtype=torch.bfloat16 if self.is_modelopt_fp4 else None,
-            n_shared_experts=config.n_shared_experts
+            "routed_scaling_factor": self.routed_scaling_factor,
+            "e_score_correction_bias": self.gate.e_score_correction_bias,
+            "enable_eplb": self.enable_eplb,
+            "num_redundant_experts": self.n_redundant_experts,
+            "is_sequence_parallel": self.is_sequence_parallel,
+            "router_logits_dtype": torch.bfloat16 if self.is_modelopt_fp4 else None,
+            "n_shared_experts": config.n_shared_experts
             if self.is_fusion_moe_shared_experts_enabled
             else None,
-        )
+        }
+        if "apply_routed_scale_to_output" in inspect.signature(
+            FusedMoE.__init__
+        ).parameters:
+            fused_moe_kwargs["apply_routed_scale_to_output"] = (
+                not self.is_rocm_aiter_moe_enabled
+            )
+        self.experts = FusedMoE(**fused_moe_kwargs)
 
         # NOTE(rob): this is a hack until we finish off the PR for
         # merging TRTLLM kernels into the MK framework. Then we can
