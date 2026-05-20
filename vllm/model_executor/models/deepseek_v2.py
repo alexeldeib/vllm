@@ -402,6 +402,9 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states=hidden_states, router_logits=router_logits
             )
 
+        if isinstance(final_hidden_states, tuple):
+            final_hidden_states = final_hidden_states[0]
+
         if self.is_sequence_parallel:
             final_hidden_states = tensor_model_parallel_all_gather(
                 final_hidden_states, 0
