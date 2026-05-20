@@ -2530,6 +2530,11 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
             *hidden_states.shape[:-1],
             -1,
         )
+        # The FlashInfer TRTLLM FP4 kernel in the Dynamo runtime requires
+        # FP32 routing logits. The Kimi latency path usually produces BF16
+        # router logits, so normalize here as well as in the generic MoE path.
+        if router_logits.dtype != torch.float32:
+            router_logits = router_logits.to(torch.float32)
         self._log_flashinfer_call_once(
             do_finalize=do_finalize,
             original_hidden_states=original_hidden_states,
