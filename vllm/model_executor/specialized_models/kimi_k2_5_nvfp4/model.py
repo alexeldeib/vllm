@@ -128,11 +128,6 @@ def _kimi_moe_finalize_ar_max_tokens() -> int:
     try:
         return int(raw)
     except ValueError:
-        logger.warning_once(
-            "Invalid KIMI_NVFP4_MOE_FINALIZE_AR_MAX_TOKENS=%r; using %s.",
-            raw,
-            _KIMI_MOE_FINALIZE_AR_DEFAULT_MAX_TOKENS,
-        )
         return _KIMI_MOE_FINALIZE_AR_DEFAULT_MAX_TOKENS
 
 
@@ -2697,6 +2692,7 @@ class KimiK25Nvfp4MoE(nn.Module):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.routed_scaling_factor = getattr(config, "routed_scaling_factor", 1.0)
+        self.moe_finalize_ar_max_tokens = _kimi_moe_finalize_ar_max_tokens()
         self.n_routed_experts = config.n_routed_experts
         self.n_shared_experts = config.n_shared_experts
         self.n_redundant_experts = 0
@@ -2781,20 +2777,12 @@ class KimiK25Nvfp4MoE(nn.Module):
         if get_node_count() > 1:
             return False
 
-        max_tokens = _kimi_moe_finalize_ar_max_tokens()
+        max_tokens = self.moe_finalize_ar_max_tokens
         if max_tokens <= 0:
             return False
 
         token_count = int(hidden_states.shape[0])
-        if token_count > max_tokens:
-            logger.info_once(
-                "Skipping Kimi-K2.5 NVFP4 MoE finalize/allreduce/norm fusion "
-                "for token batches above %s tokens to avoid FlashInfer TRTLLM "
-                "one-shot Lamport workspace limits.",
-                max_tokens,
-            )
-            return False
-        return True
+        return token_count <= max_tokens
 
     def _forward_finalize_allreduce_norm_impl(
         self,
