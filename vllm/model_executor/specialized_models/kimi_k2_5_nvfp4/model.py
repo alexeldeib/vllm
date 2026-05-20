@@ -3,6 +3,7 @@
 """Text-only specialized Kimi-K2.5 NVFP4 implementation."""
 
 import atexit
+import inspect
 import os
 import threading
 from collections.abc import Iterable
@@ -339,6 +340,18 @@ def _has_flashinfer_comm_kernel(kernel_name: str) -> bool:
     except ImportError:
         return False
     return hasattr(flashinfer_comm, kernel_name)
+
+
+_flashinfer_comm_kernel_kwargs: dict[str, set[str]] = {}
+
+
+def _flashinfer_comm_supported_kwargs(kernel: Any) -> set[str]:
+    kernel_name = getattr(kernel, "__name__", repr(kernel))
+    supported_kwargs = _flashinfer_comm_kernel_kwargs.get(kernel_name)
+    if supported_kwargs is None:
+        supported_kwargs = set(inspect.signature(kernel).parameters)
+        _flashinfer_comm_kernel_kwargs[kernel_name] = supported_kwargs
+    return supported_kwargs
 
 
 def _get_kimi_nvfp4_specialization_rejection_reason(
@@ -2792,15 +2805,14 @@ class KimiK25Nvfp4MoE(nn.Module):
 
         norm_out = torch.empty_like(hidden_states)
         residual_out = torch.empty_like(residual)
-        flashinfer_comm.trtllm_moe_finalize_allreduce_fusion(
+        fusion_fn = flashinfer_comm.trtllm_moe_finalize_allreduce_fusion
+        fusion_kwargs: dict[str, Any] = dict(
             allreduce_in=allreduce_in,
             residual_in=residual,
             norm_weight=norm_weight,
             expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
             norm_out=norm_out,
             residual_out=residual_out,
-            quant_out=None,
-            scale_out=None,
             workspace_ptrs=workspace.workspace_tensor,
             launch_with_pdl=True,
             world_rank=tp_group.rank_in_group,
@@ -2808,9 +2820,17 @@ class KimiK25Nvfp4MoE(nn.Module):
             eps=norm_eps,
             shared_expert_output=shared_output,
             expert_scale_factor=expert_weights,
-            # Routed scaling is folded into expert_weights by forward_unfinalized.
-            routed_scaling_factor=None,
         )
+        supported_kwargs = _flashinfer_comm_supported_kwargs(fusion_fn)
+        for key, value in (
+            ("quant_out", None),
+            ("scale_out", None),
+            # Routed scaling is folded into expert_weights by forward_unfinalized.
+            ("routed_scaling_factor", None),
+        ):
+            if key in supported_kwargs:
+                fusion_kwargs[key] = value
+        fusion_fn(**fusion_kwargs)
         return norm_out, residual_out
 
     def _forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
