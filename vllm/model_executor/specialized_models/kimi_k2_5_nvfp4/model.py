@@ -476,10 +476,13 @@ def _fallback_to_generic_kimi_k25(
         KimiK25ForConditionalGeneration as GenericKimiK25ForConditionalGeneration,
     )
 
-    logger.info_once(
-        "Falling back to the generic Kimi-K2.5 implementation because %s.",
-        reason,
+    message = (
+        "Falling back to the generic Kimi-K2.5 implementation because "
+        f"{reason}."
     )
+    if os.getenv("VLLM_KIMI_NVFP4_SPECIALIZED_STRICT", "0") == "1":
+        raise ValueError(message)
+    logger.warning_once("%s", message)
     return GenericKimiK25ForConditionalGeneration(
         vllm_config=vllm_config,
         prefix=prefix,

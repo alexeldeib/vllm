@@ -325,9 +325,13 @@ class KimiK25ForConditionalGeneration(
         self.config = config
         quant_config = vllm_config.quant_config
 
-        # Check for MoonViT config compatibility
+        # Check for MoonViT config compatibility. Text-only serving paths can
+        # leave multimodal_config unset even when the architecture name is the
+        # conditional-generation class.
+        multimodal_config = model_config.multimodal_config
         self.use_data_parallel = (
-            model_config.multimodal_config.mm_encoder_tp_mode == "data"
+            multimodal_config is not None
+            and multimodal_config.mm_encoder_tp_mode == "data"
         )
         self.hidden_size = config.text_config.hidden_size
         self.device = current_platform.current_device()
