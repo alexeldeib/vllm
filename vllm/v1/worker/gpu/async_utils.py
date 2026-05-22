@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 import os
+import threading
 import time
 
 import numpy as np
@@ -16,6 +17,20 @@ logger = init_logger(__name__)
 
 def _k26_step_debug_enabled() -> bool:
     return os.getenv("VLLM_K26_TEP8_STEP_DEBUG", "0") == "1"
+
+
+def _k26_async_output_event_log_interval_s() -> float:
+    try:
+        return float(os.getenv("VLLM_K26_ASYNC_OUTPUT_EVENT_LOG_INTERVAL_S", "15"))
+    except ValueError:
+        return 15.0
+
+
+def _k26_async_output_event_timeout_s() -> float:
+    try:
+        return float(os.getenv("VLLM_K26_ASYNC_OUTPUT_EVENT_TIMEOUT_S", "0"))
+    except ValueError:
+        return 0.0
 
 
 class AsyncOutput(AsyncModelRunnerOutput):
@@ -69,10 +84,35 @@ class AsyncOutput(AsyncModelRunnerOutput):
         if _k26_step_debug_enabled():
             logger.warning(
                 "K26 TEP8 step debug AsyncOutput get_output synchronize begin: "
-                "reqs=%s",
+                "reqs=%s thread=%s current_device=%s",
                 len(self.model_runner_output.req_ids),
+                threading.current_thread().name,
+                torch.cuda.current_device() if torch.cuda.is_available() else None,
             )
-        self.copy_event.synchronize()
+            log_interval_s = max(_k26_async_output_event_log_interval_s(), 1.0)
+            timeout_s = _k26_async_output_event_timeout_s()
+            next_log_s = log_interval_s
+            while not self.copy_event.query():
+                elapsed_s = time.monotonic() - start_time
+                if elapsed_s >= next_log_s:
+                    logger.warning(
+                        "K26 TEP8 step debug AsyncOutput copy event waiting: "
+                        "elapsed_s=%.3f reqs=%s thread=%s current_device=%s",
+                        elapsed_s,
+                        len(self.model_runner_output.req_ids),
+                        threading.current_thread().name,
+                        torch.cuda.current_device() if torch.cuda.is_available() else None,
+                    )
+                    next_log_s += log_interval_s
+                if timeout_s > 0 and elapsed_s >= timeout_s:
+                    raise TimeoutError(
+                        "K26 TEP8 AsyncOutput copy event did not complete within "
+                        f"{timeout_s:.3f}s for {len(self.model_runner_output.req_ids)} "
+                        "request(s)"
+                    )
+                time.sleep(0.1)
+        else:
+            self.copy_event.synchronize()
         if _k26_step_debug_enabled():
             logger.warning(
                 "K26 TEP8 step debug AsyncOutput get_output synchronize complete: "

@@ -77,6 +77,10 @@ def _k26_step_debug_enabled() -> bool:
     return os.getenv("VLLM_K26_TEP8_STEP_DEBUG", "0") == "1"
 
 
+def _k26_sync_output_handoff_enabled() -> bool:
+    return os.getenv("VLLM_K26_SYNC_OUTPUT_HANDOFF", "0") == "1"
+
+
 class FutureWrapper(Future):
     def __init__(
         self,
@@ -973,9 +977,16 @@ class WorkerProc:
         it is passed to the async_output_busy_loop thread. Otherwise, it is
         enqueued directly to the worker_response_mq.
         """
-        if self.use_async_scheduling:
+        if self.use_async_scheduling and not _k26_sync_output_handoff_enabled():
             self.async_output_queue.put(output)
         else:
+            if self.use_async_scheduling and _k26_step_debug_enabled():
+                logger.warning(
+                    "K26 TEP8 debug forcing synchronous output handoff: "
+                    "rank=%s output=%s",
+                    self.rank,
+                    _summarize_result(output),
+                )
             self.enqueue_output(output)
 
     def async_output_busy_loop(self):
@@ -991,6 +1002,14 @@ class WorkerProc:
 
         if hasattr(self.worker, "device"):
             current_platform.set_device(self.worker.device)
+        if _k26_step_debug_enabled():
+            logger.warning(
+                "K26 TEP8 debug async_output_busy_loop device setup: "
+                "rank=%s worker_device=%s current_device=%s",
+                self.rank,
+                getattr(self.worker, "device", None),
+                torch.cuda.current_device() if torch.cuda.is_available() else None,
+            )
 
         while True:
             output = self.async_output_queue.get()
