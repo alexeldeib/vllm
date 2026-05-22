@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
@@ -420,6 +421,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             raise ValueError(
                 "skip_attn must only be True for initial memory profiling."
             )
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner dummy_run begin: "
+                "num_tokens=%s skip_attn=%s uniform_decode=%s "
+                "skip_eplb=%s is_profile=%s",
+                num_tokens,
+                skip_attn,
+                uniform_decode,
+                skip_eplb,
+                is_profile,
+            )
 
         # Create a dummy scheduler output.
         num_reqs = min(num_tokens, self.max_num_reqs)
@@ -452,6 +464,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             intermediate_tensors = self.intermediate_tensors[:num_tokens]
 
         # Execute the model.
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner dummy_run "
+                "execute_model begin: num_reqs=%s num_tokens=%s",
+                num_reqs,
+                num_tokens,
+            )
         self.execute_model(
             dummy_scheduler_output,
             intermediate_tensors=intermediate_tensors,
@@ -459,10 +478,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             skip_attn_for_dummy_run=skip_attn,
             is_profile=is_profile,
         )
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner dummy_run "
+                "execute_model complete: num_reqs=%s num_tokens=%s",
+                num_reqs,
+                num_tokens,
+            )
         self.kv_connector.set_disabled(False)
 
         # Non-last PP ranks don't produce output for sampling.
         if not self.is_last_pp_rank:
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug v2_model_runner dummy_run return: "
+                    "last_pp_rank=False"
+                )
             return None, None
 
         assert self.execute_model_state is not None
@@ -510,6 +541,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         assert hidden_states is not None  # Last PP rank always has hidden_states
         sample_hidden_states = hidden_states[input_batch.logits_indices]
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner dummy_run return: "
+                "last_pp_rank=True hidden_shape=%s sample_shape=%s",
+                tuple(hidden_states.shape),
+                tuple(sample_hidden_states.shape),
+            )
         return hidden_states, sample_hidden_states
 
     @torch.inference_mode()
@@ -533,21 +571,60 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner profile_run begin: "
+                "max_num_tokens=%s max_num_reqs=%s",
+                self.max_num_tokens,
+                self.max_num_reqs,
+            )
         hidden_states, sample_hidden_states = self._dummy_run(
             self.max_num_tokens, skip_attn=True, is_profile=True
         )
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner profile_run dummy complete: "
+                "hidden=%s sample=%s",
+                None if hidden_states is None else tuple(hidden_states.shape),
+                None
+                if sample_hidden_states is None
+                else tuple(sample_hidden_states.shape),
+            )
 
         # Only run sampler/pooler on last PP rank (non-last ranks return None).
         if self.is_last_pp_rank:
             assert sample_hidden_states is not None
             if self.pooling_runner is None:
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.warning(
+                        "K26 TEP8 debug v2_model_runner profile_run sampler begin"
+                    )
                 self._dummy_sampler_run(sample_hidden_states)
             else:
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.warning(
+                        "K26 TEP8 debug v2_model_runner profile_run pooler begin"
+                    )
                 self._dummy_pooler_run(hidden_states)
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug v2_model_runner profile_run "
+                    "sampler_or_pooler complete"
+                )
 
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner profile_run synchronize begin"
+            )
         torch.accelerator.synchronize()
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner profile_run synchronize complete"
+            )
         del hidden_states, sample_hidden_states
         gc.collect()
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning("K26 TEP8 debug v2_model_runner profile_run complete")
 
     def reset_mm_cache(self) -> None:
         if self.encoder_cache is not None:
@@ -568,6 +645,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     def capture_model(self) -> int:
         assert self.cudagraph_manager is not None
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning("K26 TEP8 debug v2_model_runner capture_model begin")
         if not self.cudagraph_manager.needs_capture():
             logger.warning(
                 "Skipping CUDA graph capture. To turn on CUDA graph capture, "
@@ -581,6 +660,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         start_free_gpu_memory = torch.cuda.mem_get_info()[0]
 
         with self.maybe_setup_dummy_loras(self.lora_config):
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning("K26 TEP8 debug v2_model_runner cudagraph capture begin")
             self.cudagraph_manager.capture(
                 self.model,
                 self.model_state,
@@ -592,6 +673,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 has_lora=self.lora_config is not None,
                 use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
             )
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug v2_model_runner cudagraph capture complete"
+                )
             if self.speculator is not None:
                 self.speculator.capture_model()
 
@@ -605,6 +690,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             elapsed_time,
             cuda_graph_size / (1 << 30),
         )
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner capture_model complete: "
+                "elapsed_s=%.2f cuda_graph_size_bytes=%s",
+                elapsed_time,
+                cuda_graph_size,
+            )
         return cuda_graph_size
 
     def _remove_request(self, req_id: str) -> bool:
@@ -952,6 +1044,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner execute_model begin: "
+                "dummy_run=%s is_profile=%s skip_attn=%s "
+                "total_tokens=%s scheduled_reqs=%s",
+                dummy_run,
+                is_profile,
+                skip_attn_for_dummy_run,
+                scheduler_output.total_num_scheduled_tokens,
+                len(scheduler_output.num_scheduled_tokens),
+            )
         if not dummy_run:
             # Update the request states.
             self.finish_requests(scheduler_output)
@@ -959,9 +1062,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.add_requests(scheduler_output)
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug v2_model_runner request state updated: "
+                    "total_tokens=%s scheduled_reqs=%s",
+                    scheduler_output.total_num_scheduled_tokens,
+                    len(scheduler_output.num_scheduled_tokens),
+                )
             if scheduler_output.total_num_scheduled_tokens == 0:
                 # No need to run the model.
                 empty_output = self.kv_connector.no_forward(scheduler_output)
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.warning(
+                        "K26 TEP8 debug v2_model_runner execute_model return no_forward"
+                    )
                 return empty_output
 
         # Get batch descriptor and sync across DP ranks.
@@ -969,6 +1083,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner dispatch begin: "
+                "num_reqs=%s num_toks=%s max_query_len=%s "
+                "uniform_tok_count=%s",
+                num_reqs,
+                num_toks,
+                max_query_len,
+                uniform_tok_count,
+            )
 
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
@@ -986,10 +1110,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.dp_rank,
             need_eager=is_profile or skip_compiled,
         )
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner dispatch complete: "
+                "batch_num_reqs=%s batch_num_tokens=%s cg_mode=%s "
+                "num_tokens_across_dp=%s",
+                getattr(batch_desc, "num_reqs", None),
+                getattr(batch_desc, "num_tokens", None),
+                getattr(batch_desc, "cg_mode", None),
+                num_tokens_across_dp,
+            )
 
         if batch_desc.num_tokens == 0:
             # All DP ranks have zero tokens to run.
             empty_output = self.kv_connector.no_forward(scheduler_output)
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug v2_model_runner execute_model "
+                    "return zero-token no_forward"
+                )
             return empty_output
 
         if not dummy_run:
@@ -1084,8 +1223,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug v2_model_runner pre_forward begin: mode=fullgraph"
+                )
             self.kv_connector.pre_forward(scheduler_output)
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug v2_model_runner model forward begin: mode=fullgraph"
+                )
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug v2_model_runner model forward complete: "
+                    "mode=fullgraph output_type=%s",
+                    type(model_output).__name__,
+                )
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1103,8 +1256,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mapping=slot_mappings_by_layer,
                 skip_compiled=skip_compiled,
             ):
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.warning(
+                        "K26 TEP8 debug v2_model_runner pre_forward begin: "
+                        "mode=%s input_tokens=%s",
+                        batch_desc.cg_mode,
+                        input_batch.num_tokens_after_padding,
+                    )
                 self.kv_connector.pre_forward(scheduler_output)
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.warning(
+                        "K26 TEP8 debug v2_model_runner model forward begin: "
+                        "mode=%s input_tokens=%s",
+                        batch_desc.cg_mode,
+                        input_batch.num_tokens_after_padding,
+                    )
                 model_output = self.model(**model_inputs)
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    output_shape = (
+                        tuple(model_output.shape)
+                        if isinstance(model_output, torch.Tensor)
+                        else None
+                    )
+                    logger.warning(
+                        "K26 TEP8 debug v2_model_runner model forward "
+                        "complete: mode=%s output_type=%s output_shape=%s",
+                        batch_desc.cg_mode,
+                        type(model_output).__name__,
+                        output_shape,
+                    )
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1122,6 +1302,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_intermediate_tensors = model_output
 
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner post_forward complete: output_type=%s",
+                type(kv_connector_output).__name__,
+            )
         self.execute_model_state = ExecuteModelState(
             input_batch=input_batch,
             attn_metadata=attn_metadata,
@@ -1135,7 +1320,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: return IntermediateTensors for sending.
             assert output_intermediate_tensors is not None
             output_intermediate_tensors.kv_connector_output = kv_connector_output
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug v2_model_runner execute_model return: "
+                    "last_pp_rank=False output_type=%s",
+                    type(output_intermediate_tensors).__name__,
+                )
             return output_intermediate_tensors
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            hidden_shape = (
+                tuple(hidden_states.shape)
+                if isinstance(hidden_states, torch.Tensor)
+                else None
+            )
+            logger.warning(
+                "K26 TEP8 debug v2_model_runner execute_model return: "
+                "last_pp_rank=True hidden_shape=%s",
+                hidden_shape,
+            )
         return None
 
     @torch.inference_mode()

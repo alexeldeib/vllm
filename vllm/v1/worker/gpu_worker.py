@@ -352,7 +352,19 @@ class Worker(WorkerBase):
         if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             # still need a profile run which compiles the model for
             # max_num_batched_tokens
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug gpu_worker determine_available_memory "
+                    "profile_run begin: kv_cache_memory_bytes=%s",
+                    kv_cache_memory_bytes,
+                )
             self.model_runner.profile_run()
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug gpu_worker determine_available_memory "
+                    "profile_run complete: kv_cache_memory_bytes=%s",
+                    kv_cache_memory_bytes,
+                )
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -375,11 +387,28 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug gpu_worker determine_available_memory "
+                    "profile_run begin: requested_memory=%s",
+                    self.requested_memory,
+                )
             self.model_runner.profile_run()
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug gpu_worker determine_available_memory "
+                    "profile_run complete"
+                )
 
             profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
                 "allocated_bytes.all.peak", 0
             )
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug gpu_worker determine_available_memory "
+                    "torch peak captured: profile_torch_peak=%s",
+                    profile_torch_peak,
+                )
 
             # Profile CUDA graph memory if graphs will be captured.
             # Skip on ROCm/HIP/XPU as graph pool handles and mem_get_info behave
@@ -390,7 +419,18 @@ class Worker(WorkerBase):
                 and self.vllm_config.compilation_config.cudagraph_mode
                 != CUDAGraphMode.NONE
             ):
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.warning(
+                        "K26 TEP8 debug gpu_worker determine_available_memory "
+                        "profile_cudagraph_memory begin"
+                    )
                 cudagraph_memory_estimate = self.model_runner.profile_cudagraph_memory()
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.warning(
+                        "K26 TEP8 debug gpu_worker determine_available_memory "
+                        "profile_cudagraph_memory complete: estimate=%s",
+                        cudagraph_memory_estimate,
+                    )
 
         # Use the pre-cudagraph torch peak to avoid double-counting.
         profile_result.torch_peak_increase = (
@@ -489,6 +529,12 @@ class Worker(WorkerBase):
                     suggested_util,
                 )
 
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug gpu_worker determine_available_memory return: "
+                "available_kv_cache_memory_bytes=%s",
+                self.available_kv_cache_memory_bytes,
+            )
         return int(self.available_kv_cache_memory_bytes)
 
     def get_kv_connector_handshake_metadata(self) -> dict | None:
