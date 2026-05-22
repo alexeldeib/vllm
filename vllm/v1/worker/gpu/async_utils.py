@@ -1,12 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import os
+import time
 
 import numpy as np
 import torch
 
+from vllm.logger import init_logger
 from vllm.v1.outputs import AsyncModelRunnerOutput, LogprobsTensors, ModelRunnerOutput
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
+
+logger = init_logger(__name__)
+
+
+def _k26_step_debug_enabled() -> bool:
+    return os.getenv("VLLM_K26_TEP8_STEP_DEBUG", "0") == "1"
 
 
 class AsyncOutput(AsyncModelRunnerOutput):
@@ -25,6 +34,14 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.copy_event = torch.cuda.Event()
+        if _k26_step_debug_enabled():
+            logger.warning(
+                "K26 TEP8 step debug AsyncOutput init begin: "
+                "reqs=%s sampled_shape=%s num_sampled_shape=%s",
+                len(model_runner_output.req_ids),
+                tuple(sampler_output.sampled_token_ids.shape),
+                tuple(num_sampled_tokens.shape),
+            )
 
         with stream(copy_stream, main_stream):
             copy_stream.wait_stream(main_stream)
@@ -44,9 +61,24 @@ class AsyncOutput(AsyncModelRunnerOutput):
                 for k, v in self.model_runner_output.prompt_logprobs_dict.items()
             }
             self.copy_event.record(copy_stream)
+        if _k26_step_debug_enabled():
+            logger.warning("K26 TEP8 step debug AsyncOutput init complete")
 
     def get_output(self) -> ModelRunnerOutput:
+        start_time = time.monotonic()
+        if _k26_step_debug_enabled():
+            logger.warning(
+                "K26 TEP8 step debug AsyncOutput get_output synchronize begin: "
+                "reqs=%s",
+                len(self.model_runner_output.req_ids),
+            )
         self.copy_event.synchronize()
+        if _k26_step_debug_enabled():
+            logger.warning(
+                "K26 TEP8 step debug AsyncOutput get_output synchronize complete: "
+                "elapsed_s=%.6f",
+                time.monotonic() - start_time,
+            )
 
         # NOTE(woosuk): The following code is to ensure compatibility with
         # the existing model runner.
@@ -66,6 +98,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
         if self.logprobs_tensors is not None:
             self.model_runner_output.logprobs = self.logprobs_tensors.tolists()
         self.model_runner_output.prompt_logprobs_dict = self.prompt_logprobs_dict
+        if _k26_step_debug_enabled():
+            logger.warning("K26 TEP8 step debug AsyncOutput get_output complete")
         return self.model_runner_output
 
 

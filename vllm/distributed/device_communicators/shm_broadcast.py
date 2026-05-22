@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 import pickle
 import sys
 import threading
@@ -90,7 +91,9 @@ LONG_WAIT_TIME_LOG_MSG = (
 
 
 def _k26_hang_debug_enabled() -> bool:
-    return envs.VLLM_K26_TEP8_HANG_DEBUG
+    if envs.VLLM_K26_TEP8_HANG_DEBUG:
+        return True
+    return os.getenv("VLLM_K26_TEP8_STEP_DEBUG", "0") == "1"
 
 
 def _truncate_values(values: Any, limit: int = 8) -> list[Any]:

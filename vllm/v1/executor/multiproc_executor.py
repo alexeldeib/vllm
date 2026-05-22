@@ -71,6 +71,12 @@ from vllm.v1.worker.worker_base import WorkerWrapperBase
 logger = init_logger(__name__)
 
 
+def _k26_step_debug_enabled() -> bool:
+    if envs.VLLM_K26_TEP8_HANG_DEBUG:
+        return True
+    return os.getenv("VLLM_K26_TEP8_STEP_DEBUG", "0") == "1"
+
+
 class FutureWrapper(Future):
     def __init__(
         self,
@@ -376,7 +382,7 @@ class MultiprocExecutor(Executor):
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
         rpc_payload = (send_method, args, kwargs, output_rank)
-        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+        if _k26_step_debug_enabled():
             logger.info(
                 "K26 TEP8 debug collective_rpc enqueue begin: method=%s "
                 "output_rank=%s args=%s",
@@ -385,7 +391,7 @@ class MultiprocExecutor(Executor):
                 [_summarize_result(arg) for arg in args[:2]],
             )
         self.rpc_broadcast_mq.enqueue(rpc_payload)
-        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+        if _k26_step_debug_enabled():
             logger.info(
                 "K26 TEP8 debug collective_rpc enqueue complete: payload=%s",
                 _summarize_queue_object(rpc_payload),
@@ -401,7 +407,7 @@ class MultiprocExecutor(Executor):
                 dequeue_timeout = (
                     None if deadline is None else (deadline - time.monotonic())
                 )
-                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                if _k26_step_debug_enabled():
                     logger.info(
                         "K26 TEP8 debug collective_rpc waiting response: "
                         "method=%s response_index=%s timeout=%s",
@@ -413,7 +419,7 @@ class MultiprocExecutor(Executor):
                     status, result = mq.dequeue(timeout=dequeue_timeout)
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
-                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                if _k26_step_debug_enabled():
                     logger.info(
                         "K26 TEP8 debug collective_rpc response received: "
                         "method=%s response_index=%s status=%s result=%s",
@@ -829,6 +835,13 @@ class WorkerProc:
         """Worker initialization and execution loops.
         This runs a background process"""
 
+        if os.getenv("VLLM_K26_FAULTHANDLER", "0") == "1":
+            import faulthandler
+
+            faulthandler.enable(all_threads=True)
+            faulthandler.register(signal.SIGUSR2, all_threads=True)
+            logger.info("K26 TEP8 debug faulthandler registered on SIGUSR2")
+
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
         # processes to terminate without error
@@ -947,7 +960,7 @@ class WorkerProc:
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
-            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            if _k26_step_debug_enabled():
                 logger.info(
                     "K26 TEP8 debug worker response enqueue: rank=%s result=%s",
                     self.rank,
@@ -981,6 +994,13 @@ class WorkerProc:
 
         while True:
             output = self.async_output_queue.get()
+            if _k26_step_debug_enabled():
+                logger.info(
+                    "K26 TEP8 debug async_output_busy_loop received: "
+                    "rank=%s output=%s",
+                    self.rank,
+                    _summarize_result(output),
+                )
             self.enqueue_output(output)
 
     def worker_busy_loop(self):
@@ -991,7 +1011,7 @@ class WorkerProc:
                 indefinite=True
             )
             method_name = method if isinstance(method, str) else type(method).__name__
-            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            if _k26_step_debug_enabled():
                 logger.info(
                     "K26 TEP8 debug worker rpc received: rank=%s method=%s "
                     "output_rank=%s args=%s",
@@ -1007,7 +1027,7 @@ class WorkerProc:
                     func = partial(cloudpickle.loads(method), self.worker)
 
                 output = func(*args, **kwargs)
-                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                if _k26_step_debug_enabled():
                     logger.info(
                         "K26 TEP8 debug worker rpc finished: rank=%s method=%s "
                         "output=%s",
