@@ -1074,7 +1074,7 @@ class EngineCoreProc(EngineCore):
             set_process_title(process_title)
             maybe_init_worker_tracer("vllm.engine_core", "engine_core", process_title)
             decorate_logs()
-            if parallel_config.numa_bind:
+            if getattr(parallel_config, "numa_bind", False):
                 numa_utils.log_current_affinity_state(process_title)
 
             if data_parallel and vllm_config.kv_transfer_config is not None:
