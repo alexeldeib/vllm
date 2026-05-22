@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -30,6 +31,13 @@ from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.utils import AttentionGroup
 
 logger = init_logger(__name__)
+
+
+def _k26_cudagraph_debug_enabled() -> bool:
+    return (
+        os.getenv("VLLM_K26_TEP8_HANG_DEBUG", "0") == "1"
+        or os.getenv("VLLM_K26_TEP8_STEP_DEBUG", "0") == "1"
+    )
 
 
 @dataclass(frozen=True)
@@ -187,6 +195,14 @@ class CudaGraphManager:
             create_forward_fn: Factory that prepares inputs (OUTSIDE graph) and
                 returns a function that runs forward with a given CUDAGraphMode.
         """
+        debug = _k26_cudagraph_debug_enabled()
+        if debug:
+            logger.warning(
+                "K26 TEP8 debug cudagraph manager capture begin: "
+                "mode=%s capture_descs=%s",
+                self.cudagraph_mode,
+                {mode.name: len(descs) for mode, descs in self._capture_descs.items()},
+            )
         with graph_capture(device=self.device):
             # Capture in order: PIECEWISE first, then FULL. PIECEWISE has larger
             # activations so FULL activations should fit in already allocated
@@ -200,17 +216,49 @@ class CudaGraphManager:
                     descs = tqdm(descs, desc=f"{progress_bar_desc} ({mode.name})")
                 for desc in descs:
                     # Prepare inputs and get forward function
+                    if debug:
+                        logger.warning(
+                            "K26 TEP8 debug cudagraph prepare begin: desc=%s",
+                            desc,
+                        )
                     forward_fn = create_forward_fn(desc)
+                    if debug:
+                        logger.warning(
+                            "K26 TEP8 debug cudagraph prepare complete: desc=%s",
+                            desc,
+                        )
 
                     # Warmup
+                    if debug:
+                        logger.warning(
+                            "K26 TEP8 debug cudagraph warmup begin: desc=%s",
+                            desc,
+                        )
                     forward_fn(CUDAGraphMode.NONE)
+                    if debug:
+                        logger.warning(
+                            "K26 TEP8 debug cudagraph warmup complete: desc=%s",
+                            desc,
+                        )
 
                     # Capture
                     logger.debug(
                         "CG Capture: mode=%s, batch_desc=%s", desc.cg_mode.name, desc
                     )
                     if desc.cg_mode == CUDAGraphMode.PIECEWISE:
+                        if debug:
+                            logger.warning(
+                                "K26 TEP8 debug cudagraph piecewise capture begin: "
+                                "desc=%s",
+                                desc,
+                            )
                         forward_fn(CUDAGraphMode.PIECEWISE)
+                        if debug:
+                            logger.warning(
+                                "K26 TEP8 debug cudagraph piecewise capture complete: "
+                                "desc=%s",
+                                desc,
+                            )
                     else:
                         assert desc not in self.graphs, (
                             f"Graph already captured for {desc}"
@@ -219,6 +267,11 @@ class CudaGraphManager:
                         # Sync offloader's copy stream before capture.
                         # Ensure any pre-capture prefetches from offloader are complete.
                         get_offloader().sync_prev_onload()
+                        if debug:
+                            logger.warning(
+                                "K26 TEP8 debug cudagraph full capture begin: desc=%s",
+                                desc,
+                            )
                         with torch.cuda.graph(graph, self.pool):
                             forward_fn(CUDAGraphMode.NONE)
                             # Join offloader's copy stream after forward to avoid
@@ -227,7 +280,14 @@ class CudaGraphManager:
                             # the next forward pass.
                             get_offloader().join_after_forward()
                         self.graphs[desc] = graph
+                        if debug:
+                            logger.warning(
+                                "K26 TEP8 debug cudagraph full capture complete: desc=%s",
+                                desc,
+                            )
         self._graphs_captured = True
+        if debug:
+            logger.warning("K26 TEP8 debug cudagraph manager capture complete")
 
     def dispatch(
         self,

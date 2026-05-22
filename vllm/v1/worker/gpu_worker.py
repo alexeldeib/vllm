@@ -571,6 +571,14 @@ class Worker(WorkerBase):
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
         """Allocate GPU KV cache with the specified kv_cache_config."""
 
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug gpu_worker initialize_from_config begin: "
+                "num_blocks=%s needs_zero=%s",
+                getattr(kv_cache_config, "num_blocks", None),
+                getattr(kv_cache_config, "needs_kv_cache_zeroing", None),
+            )
+
         # Update local config with adjusted num blocks after profiling,
         # so that it's available to the warmup stage.
         self.cache_config.num_gpu_blocks = kv_cache_config.num_blocks
@@ -581,6 +589,8 @@ class Worker(WorkerBase):
         # because `initialize_kv_cache` will inject kv cache groups not
         # related to kv cache connector (e.g. kv cache sharing layers).
         ensure_kv_transfer_initialized(self.vllm_config, kv_cache_config)
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning("K26 TEP8 debug gpu_worker kv_transfer initialized")
 
         if self.vllm_config.model_config.enable_sleep_mode:
             from vllm.device_allocator.cumem import CuMemAllocator
@@ -590,6 +600,8 @@ class Worker(WorkerBase):
                 self.model_runner.initialize_kv_cache(kv_cache_config)
         else:
             self.model_runner.initialize_kv_cache(kv_cache_config)
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning("K26 TEP8 debug gpu_worker initialize_kv_cache complete")
 
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
@@ -601,10 +613,23 @@ class Worker(WorkerBase):
             self.model_runner, "_init_kv_zero_meta"
         ):
             self.model_runner._init_kv_zero_meta()
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning("K26 TEP8 debug gpu_worker kv_zero_meta complete")
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning("K26 TEP8 debug gpu_worker initialize_from_config complete")
 
     @instrument(span_name="Warmup (GPU)")
     def compile_or_warm_up_model(self) -> CompilationTimes:
         warmup_sizes: list[int] = []
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug gpu_worker compile_or_warm_up_model begin: "
+                "mode=%s cudagraph_mode=%s compile_sizes=%s capture_sizes=%s",
+                self.vllm_config.compilation_config.mode,
+                self.vllm_config.compilation_config.cudagraph_mode,
+                self.vllm_config.compilation_config.compile_sizes,
+                self.vllm_config.compilation_config.cudagraph_capture_sizes,
+            )
 
         if self.vllm_config.compilation_config.mode == CompilationMode.VLLM_COMPILE:
             # warm up sizes that are not in cudagraph capture sizes,
@@ -632,16 +657,37 @@ class Worker(WorkerBase):
         # We skip EPLB here since we don't want to record dummy metrics
         for size in sorted(warmup_sizes, reverse=True):
             logger.info("Compile and warming up model for size %d", size)
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug gpu_worker warmup dummy_run begin: size=%s",
+                    size,
+                )
             self.model_runner._dummy_run(size, skip_eplb=True, remove_lora=False)
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug gpu_worker warmup dummy_run complete: size=%s",
+                    size,
+                )
         self.model_runner.maybe_remove_all_loras(self.model_runner.lora_config)
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning("K26 TEP8 debug gpu_worker kernel_warmup begin")
         kernel_warmup(self)
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning("K26 TEP8 debug gpu_worker kernel_warmup complete")
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning("K26 TEP8 debug gpu_worker capture_model begin")
             cuda_graph_memory_bytes = self.model_runner.capture_model()
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning(
+                    "K26 TEP8 debug gpu_worker capture_model complete: bytes=%s",
+                    cuda_graph_memory_bytes,
+                )
 
         # Compare actual vs estimated CUDA graph memory (if we did profiling)
         if (
@@ -718,7 +764,11 @@ class Worker(WorkerBase):
 
         if self.use_v2_model_runner:
             # V2: Run full execute_model + sample_tokens to JIT compile triton kernels.
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning("K26 TEP8 debug gpu_worker warmup_kernels begin")
             warmup_kernels(self.model_runner, self.execute_model, self.sample_tokens)
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.warning("K26 TEP8 debug gpu_worker warmup_kernels complete")
         elif get_pp_group().is_last_rank:
             # V1: Warm up sampler and preallocate memory buffer for logits and other
             # sampling related tensors of max possible shape to avoid memory
@@ -745,6 +795,8 @@ class Worker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning("K26 TEP8 debug gpu_worker compile_or_warm_up_model complete")
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,
             encoder=self.compilation_config.encoder_compilation_time,

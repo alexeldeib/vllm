@@ -654,7 +654,21 @@ class WorkerProc:
         )
 
         # Load model
+        if _k26_step_debug_enabled():
+            logger.warning(
+                "K26 TEP8 debug WorkerProc init_device begin: "
+                "rank=%s local_rank=%s",
+                rank,
+                local_rank,
+            )
         self.worker.init_device()
+        if _k26_step_debug_enabled():
+            logger.warning(
+                "K26 TEP8 debug WorkerProc init_device complete: "
+                "rank=%s local_rank=%s",
+                rank,
+                local_rank,
+            )
         # Update process title now that parallel groups are initialized
         self.setup_proc_title_and_log_prefix(
             enable_ep=vllm_config.parallel_config.enable_expert_parallel
@@ -662,7 +676,14 @@ class WorkerProc:
         if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
             self.worker.elastic_ep_execute("load_model")
         else:
+            if _k26_step_debug_enabled():
+                logger.warning("K26 TEP8 debug WorkerProc load_model begin: rank=%s", rank)
             self.worker.load_model()
+            if _k26_step_debug_enabled():
+                logger.warning(
+                    "K26 TEP8 debug WorkerProc load_model complete: rank=%s",
+                    rank,
+                )
 
         scheduler_config = vllm_config.scheduler_config
         self.use_async_scheduling = scheduler_config.async_scheduling
@@ -674,13 +695,25 @@ class WorkerProc:
                 name="WorkerAsyncOutputCopy",
             )
             self.async_output_copy_thread.start()
+            if _k26_step_debug_enabled():
+                logger.warning(
+                    "K26 TEP8 debug WorkerProc async_output_thread started: rank=%s",
+                    rank,
+                )
 
         # Set block size based on the attention backends
         current_platform.update_block_size_for_backend(vllm_config)
 
         # Initialize message queues after init_device() since multi-node setups
         # (nnodes_within_dp > 1) require distributed groups to be initialized
+        if _k26_step_debug_enabled():
+            logger.warning("K26 TEP8 debug WorkerProc init_message_queues begin: rank=%s", rank)
         self._init_message_queues(input_shm_handle, vllm_config)
+        if _k26_step_debug_enabled():
+            logger.warning(
+                "K26 TEP8 debug WorkerProc init_message_queues complete: rank=%s",
+                rank,
+            )
 
         # Enable environment variable cache (e.g. assume no more
         # environment variable overrides after this point)
@@ -780,7 +813,20 @@ class WorkerProc:
                 try:
                     # Wait until the WorkerProc is ready.
                     unready_proc_handle = pipes.pop(pipe)
+                    if _k26_step_debug_enabled():
+                        logger.warning(
+                            "K26 TEP8 debug wait_for_ready recv begin: rank=%s",
+                            unready_proc_handle.rank,
+                        )
                     response: dict[str, Any] = pipe.recv()
+                    if _k26_step_debug_enabled():
+                        logger.warning(
+                            "K26 TEP8 debug wait_for_ready recv complete: "
+                            "rank=%s status=%s has_handle=%s",
+                            unready_proc_handle.rank,
+                            response.get("status"),
+                            "handle" in response,
+                        )
                     if response["status"] != "READY":
                         raise e
 
@@ -895,6 +941,11 @@ class WorkerProc:
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
 
             # Send READY once we know everything is loaded
+            if _k26_step_debug_enabled():
+                logger.warning(
+                    "K26 TEP8 debug WorkerProc ready_pipe send begin: rank=%s",
+                    worker.rank,
+                )
             ready_writer.send(
                 {
                     "status": WorkerProc.READY_STR,
@@ -902,15 +953,47 @@ class WorkerProc:
                     "peer_response_handles": worker.peer_response_handles,
                 }
             )
+            if _k26_step_debug_enabled():
+                logger.warning(
+                    "K26 TEP8 debug WorkerProc ready_pipe send complete: rank=%s",
+                    worker.rank,
+                )
 
             # Ensure message queues are ready. Will deadlock if re-ordered.
             # Must be kept consistent with the Executor
             if worker.rpc_broadcast_mq is not None:
+                if _k26_step_debug_enabled():
+                    logger.warning(
+                        "K26 TEP8 debug WorkerProc rpc_broadcast_mq wait begin: "
+                        "rank=%s",
+                        worker.rank,
+                    )
                 worker.rpc_broadcast_mq.wait_until_ready()
+                if _k26_step_debug_enabled():
+                    logger.warning(
+                        "K26 TEP8 debug WorkerProc rpc_broadcast_mq wait complete: "
+                        "rank=%s",
+                        worker.rank,
+                    )
+            if _k26_step_debug_enabled():
+                logger.warning(
+                    "K26 TEP8 debug WorkerProc worker_response_mq wait begin: rank=%s",
+                    worker.rank,
+                )
             worker.worker_response_mq.wait_until_ready()
+            if _k26_step_debug_enabled():
+                logger.warning(
+                    "K26 TEP8 debug WorkerProc worker_response_mq wait complete: rank=%s",
+                    worker.rank,
+                )
             ready_writer.close()
             ready_writer = None
 
+            if _k26_step_debug_enabled():
+                logger.warning(
+                    "K26 TEP8 debug WorkerProc entering busy_loop: rank=%s",
+                    worker.rank,
+                )
             worker.worker_busy_loop()
 
         except Exception:

@@ -636,12 +636,26 @@ class MessageQueue:
         """This is a collective operation. All processes (including the
         readers and the writer) should call this function.
         """
+        debug = _k26_hang_debug_enabled()
+        if debug:
+            logger.warning(
+                "K26 TEP8 debug mq wait_until_ready begin: context=%s",
+                self._debug_queue_context(),
+            )
         if self._is_writer:
             # wait for all readers to connect
 
             # local readers
             for i in range(self.n_local_reader):
                 # wait for subscription messages from all local readers
+                if debug:
+                    logger.warning(
+                        "K26 TEP8 debug mq wait local reader subscription: "
+                        "context=%s reader_index=%s/%s",
+                        self._debug_queue_context(),
+                        i + 1,
+                        self.n_local_reader,
+                    )
                 self.local_socket.recv()
             if self.n_local_reader > 0:
                 # send a message to all local readers
@@ -651,6 +665,14 @@ class MessageQueue:
             # remote readers
             for i in range(self.n_remote_reader):
                 # wait for subscription messages from all remote readers
+                if debug:
+                    logger.warning(
+                        "K26 TEP8 debug mq wait remote reader subscription: "
+                        "context=%s reader_index=%s/%s",
+                        self._debug_queue_context(),
+                        i + 1,
+                        self.n_remote_reader,
+                    )
                 self.remote_socket.recv()
             if self.n_remote_reader > 0:
                 # send a message to all remote readers
@@ -658,12 +680,27 @@ class MessageQueue:
                 self.remote_socket.send(b"READY")
         elif self._is_local_reader:
             # wait for the writer to send a message
+            if debug:
+                logger.warning(
+                    "K26 TEP8 debug mq wait local reader READY recv begin: context=%s",
+                    self._debug_queue_context(),
+                )
             recv = self.local_socket.recv()
             assert recv == b"READY"
         elif self._is_remote_reader:
             # wait for the writer to send a message
+            if debug:
+                logger.warning(
+                    "K26 TEP8 debug mq wait remote reader READY recv begin: context=%s",
+                    self._debug_queue_context(),
+                )
             recv = self.remote_socket.recv()
             assert recv == b"READY"
+        if debug:
+            logger.warning(
+                "K26 TEP8 debug mq wait_until_ready complete: context=%s",
+                self._debug_queue_context(),
+            )
 
     def shutdown(self):
         """If this is an idle reader, wakes it up so it can clean up and shut
