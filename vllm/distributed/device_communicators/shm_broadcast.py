@@ -89,6 +89,119 @@ LONG_WAIT_TIME_LOG_MSG = (
 )
 
 
+def _k26_hang_debug_enabled() -> bool:
+    return envs.VLLM_K26_TEP8_HANG_DEBUG
+
+
+def _truncate_values(values: Any, limit: int = 8) -> list[Any]:
+    try:
+        return list(values)[:limit]
+    except TypeError:
+        return []
+
+
+def _summarize_collection(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return {"count": len(value), "keys": _truncate_values(value.keys())}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {"count": len(value), "items": _truncate_values(value)}
+    return {"type": type(value).__name__}
+
+
+def _summarize_kv_metadata(metadata: Any) -> dict[str, Any] | None:
+    if metadata is None:
+        return None
+    summary: dict[str, Any] = {"type": type(metadata).__name__}
+    for attr in (
+        "reqs_to_recv",
+        "reqs_to_send",
+        "reqs_in_batch",
+        "reqs_not_processed",
+    ):
+        if hasattr(metadata, attr):
+            summary[attr] = _summarize_collection(getattr(metadata, attr))
+    return summary
+
+
+def _summarize_scheduler_output(value: Any) -> dict[str, Any] | None:
+    if not hasattr(value, "total_num_scheduled_tokens"):
+        return None
+    cached_reqs = getattr(value, "scheduled_cached_reqs", None)
+    new_reqs = getattr(value, "scheduled_new_reqs", [])
+    num_scheduled_tokens = getattr(value, "num_scheduled_tokens", {})
+    return {
+        "type": type(value).__name__,
+        "total_num_scheduled_tokens": getattr(
+            value, "total_num_scheduled_tokens", None
+        ),
+        "new_req_ids": [
+            getattr(req, "req_id", "<unknown>") for req in _truncate_values(new_reqs)
+        ],
+        "cached_req_ids": _truncate_values(getattr(cached_reqs, "req_ids", [])),
+        "num_scheduled_tokens": dict(
+            list(getattr(num_scheduled_tokens, "items", lambda: [])())[:8]
+        ),
+        "finished_req_ids": _truncate_values(getattr(value, "finished_req_ids", [])),
+        "kv_connector_metadata": _summarize_kv_metadata(
+            getattr(value, "kv_connector_metadata", None)
+        ),
+    }
+
+
+def _summarize_result(value: Any) -> Any:
+    if value is None:
+        return None
+    scheduler_summary = _summarize_scheduler_output(value)
+    if scheduler_summary is not None:
+        return scheduler_summary
+    if hasattr(value, "kv_connector_output"):
+        kv_output = getattr(value, "kv_connector_output", None)
+        return {
+            "type": type(value).__name__,
+            "kv_connector_output": {
+                "is_none": kv_output is None,
+                "finished_sending": _truncate_values(
+                    getattr(kv_output, "finished_sending", [])
+                )
+                if kv_output is not None
+                else [],
+                "finished_recving": _truncate_values(
+                    getattr(kv_output, "finished_recving", [])
+                )
+                if kv_output is not None
+                else [],
+            },
+        }
+    return {"type": type(value).__name__}
+
+
+def _summarize_queue_object(obj: Any) -> dict[str, Any]:
+    if isinstance(obj, tuple) and len(obj) == 4:
+        method, args, kwargs, output_rank = obj
+        return {
+            "kind": "rpc",
+            "method": method if isinstance(method, str) else type(method).__name__,
+            "args": [_summarize_result(arg) for arg in args[:2]],
+            "kwargs_keys": sorted(kwargs.keys()) if isinstance(kwargs, dict) else [],
+            "output_rank": output_rank,
+        }
+    if isinstance(obj, tuple) and len(obj) == 2:
+        status, result = obj
+        return {
+            "kind": "response",
+            "status": str(status),
+            "result": _summarize_result(result),
+        }
+    return {"kind": "object", "type": type(obj).__name__}
+
+
+def _metadata_snapshot(metadata_buffer: Any) -> list[int] | str:
+    try:
+        return list(bytes(metadata_buffer))
+    except Exception as e:
+        return f"<metadata unavailable: {e}>"
+
+
 class SpinCondition:
     """
     This class implements an interface similar to a threading.Condition. It
@@ -428,6 +541,7 @@ class MessageQueue:
         self._is_writer = True
         self._is_local_reader = False
         self.local_reader_rank = -1
+        self._debug_rank = -1
         # rank does not matter for remote readers
         self._is_remote_reader = False
 
@@ -445,11 +559,33 @@ class MessageQueue:
     def export_handle(self) -> Handle:
         return self.handle
 
+    def _debug_queue_context(self) -> dict[str, Any]:
+        role = "writer"
+        if getattr(self, "_is_local_reader", False):
+            role = "local_reader"
+        elif getattr(self, "_is_remote_reader", False):
+            role = "remote_reader"
+        handle = getattr(self, "handle", None)
+        buffer_handle = getattr(handle, "buffer_handle", None)
+        return {
+            "role": role,
+            "rank": getattr(self, "_debug_rank", None),
+            "local_reader_rank": getattr(self, "local_reader_rank", None),
+            "current_idx": getattr(self, "current_idx", None),
+            "buffer_name": buffer_handle[3] if buffer_handle else None,
+            "n_local_reader": getattr(self, "n_local_reader", None),
+            "n_remote_reader": getattr(self, "n_remote_reader", None),
+            "shutting_down": getattr(self, "shutting_down", None),
+        }
+
     @staticmethod
     def create_from_handle(handle: Handle, rank) -> "MessageQueue":
         self = MessageQueue.__new__(MessageQueue)
         self.handle = handle
         self._is_writer = False
+        self._debug_rank = rank
+        self.n_local_reader = len(handle.local_reader_ranks)
+        self.n_remote_reader = 1 if handle.remote_subscribe_addr is not None else 0
 
         context = Context()
 
@@ -562,9 +698,22 @@ class MessageQueue:
 
                     # if we wait for a long time, log a message
                     if elapsed > VLLM_RINGBUFFER_WARNING_INTERVAL * n_warning:
-                        logger.info(
-                            LONG_WAIT_TIME_LOG_MSG, VLLM_RINGBUFFER_WARNING_INTERVAL
-                        )
+                        if _k26_hang_debug_enabled():
+                            logger.warning(
+                                "K26 TEP8 debug shm acquire_write waiting: "
+                                "context=%s read_count=%s written_flag=%s "
+                                "metadata=%s elapsed_s=%.3f",
+                                self._debug_queue_context(),
+                                read_count,
+                                written_flag,
+                                _metadata_snapshot(metadata_buffer),
+                                elapsed,
+                            )
+                        else:
+                            logger.info(
+                                LONG_WAIT_TIME_LOG_MSG,
+                                VLLM_RINGBUFFER_WARNING_INTERVAL,
+                            )
                         n_warning += 1
 
                     continue
@@ -678,9 +827,23 @@ class MessageQueue:
 
                     # if we wait for a long time, log a message
                     if read_timeout.should_warn():
-                        logger.info(
-                            LONG_WAIT_TIME_LOG_MSG, VLLM_RINGBUFFER_WARNING_INTERVAL
-                        )
+                        if _k26_hang_debug_enabled():
+                            logger.warning(
+                                "K26 TEP8 debug shm acquire_read waiting: "
+                                "context=%s read_flag=%s written_flag=%s "
+                                "metadata=%s timeout=%s indefinite=%s",
+                                self._debug_queue_context(),
+                                read_flag,
+                                written_flag,
+                                _metadata_snapshot(metadata_buffer),
+                                timeout,
+                                indefinite,
+                            )
+                        else:
+                            logger.info(
+                                LONG_WAIT_TIME_LOG_MSG,
+                                VLLM_RINGBUFFER_WARNING_INTERVAL,
+                            )
 
                     continue
                 # found a block that is not read by this reader
@@ -719,6 +882,15 @@ class MessageQueue:
         all_buffers[0] = pickle.dumps(
             obj, protocol=pickle.HIGHEST_PROTOCOL, buffer_callback=oob_callback
         )
+        if _k26_hang_debug_enabled():
+            logger.info(
+                "K26 TEP8 debug shm enqueue begin: context=%s total_bytes=%s "
+                "main_buffer_bytes=%s object=%s",
+                self._debug_queue_context(),
+                total_bytes,
+                len(all_buffers[0]),
+                _summarize_queue_object(obj),
+            )
         if self.n_local_reader > 0:
             if total_bytes + len(all_buffers[0]) >= self.buffer.max_chunk_bytes:
                 with self.acquire_write(timeout) as buf:
@@ -744,6 +916,12 @@ class MessageQueue:
 
         if self.n_remote_reader > 0:
             self.remote_socket.send_multipart(all_buffers, copy=False)
+        if _k26_hang_debug_enabled():
+            logger.info(
+                "K26 TEP8 debug shm enqueue complete: context=%s object=%s",
+                self._debug_queue_context(),
+                _summarize_queue_object(obj),
+            )
 
     def dequeue(
         self,
@@ -751,6 +929,13 @@ class MessageQueue:
         indefinite: bool = False,
     ):
         """Read from message queue with optional timeout (in seconds)"""
+        if _k26_hang_debug_enabled():
+            logger.info(
+                "K26 TEP8 debug shm dequeue begin: context=%s timeout=%s indefinite=%s",
+                self._debug_queue_context(),
+                timeout,
+                indefinite,
+            )
         if self._is_local_reader:
             with self.acquire_read(timeout, indefinite) as buf:
                 overflow = buf[0] == 1
@@ -770,6 +955,12 @@ class MessageQueue:
             obj = MessageQueue.recv(self.remote_socket, timeout)
         else:
             raise RuntimeError("Only readers can dequeue")
+        if _k26_hang_debug_enabled():
+            logger.info(
+                "K26 TEP8 debug shm dequeue complete: context=%s object=%s",
+                self._debug_queue_context(),
+                _summarize_queue_object(obj),
+            )
         return obj
 
     @staticmethod

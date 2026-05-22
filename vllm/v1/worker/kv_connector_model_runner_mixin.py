@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -30,6 +31,27 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 logger = init_logger(__name__)
+
+
+def _debug_ids(value, limit: int = 8):
+    if isinstance(value, dict):
+        return {"count": len(value), "ids": list(value.keys())[:limit]}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return {"count": len(value), "ids": list(value)[:limit]}
+    return {"type": type(value).__name__}
+
+
+def _debug_kv_metadata(metadata) -> dict:
+    summary = {"type": type(metadata).__name__}
+    for attr in (
+        "reqs_to_recv",
+        "reqs_to_send",
+        "reqs_in_batch",
+        "reqs_not_processed",
+    ):
+        if hasattr(metadata, attr):
+            summary[attr] = _debug_ids(getattr(metadata, attr))
+    return summary
 
 
 # Defined as a kv connector functionality mixin for ModelRunner (GPU, TPU)
@@ -93,6 +115,12 @@ class KVConnectorModelRunnerMixin:
         kv_connector = get_kv_transfer_group()
         assert isinstance(kv_connector, KVConnectorBase)
         assert scheduler_output.kv_connector_metadata is not None
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug kv_connector begin: metadata=%s finished_req_ids=%s",
+                _debug_kv_metadata(scheduler_output.kv_connector_metadata),
+                list(scheduler_output.finished_req_ids)[:8],
+            )
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
 
         # Background KV cache transfers happen here.
@@ -100,11 +128,17 @@ class KVConnectorModelRunnerMixin:
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
         kv_connector.start_load_kv(get_forward_context())
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info("K26 TEP8 debug kv_connector start_load_kv complete")
         try:
             yield output
         finally:
             if wait_for_save and not defer_finalize:
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.info("K26 TEP8 debug kv_connector wait_for_save begin")
                 kv_connector.wait_for_save()
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.info("K26 TEP8 debug kv_connector wait_for_save complete")
 
             output.finished_sending, output.finished_recving = (
                 kv_connector.get_finished(scheduler_output.finished_req_ids)
@@ -114,6 +148,17 @@ class KVConnectorModelRunnerMixin:
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
             output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
             output.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug kv_connector finish: finished_sending=%s "
+                    "finished_recving=%s invalid_block_ids=%s stats=%s",
+                    list(output.finished_sending)[:8],
+                    list(output.finished_recving)[:8],
+                    [list(group)[:8] for group in output.invalid_block_ids[:2]]
+                    if output.invalid_block_ids
+                    else [],
+                    output.kv_connector_stats,
+                )
 
             if not defer_finalize:
                 kv_connector.clear_connector_metadata()

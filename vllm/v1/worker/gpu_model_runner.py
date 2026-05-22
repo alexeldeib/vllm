@@ -33,6 +33,10 @@ from vllm.config import (
     update_config,
 )
 from vllm.config.cache import CacheConfig
+from vllm.distributed.device_communicators.shm_broadcast import (
+    _summarize_result,
+    _summarize_scheduler_output,
+)
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
@@ -3782,6 +3786,13 @@ class GPUModelRunner(
                 "State error: sample_tokens() must be called "
                 "after execute_model() returns None."
             )
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug gpu_model_runner execute_model begin: "
+                "device=%s scheduler=%s",
+                getattr(self, "device", None),
+                _summarize_scheduler_output(scheduler_output),
+            )
 
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -3997,6 +4008,18 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug gpu_model_runner preprocess complete: "
+                "device=%s num_reqs=%s num_tokens_unpadded=%s "
+                "num_tokens_padded=%s cudagraph_mode=%s batch_desc=%s",
+                getattr(self, "device", None),
+                num_reqs,
+                num_tokens_unpadded,
+                num_tokens_padded,
+                cudagraph_mode,
+                batch_desc,
+            )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -4036,6 +4059,13 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug gpu_model_runner forward begin: "
+                    "device=%s kv_defer_finalize=%s",
+                    getattr(self, "device", None),
+                    defer_kv_connector_finalize,
+                )
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4043,6 +4073,14 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug gpu_model_runner forward complete: "
+                    "device=%s output=%s kv_connector_output=%s",
+                    getattr(self, "device", None),
+                    _summarize_result(model_output),
+                    kv_connector_output,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -4122,12 +4160,27 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug gpu_model_runner execute_model return: "
+                "device=%s result=None state_ready=True kv_connector_output=%s",
+                getattr(self, "device", None),
+                kv_connector_output,
+            )
         return None
 
     @torch.inference_mode
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug gpu_model_runner sample_tokens begin: "
+                "device=%s state_present=%s grammar_present=%s",
+                getattr(self, "device", None),
+                self.execute_model_state is not None,
+                grammar_output is not None,
+            )
         if self.execute_model_state is None:
             kv_connector_output = self.kv_connector_output
             self.kv_connector_output = None
@@ -4144,6 +4197,13 @@ class GPUModelRunner(
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug gpu_model_runner sample_tokens return "
+                    "kv-only output: device=%s output=%s",
+                    getattr(self, "device", None),
+                    _summarize_result(output),
+                )
             return output
 
         # Unpack ephemeral state.
@@ -4170,6 +4230,13 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug gpu_model_runner sample complete: "
+                "device=%s sampled_shape=%s",
+                getattr(self, "device", None),
+                getattr(sampler_output.sampled_token_ids, "shape", None),
+            )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4339,6 +4406,13 @@ class GPUModelRunner(
             )
 
         if not self.use_async_scheduling:
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug gpu_model_runner sample_tokens return output: "
+                    "device=%s output=%s",
+                    getattr(self, "device", None),
+                    _summarize_result(output),
+                )
             return output
 
         with record_function_or_nullcontext(
@@ -4362,6 +4436,13 @@ class GPUModelRunner(
                 async_output.async_copy_ready_event,
             )
 
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug gpu_model_runner sample_tokens return async: "
+                "device=%s output=%s",
+                getattr(self, "device", None),
+                _summarize_result(async_output),
+            )
         return async_output
 
     def _pp_broadcast_prev_sampled_token_ids(

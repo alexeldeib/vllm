@@ -22,6 +22,10 @@ from vllm.distributed import (
     init_distributed_environment,
     set_custom_all_reduce,
 )
+from vllm.distributed.device_communicators.shm_broadcast import (
+    _summarize_result,
+    _summarize_scheduler_output,
+)
 from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm.distributed.eplb.eplb_utils import override_envs_for_eplb
 from vllm.distributed.kv_transfer import (
@@ -766,6 +770,14 @@ class Worker(WorkerBase):
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug gpu_worker execute_model begin: "
+                "worker_device=%s forward_pass=%s scheduler=%s",
+                getattr(self, "device", None),
+                forward_pass,
+                _summarize_scheduler_output(scheduler_output),
+            )
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
@@ -817,6 +829,13 @@ class Worker(WorkerBase):
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug gpu_worker execute_model model_runner "
+                    "returned: worker_device=%s output=%s",
+                    getattr(self, "device", None),
+                    _summarize_result(output),
+                )
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model

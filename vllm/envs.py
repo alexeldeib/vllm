@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     VLLM_ENGINE_READY_TIMEOUT_S: int = 600
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
+    VLLM_K26_TEP8_HANG_DEBUG: bool = False
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
     S3_ENDPOINT_URL: str | None = None
@@ -1525,6 +1526,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Whether to enable specialized model implementations when available.
     "VLLM_USE_SPECIALIZED_MODELS": lambda: bool(
         int(os.getenv("VLLM_USE_SPECIALIZED_MODELS", "0"))
+    ),
+    # Temporary diagnostics for Kimi K2.6 TEP4/TEP8 PD decode hangs.
+    "VLLM_K26_TEP8_HANG_DEBUG": lambda: bool(
+        int(os.getenv("VLLM_K26_TEP8_HANG_DEBUG", "0"))
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

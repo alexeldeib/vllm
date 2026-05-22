@@ -28,7 +28,12 @@ import torch
 import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed import destroy_distributed_environment, destroy_model_parallel
-from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
+from vllm.distributed.device_communicators.shm_broadcast import (
+    Handle,
+    MessageQueue,
+    _summarize_queue_object,
+    _summarize_result,
+)
 from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
 from vllm.distributed.parallel_state import (
     get_dcp_group,
@@ -370,7 +375,21 @@ class MultiprocExecutor(Executor):
             send_method = method
         else:
             send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
-        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+        rpc_payload = (send_method, args, kwargs, output_rank)
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug collective_rpc enqueue begin: method=%s "
+                "output_rank=%s args=%s",
+                method if isinstance(method, str) else type(method).__name__,
+                output_rank,
+                [_summarize_result(arg) for arg in args[:2]],
+            )
+        self.rpc_broadcast_mq.enqueue(rpc_payload)
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug collective_rpc enqueue complete: payload=%s",
+                _summarize_queue_object(rpc_payload),
+            )
 
         response_mqs: Sequence[MessageQueue] = self.response_mqs
         if output_rank is not None:
@@ -382,10 +401,27 @@ class MultiprocExecutor(Executor):
                 dequeue_timeout = (
                     None if deadline is None else (deadline - time.monotonic())
                 )
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.info(
+                        "K26 TEP8 debug collective_rpc waiting response: "
+                        "method=%s response_index=%s timeout=%s",
+                        method if isinstance(method, str) else type(method).__name__,
+                        len(responses),
+                        dequeue_timeout,
+                    )
                 try:
                     status, result = mq.dequeue(timeout=dequeue_timeout)
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.info(
+                        "K26 TEP8 debug collective_rpc response received: "
+                        "method=%s response_index=%s status=%s result=%s",
+                        method if isinstance(method, str) else type(method).__name__,
+                        len(responses),
+                        status,
+                        _summarize_result(result),
+                    )
                 if status != WorkerProc.ResponseStatus.SUCCESS:
                     raise RuntimeError(
                         f"Worker failed with error '{result}', please check the"
@@ -911,6 +947,12 @@ class WorkerProc:
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug worker response enqueue: rank=%s result=%s",
+                    self.rank,
+                    _summarize_queue_object(result),
+                )
             response_mq.enqueue(result)
 
     def handle_output(self, output: Any):
@@ -948,6 +990,16 @@ class WorkerProc:
             method, args, kwargs, output_rank = self.rpc_broadcast_mq.dequeue(
                 indefinite=True
             )
+            method_name = method if isinstance(method, str) else type(method).__name__
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug worker rpc received: rank=%s method=%s "
+                    "output_rank=%s args=%s",
+                    self.rank,
+                    method_name,
+                    output_rank,
+                    [_summarize_result(arg) for arg in args[:2]],
+                )
             try:
                 if isinstance(method, str):
                     func = getattr(self.worker, method)
@@ -955,6 +1007,14 @@ class WorkerProc:
                     func = partial(cloudpickle.loads(method), self.worker)
 
                 output = func(*args, **kwargs)
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.info(
+                        "K26 TEP8 debug worker rpc finished: rank=%s method=%s "
+                        "output=%s",
+                        self.rank,
+                        method_name,
+                        _summarize_result(output),
+                    )
             except Exception as e:
                 # Notes have been introduced in python 3.11
                 if hasattr(e, "add_note"):

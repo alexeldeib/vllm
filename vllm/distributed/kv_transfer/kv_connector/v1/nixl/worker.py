@@ -77,6 +77,23 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _k26_req_meta_summary(meta: ReqMeta | None) -> dict[str, Any]:
+    if meta is None:
+        return {}
+    remote = getattr(meta, "remote", None)
+    local_block_ids = getattr(meta, "local_block_ids", []) or []
+    remote_block_ids = getattr(remote, "block_ids", []) if remote is not None else []
+    return {
+        "remote_engine_id": getattr(remote, "engine_id", None),
+        "remote_request_id": getattr(remote, "request_id", None),
+        "local_block_groups": len(local_block_ids),
+        "local_blocks": sum(len(group) for group in local_block_ids),
+        "remote_block_groups": len(remote_block_ids),
+        "remote_blocks": sum(len(group) for group in remote_block_ids),
+        "tp_size": getattr(meta, "tp_size", None),
+    }
+
+
 class NixlConnectorWorker:
     """Implementation of Worker side methods"""
 
@@ -585,6 +602,15 @@ class NixlConnectorWorker:
         fut = self._handshake_futures.get(remote_engine_id)
         if fut is None:
             assert meta.remote is not None
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug nixl handshake submit: rank=%s req_id=%s "
+                    "remote_engine_id=%s meta=%s",
+                    self.tp_rank,
+                    req_id,
+                    remote_engine_id,
+                    _k26_req_meta_summary(meta),
+                )
             fut = self._handshake_initiation_executor.submit(
                 self._nixl_handshake,
                 meta.remote.host,
@@ -599,6 +625,14 @@ class NixlConnectorWorker:
                     del self._handshake_futures[eid]
                     try:
                         self._remote_agents[eid] = f.result()
+                        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                            logger.info(
+                                "K26 TEP8 debug nixl handshake complete: "
+                                "rank=%s remote_engine_id=%s remote_agents=%s",
+                                self.tp_rank,
+                                eid,
+                                sorted(self._remote_agents[eid].keys()),
+                            )
                     except Exception as e:
                         self._log_failure(
                             failure_type="handshake_setup_failed",
@@ -615,6 +649,14 @@ class NixlConnectorWorker:
                 # check if handshake succeeded
                 f.result()
                 self._ready_requests.put(entry)
+                if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                    logger.info(
+                        "K26 TEP8 debug nixl request ready after handshake: "
+                        "rank=%s req_id=%s remote_engine_id=%s",
+                        self.tp_rank,
+                        req_id,
+                        remote_engine_id,
+                    )
             except Exception as e:
                 # handshake failed - mark blocks as invalid
                 self._log_failure(
@@ -1662,6 +1704,20 @@ class NixlConnectorWorker:
         done_recving.update(self._failed_recv_reqs)
         self._failed_recv_reqs.clear()
 
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug nixl get_finished: rank=%s done_sending=%s "
+                "done_recving=%s active_recving=%s recving_metadata=%s",
+                self.tp_rank,
+                list(done_sending)[:8],
+                list(done_recving)[:8],
+                {
+                    req_id: len(handles)
+                    for req_id, handles in self._recving_transfers.items()
+                },
+                list(self._recving_metadata.keys())[:8],
+            )
+
         if len(done_sending) > 0 or len(done_recving) > 0:
             logger.debug(
                 "Rank %s, get_finished: %s requests done sending "
@@ -1842,6 +1898,18 @@ class NixlConnectorWorker:
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug nixl start_load_kv begin: rank=%s "
+                "reqs_to_recv=%s reqs_to_send=%s reqs_in_batch=%s "
+                "reqs_not_processed=%s ready_queue=%s",
+                self.tp_rank,
+                list(metadata.reqs_to_recv.keys())[:8],
+                list(metadata.reqs_to_send.keys())[:8],
+                list(metadata.reqs_in_batch)[:8],
+                list(metadata.reqs_not_processed)[:8],
+                self._ready_requests.qsize(),
+            )
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
@@ -1858,6 +1926,16 @@ class NixlConnectorWorker:
                 len(meta.local_physical_block_ids),
                 len(meta.remote.block_ids),
             )
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug nixl start_load_kv recv req: rank=%s "
+                    "req_id=%s remote_engine_id=%s meta=%s has_agent=%s",
+                    self.tp_rank,
+                    req_id,
+                    remote_engine_id,
+                    _k26_req_meta_summary(meta),
+                    remote_engine_id in self._remote_agents,
+                )
             # always store metadata for failure recovery
             self._recving_metadata[req_id] = meta
             if remote_engine_id not in self._remote_agents:
@@ -1872,7 +1950,16 @@ class NixlConnectorWorker:
 
         # Start transfers for requests whose handshakes have now finished.
         while not self._ready_requests.empty():
-            self._read_blocks_for_req(*self._ready_requests.get_nowait())
+            ready_req_id, ready_meta = self._ready_requests.get_nowait()
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug nixl drain ready request: rank=%s req_id=%s "
+                    "meta=%s",
+                    self.tp_rank,
+                    ready_req_id,
+                    _k26_req_meta_summary(ready_meta),
+                )
+            self._read_blocks_for_req(ready_req_id, ready_meta)
 
         # Keep around the requests that have been part of a batch. This is
         # needed because async scheduling pushes the misalignment between the
@@ -1893,6 +1980,18 @@ class NixlConnectorWorker:
         for req_id, expiration_time in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug nixl start_load_kv complete: rank=%s "
+                "recving_metadata=%s recving_transfers=%s reqs_to_send=%s",
+                self.tp_rank,
+                list(self._recving_metadata.keys())[:8],
+                {
+                    req_id: len(handles)
+                    for req_id, handles in self._recving_transfers.items()
+                },
+                list(self._reqs_to_send.keys())[:8],
+            )
 
     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
         assert meta.remote is not None and self.transfer_topo is not None
@@ -1900,6 +1999,19 @@ class NixlConnectorWorker:
         remote_ranks = self.transfer_topo.target_remote_ranks(engine_id)
         remote_info = self.transfer_topo.get_engine_info(engine_id)
         tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug nixl read req begin: rank=%s req_id=%s "
+                "engine_id=%s remote_ranks=%s remote_tp_size=%s tp_ratio=%s "
+                "meta=%s",
+                self.tp_rank,
+                req_id,
+                engine_id,
+                remote_ranks,
+                remote_info.remote_tp_size,
+                tp_ratio,
+                _k26_req_meta_summary(meta),
+            )
 
         if self._has_mamba:
             # Expand remote logical → kernel block IDs.
@@ -1997,6 +2109,20 @@ class NixlConnectorWorker:
         block_size_ratio = self.transfer_topo.block_size_ratio(
             remote_info.remote_block_size
         )
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.info(
+                "K26 TEP8 debug nixl read blocks begin: rank=%s request_id=%s "
+                "remote_request_id=%s dst_engine_id=%s remote_rank=%s "
+                "local_blocks=%s remote_blocks=%s block_size_ratio=%s",
+                self.tp_rank,
+                request_id,
+                remote_request_id,
+                dst_engine_id,
+                remote_rank,
+                [len(group) for group in local_block_ids],
+                [len(group) for group in remote_block_ids],
+                block_size_ratio,
+            )
         if block_size_ratio > 1:
             # TODO (NickLucche) assume HMA is off. Change to handle multiple KV groups.
             assert not self._is_hma_required
@@ -2107,6 +2233,15 @@ class NixlConnectorWorker:
 
             # Use handle to check completion in future step().
             self._recving_transfers[request_id].append(handle)
+            if envs.VLLM_K26_TEP8_HANG_DEBUG:
+                logger.info(
+                    "K26 TEP8 debug nixl read blocks submitted: rank=%s "
+                    "request_id=%s remote_rank=%s handles_for_req=%s",
+                    self.tp_rank,
+                    request_id,
+                    remote_rank,
+                    len(self._recving_transfers[request_id]),
+                )
         except Exception as e:
             # mark all (logical) blocks for this request as invalid
             self._log_failure(
