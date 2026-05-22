@@ -19,6 +19,10 @@ def _k26_step_debug_enabled() -> bool:
     return os.getenv("VLLM_K26_TEP8_STEP_DEBUG", "0") == "1"
 
 
+def _k26_poll_output_event_enabled() -> bool:
+    return os.getenv("VLLM_K26_POLL_OUTPUT_EVENT", "0") == "1"
+
+
 def _k26_async_output_event_log_interval_s() -> float:
     try:
         return float(os.getenv("VLLM_K26_ASYNC_OUTPUT_EVENT_LOG_INTERVAL_S", "15"))
@@ -31,6 +35,13 @@ def _k26_async_output_event_timeout_s() -> float:
         return float(os.getenv("VLLM_K26_ASYNC_OUTPUT_EVENT_TIMEOUT_S", "0"))
     except ValueError:
         return 0.0
+
+
+def _k26_async_output_event_poll_interval_s() -> float:
+    try:
+        return float(os.getenv("VLLM_K26_ASYNC_OUTPUT_EVENT_POLL_INTERVAL_S", "0.001"))
+    except ValueError:
+        return 0.001
 
 
 class AsyncOutput(AsyncModelRunnerOutput):
@@ -81,20 +92,25 @@ class AsyncOutput(AsyncModelRunnerOutput):
 
     def get_output(self) -> ModelRunnerOutput:
         start_time = time.monotonic()
-        if _k26_step_debug_enabled():
-            logger.warning(
-                "K26 TEP8 step debug AsyncOutput get_output synchronize begin: "
-                "reqs=%s thread=%s current_device=%s",
-                len(self.model_runner_output.req_ids),
-                threading.current_thread().name,
-                torch.cuda.current_device() if torch.cuda.is_available() else None,
-            )
+        step_debug = _k26_step_debug_enabled()
+        poll_output_event = step_debug or _k26_poll_output_event_enabled()
+        if poll_output_event:
             log_interval_s = max(_k26_async_output_event_log_interval_s(), 1.0)
+            poll_interval_s = max(_k26_async_output_event_poll_interval_s(), 0.0)
             timeout_s = _k26_async_output_event_timeout_s()
             next_log_s = log_interval_s
+            if step_debug:
+                logger.warning(
+                    "K26 TEP8 step debug AsyncOutput get_output query-poll begin: "
+                    "reqs=%s thread=%s current_device=%s poll_interval_s=%.6f",
+                    len(self.model_runner_output.req_ids),
+                    threading.current_thread().name,
+                    torch.cuda.current_device() if torch.cuda.is_available() else None,
+                    poll_interval_s,
+                )
             while not self.copy_event.query():
                 elapsed_s = time.monotonic() - start_time
-                if elapsed_s >= next_log_s:
+                if step_debug and elapsed_s >= next_log_s:
                     logger.warning(
                         "K26 TEP8 step debug AsyncOutput copy event waiting: "
                         "elapsed_s=%.3f reqs=%s thread=%s current_device=%s",
@@ -110,10 +126,13 @@ class AsyncOutput(AsyncModelRunnerOutput):
                         f"{timeout_s:.3f}s for {len(self.model_runner_output.req_ids)} "
                         "request(s)"
                     )
-                time.sleep(0.1)
+                if poll_interval_s > 0:
+                    time.sleep(poll_interval_s)
+                else:
+                    time.sleep(0)
         else:
             self.copy_event.synchronize()
-        if _k26_step_debug_enabled():
+        if step_debug:
             logger.warning(
                 "K26 TEP8 step debug AsyncOutput get_output synchronize complete: "
                 "elapsed_s=%.6f",
