@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     VLLM_API_KEY: str | None = None
     VLLM_DEBUG_LOG_API_SERVER_RESPONSE: bool = False
     VLLM_K26_TEP8_HANG_DEBUG: bool = False
+    VLLM_K26_TEP8_HANG_DEBUG_SYNC: bool = False
     S3_ACCESS_KEY_ID: str | None = None
     S3_SECRET_ACCESS_KEY: str | None = None
     S3_ENDPOINT_URL: str | None = None
@@ -1530,6 +1531,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Temporary diagnostics for Kimi K2.6 TEP4/TEP8 PD decode hangs.
     "VLLM_K26_TEP8_HANG_DEBUG": lambda: bool(
         int(os.getenv("VLLM_K26_TEP8_HANG_DEBUG", "0"))
+    ),
+    "VLLM_K26_TEP8_HANG_DEBUG_SYNC": lambda: bool(
+        int(os.getenv("VLLM_K26_TEP8_HANG_DEBUG_SYNC", "0"))
     ),
     # Experimental: use this to enable MCP tool calling for non harmony models
     "VLLM_USE_EXPERIMENTAL_PARSER_CONTEXT": lambda: bool(

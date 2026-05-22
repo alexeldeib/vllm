@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import time
+
 import torch
 
+import vllm.envs as envs
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
@@ -29,6 +32,13 @@ from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
 
 logger = init_logger(__name__)
+
+
+def _k26_debug_sync(label: str) -> None:
+    if envs.VLLM_K26_TEP8_HANG_DEBUG_SYNC and torch.cuda.is_available():
+        logger.warning("K26 TEP8 debug cuda sync begin: %s", label)
+        torch.cuda.synchronize()
+        logger.warning("K26 TEP8 debug cuda sync complete: %s", label)
 
 
 class TrtLlmNvFp4ExpertsBase:
@@ -338,7 +348,26 @@ class TrtLlmNvFp4ExpertsMonolithic(
         # Invoke kernel.
         # NOTE: Activation padding and output
         # truncation are handled by the MoE runner's
-        return flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug generic trtllm_nvfp4_moe begin: "
+                "tokens=%s hidden_dim=%s local_experts=%s ep_rank=%s "
+                "global_experts=%s top_k=%s routing=%s router_dtype=%s "
+                "hidden_dtype=%s hidden_shape=%s",
+                hidden_states.shape[0],
+                hidden_states.shape[-1],
+                self.local_num_experts,
+                self.ep_rank,
+                global_num_experts,
+                self.topk,
+                self.routing_method_type,
+                router_logits.dtype,
+                hidden_states.dtype,
+                tuple(hidden_states.shape),
+            )
+        _k26_debug_sync("generic trtllm_nvfp4_moe before")
+        start_time = time.monotonic()
+        result = flashinfer.fused_moe.trtllm_fp4_block_scale_moe(
             routing_logits=router_logits,
             routing_bias=e_score_correction_bias,
             hidden_states=hidden_states,
@@ -368,4 +397,13 @@ class TrtLlmNvFp4ExpertsMonolithic(
             routing_method_type=self.routing_method_type,
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
-        )[0]
+        )
+        _k26_debug_sync("generic trtllm_nvfp4_moe after")
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug generic trtllm_nvfp4_moe complete: "
+                "elapsed_s=%.6f result_type=%s",
+                time.monotonic() - start_time,
+                type(result).__name__,
+            )
+        return result[0]

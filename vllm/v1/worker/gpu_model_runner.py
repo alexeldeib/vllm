@@ -3787,7 +3787,7 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
         if envs.VLLM_K26_TEP8_HANG_DEBUG:
-            logger.info(
+            logger.warning(
                 "K26 TEP8 debug gpu_model_runner execute_model begin: "
                 "device=%s scheduler=%s",
                 getattr(self, "device", None),
@@ -4009,7 +4009,7 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
         if envs.VLLM_K26_TEP8_HANG_DEBUG:
-            logger.info(
+            logger.warning(
                 "K26 TEP8 debug gpu_model_runner preprocess complete: "
                 "device=%s num_reqs=%s num_tokens_unpadded=%s "
                 "num_tokens_padded=%s cudagraph_mode=%s batch_desc=%s",
@@ -4060,7 +4060,7 @@ class GPUModelRunner(
             ) as kv_connector_output,
         ):
             if envs.VLLM_K26_TEP8_HANG_DEBUG:
-                logger.info(
+                logger.warning(
                     "K26 TEP8 debug gpu_model_runner forward begin: "
                     "device=%s kv_defer_finalize=%s",
                     getattr(self, "device", None),
@@ -4074,7 +4074,7 @@ class GPUModelRunner(
                 **model_kwargs,
             )
             if envs.VLLM_K26_TEP8_HANG_DEBUG:
-                logger.info(
+                logger.warning(
                     "K26 TEP8 debug gpu_model_runner forward complete: "
                     "device=%s output=%s kv_connector_output=%s",
                     getattr(self, "device", None),

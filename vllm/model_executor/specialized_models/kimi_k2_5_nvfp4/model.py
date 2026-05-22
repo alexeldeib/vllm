@@ -6,6 +6,7 @@ import atexit
 import inspect
 import os
 import threading
+import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -118,6 +119,13 @@ _kimi_moe_setup_log_lock = threading.Lock()
 _kimi_moe_setup_log_keys: set[tuple[int, int, int, int, int, int, bool]] = set()
 _kimi_moe_runtime_log_lock = threading.Lock()
 _kimi_moe_runtime_log_keys: set[tuple[int, int, int, int, bool]] = set()
+
+
+def _k26_debug_sync(label: str) -> None:
+    if envs.VLLM_K26_TEP8_HANG_DEBUG_SYNC and torch.cuda.is_available():
+        logger.warning("K26 TEP8 debug cuda sync begin: %s", label)
+        torch.cuda.synchronize()
+        logger.warning("K26 TEP8 debug cuda sync complete: %s", label)
 
 
 def _kimi_moe_finalize_ar_max_tokens() -> int:
@@ -2573,7 +2581,28 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
 
         from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
 
-        return get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug specialized trtllm_nvfp4_moe begin: "
+                "layer=%s do_finalize=%s tokens=%s hidden_dim=%s "
+                "local_experts=%s ep_rank=%s global_experts=%s top_k=%s "
+                "routing=%s router_dtype=%s hidden_dtype=%s hidden_shape=%s",
+                self.layer_name,
+                do_finalize,
+                original_hidden_states.shape[0],
+                original_hidden_states.shape[-1],
+                self.local_num_experts,
+                self.ep_rank,
+                self.global_num_experts,
+                self.top_k,
+                self.routing_method_type,
+                router_logits.dtype,
+                hidden_states.dtype,
+                tuple(hidden_states.shape),
+            )
+        _k26_debug_sync(f"{self.layer_name} specialized trtllm_nvfp4_moe before")
+        start_time = time.monotonic()
+        result = get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
             router_logits,
             None,
             expert_weights,
@@ -2606,6 +2635,17 @@ class KimiK25Nvfp4RoutedExperts(nn.Module):
             activation_type=self.activation_type,
             output=output,
         )
+        _k26_debug_sync(f"{self.layer_name} specialized trtllm_nvfp4_moe after")
+        if envs.VLLM_K26_TEP8_HANG_DEBUG:
+            logger.warning(
+                "K26 TEP8 debug specialized trtllm_nvfp4_moe complete: "
+                "layer=%s do_finalize=%s elapsed_s=%.6f result_type=%s",
+                self.layer_name,
+                do_finalize,
+                time.monotonic() - start_time,
+                type(result).__name__,
+            )
+        return result
 
     def forward(
         self,

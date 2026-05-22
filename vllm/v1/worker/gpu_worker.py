@@ -771,7 +771,7 @@ class Worker(WorkerBase):
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if envs.VLLM_K26_TEP8_HANG_DEBUG:
-            logger.info(
+            logger.warning(
                 "K26 TEP8 debug gpu_worker execute_model begin: "
                 "worker_device=%s forward_pass=%s scheduler=%s",
                 getattr(self, "device", None),
@@ -830,7 +830,7 @@ class Worker(WorkerBase):
                 scheduler_output, intermediate_tensors
             )
             if envs.VLLM_K26_TEP8_HANG_DEBUG:
-                logger.info(
+                logger.warning(
                     "K26 TEP8 debug gpu_worker execute_model model_runner "
                     "returned: worker_device=%s output=%s",
                     getattr(self, "device", None),
