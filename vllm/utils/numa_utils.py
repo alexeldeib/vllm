@@ -177,7 +177,7 @@ def _get_numactl_args(
     process_kind: str = "worker",
 ) -> str | None:
     parallel_config = vllm_config.parallel_config
-    if not parallel_config.numa_bind:
+    if not getattr(parallel_config, "numa_bind", False):
         return None
 
     gpu_index = _get_gpu_index(parallel_config, local_rank, dp_local_rank)
