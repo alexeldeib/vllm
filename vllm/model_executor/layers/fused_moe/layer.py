@@ -1314,6 +1314,42 @@ class FusedMoE(PluggableLayer):
             input_ids,
         )
 
+    def forward_finalize_allreduce_norm(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        residual: torch.Tensor,
+        norm_layer: torch.nn.Module,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_states, shared_experts_input = self.runner.apply_routed_input_transform(
+            hidden_states
+        )
+        routed_hidden_dim = hidden_states.shape[-1]
+        hidden_states, og_hidden_dim = self.runner._maybe_pad_hidden_states(
+            shared_experts_input,
+            hidden_states,
+        )
+        if (
+            hidden_states.shape[-1] != routed_hidden_dim
+            or og_hidden_dim != routed_hidden_dim
+        ):
+            raise RuntimeError(
+                "MoE finalize allreduce fusion does not support padded or "
+                "latent routed dimensions."
+            )
+
+        return torch.ops.vllm.moe_forward_finalize_allreduce_norm(
+            hidden_states,
+            residual,
+            norm_layer.weight,
+            router_logits,
+            shared_experts_input,
+            input_ids,
+            self.runner._encode_layer_name(),
+            float(norm_layer.variance_epsilon),
+        )
+
     @property
     def expert_map(self) -> torch.Tensor | None:
         return (

@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import os
+import time
 from importlib.util import find_spec
 from typing import Any, cast
 
@@ -44,7 +47,7 @@ from vllm.v1.spec_decode.utils import (
     extend_all_queries_by_N,
     next_power_of_2,
 )
-from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.utils import AttentionGroup
@@ -230,6 +233,16 @@ class SpecDecodeBaseProposer:
             and self.speculative_config.draft_sample_method == "probabilistic"
         )
         self._last_draft_probs: torch.Tensor | None = None
+        self._k26_dflash_topk_trace_dir = os.environ.get(
+            "VLLM_K26_DFLASH_TOPK_TRACE_DIR"
+        )
+        self._k26_dflash_topk_trace_limit = int(
+            os.environ.get("VLLM_K26_DFLASH_TOPK_TRACE_LIMIT", "16")
+        )
+        self._k26_dflash_topk_trace_k = int(
+            os.environ.get("VLLM_K26_DFLASH_TOPK_TRACE_K", "8")
+        )
+        self._k26_dflash_topk_trace_count = 0
 
         self._slot_mapping_buffer = torch.zeros(
             self.max_positions,
@@ -418,6 +431,64 @@ class SpecDecodeBaseProposer:
     def take_last_draft_probs(self) -> torch.Tensor | None:
         return self._last_draft_probs
 
+    def _maybe_trace_dflash_topk(
+        self,
+        sample_hidden_states: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> None:
+        trace_dir = self._k26_dflash_topk_trace_dir
+        if (
+            self.method != "dflash"
+            or not trace_dir
+            or self._k26_dflash_topk_trace_count >= self._k26_dflash_topk_trace_limit
+        ):
+            return
+
+        logits = self.model.compute_logits(sample_hidden_states)
+        logits_fp32 = logits.float()
+        k = min(max(1, self._k26_dflash_topk_trace_k), logits_fp32.shape[-1])
+        topk_values, topk_ids = torch.topk(logits_fp32, k=k, dim=-1)
+        topk_logprobs = topk_values - torch.logsumexp(logits_fp32, dim=-1, keepdim=True)
+
+        os.makedirs(trace_dir, exist_ok=True)
+        trace_idx = self._k26_dflash_topk_trace_count
+        payload = {
+            "time_ns": time.time_ns(),
+            "trace_index": trace_idx,
+            "dp_rank": self.dp_rank,
+            "method": self.method,
+            "num_speculative_tokens": self.num_speculative_tokens,
+            "all_greedy": bool(sampling_metadata.all_greedy),
+            "sample_hidden_shape": list(sample_hidden_states.shape),
+            "draft_token_ids": draft_token_ids.detach().cpu().tolist(),
+            "topk_ids": topk_ids.detach().cpu().tolist(),
+            "topk_logits": topk_values.detach().cpu().tolist(),
+            "topk_logprobs": topk_logprobs.detach().cpu().tolist(),
+        }
+        filename = (
+            f"dflash_topk_dp{self.dp_rank}_{trace_idx:04d}_{payload['time_ns']}.json"
+        )
+        with open(os.path.join(trace_dir, filename), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        self._k26_dflash_topk_trace_count += 1
+
+    def _maybe_trace_dflash_branch_prefix(
+        self,
+        sample_hidden_states: torch.Tensor,
+        draft_token_ids: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        model_kwargs: dict[str, Any],
+        per_layer_attn_metadata: dict[str, object],
+        common_attn_metadata: CommonAttentionMetadata,
+        token_indices_to_sample: torch.Tensor,
+        num_input_tokens: int,
+        num_tokens_across_dp: torch.Tensor | None,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        slot_mapping_size: int,
+    ) -> None:
+        return
+
     def propose(
         self,
         # [num_tokens]
@@ -449,43 +520,52 @@ class SpecDecodeBaseProposer:
                     DFlashQwen3ForCausalLM,
                 ),
             )
-            target_hidden_states = self.model.combine_hidden_states(
-                target_hidden_states
-            )
+            with record_function_or_nullcontext("drafter: combine_hidden_states"):
+                target_hidden_states = self.model.combine_hidden_states(
+                    target_hidden_states
+                )
             assert target_hidden_states.shape[-1] == self.hidden_size
 
-        num_tokens, token_indices_to_sample, common_attn_metadata = (
-            self.set_inputs_first_pass(
-                target_token_ids=target_token_ids,
-                next_token_ids=next_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                token_indices_to_sample=token_indices_to_sample,
-                cad=common_attn_metadata,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+        with record_function_or_nullcontext("drafter: set_inputs_first_pass"):
+            num_tokens, token_indices_to_sample, common_attn_metadata = (
+                self.set_inputs_first_pass(
+                    target_token_ids=target_token_ids,
+                    next_token_ids=next_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    token_indices_to_sample=token_indices_to_sample,
+                    cad=common_attn_metadata,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                )
             )
-        )
 
-        per_group_attn_metadata, per_layer_attn_metadata = (
-            self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
-        )
+        with record_function_or_nullcontext("drafter: build_attn_metadata"):
+            per_group_attn_metadata, per_layer_attn_metadata = (
+                self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
+            )
 
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
-            self._determine_batch_execution_and_padding(num_tokens)
-        )
+        with record_function_or_nullcontext("drafter: determine_batch_padding"):
+            cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
+                self._determine_batch_execution_and_padding(num_tokens)
+            )
 
-        model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
-            num_tokens, num_input_tokens, mm_embed_inputs
-        )
+        with record_function_or_nullcontext("drafter: build_model_inputs_first_pass"):
+            model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
+                num_tokens, num_input_tokens, mm_embed_inputs
+            )
 
-        with set_forward_context(
-            per_layer_attn_metadata,
-            self.vllm_config,
-            num_tokens=num_input_tokens,
-            num_tokens_across_dp=num_tokens_across_dp,
-            cudagraph_runtime_mode=cudagraph_runtime_mode,
-            slot_mapping=self._get_slot_mapping(
-                slot_mapping_size, common_attn_metadata.slot_mapping
+        with (
+            record_function_or_nullcontext("drafter: model_forward"),
+            set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                num_tokens_across_dp=num_tokens_across_dp,
+                cudagraph_runtime_mode=cudagraph_runtime_mode,
+                slot_mapping=self._get_slot_mapping(
+                    slot_mapping_size, common_attn_metadata.slot_mapping
+                ),
+                trace_label=f"{self.method}_drafter_first_pass",
             ),
         ):
             ret_hidden_states = self.model(**model_kwargs)
@@ -495,13 +575,33 @@ class SpecDecodeBaseProposer:
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
 
-        sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        with record_function_or_nullcontext("drafter: select_sample_hidden"):
+            sample_hidden_states = last_hidden_states[token_indices_to_sample]
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            draft_token_ids, draft_probs = self._sample_draft_tokens(
-                sample_hidden_states, sampling_metadata
-            )
+            with record_function_or_nullcontext("drafter: sample_draft_tokens"):
+                draft_token_ids, draft_probs = self._sample_draft_tokens(
+                    sample_hidden_states, sampling_metadata
+                )
+            with record_function_or_nullcontext("drafter: trace_topk"):
+                self._maybe_trace_dflash_topk(
+                    sample_hidden_states, draft_token_ids, sampling_metadata
+                )
+            with record_function_or_nullcontext("drafter: trace_branch_prefix"):
+                self._maybe_trace_dflash_branch_prefix(
+                    sample_hidden_states,
+                    draft_token_ids,
+                    sampling_metadata,
+                    model_kwargs,
+                    per_layer_attn_metadata,
+                    common_attn_metadata,
+                    token_indices_to_sample,
+                    num_input_tokens,
+                    num_tokens_across_dp,
+                    cudagraph_runtime_mode,
+                    slot_mapping_size,
+                )
             if draft_probs is not None:
                 self._last_draft_probs = draft_probs.view(
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
@@ -614,6 +714,7 @@ class SpecDecodeBaseProposer:
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(input_batch_size),
+                trace_label=f"{self.method}_drafter_iter_{token_index + 1}",
             ):
                 ret_hidden_states = self.model(**model_kwargs)
                 if not self.model_returns_tuple():
@@ -1476,6 +1577,7 @@ class SpecDecodeBaseProposer:
                 num_tokens_across_dp=num_tokens_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=slot_mapping_dict,
+                trace_label=f"{self.method}_drafter_dummy",
             ):
                 if self.supports_mm_inputs:
                     input_ids = None

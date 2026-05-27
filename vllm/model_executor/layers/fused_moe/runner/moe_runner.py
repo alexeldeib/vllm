@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import inspect
 from collections.abc import Callable
 from contextlib import nullcontext
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +11,7 @@ import torch.nn.functional as F
 from vllm.distributed import (
     get_ep_group,
     get_pcp_group,
+    get_tp_group,
     tensor_model_parallel_all_reduce,
 )
 from vllm.forward_context import (
@@ -164,6 +166,44 @@ def _moe_forward_shared_fake(
     return shared_out, fused_out
 
 
+def _moe_forward_finalize_allreduce_norm(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    layer = get_layer_from_name(_resolve_layer_name(layer_name))
+    return layer.runner._forward_finalize_allreduce_norm_impl(
+        layer,
+        hidden_states,
+        residual,
+        norm_weight,
+        router_logits,
+        shared_experts_input,
+        input_ids,
+        norm_eps,
+    )
+
+
+def _moe_forward_finalize_allreduce_norm_fake(
+    hidden_states: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    router_logits: torch.Tensor,
+    shared_experts_input: torch.Tensor | None,
+    input_ids: torch.Tensor | None,
+    layer_name: _layer_name_type,
+    norm_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del norm_weight, router_logits, shared_experts_input, input_ids, layer_name
+    del norm_eps
+    return torch.empty_like(hidden_states), torch.empty_like(residual)
+
+
 direct_register_custom_op(
     op_name="moe_forward",
     op_func=_moe_forward,
@@ -179,6 +219,26 @@ direct_register_custom_op(
     fake_impl=_moe_forward_shared_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
+
+
+direct_register_custom_op(
+    op_name="moe_forward_finalize_allreduce_norm",
+    op_func=_moe_forward_finalize_allreduce_norm,
+    fake_impl=_moe_forward_finalize_allreduce_norm_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
+
+
+_flashinfer_comm_kernel_kwargs: dict[str, set[str]] = {}
+
+
+def _flashinfer_comm_supported_kwargs(kernel: Any) -> set[str]:
+    kernel_name = getattr(kernel, "__name__", repr(kernel))
+    supported_kwargs = _flashinfer_comm_kernel_kwargs.get(kernel_name)
+    if supported_kwargs is None:
+        supported_kwargs = set(inspect.signature(kernel).parameters)
+        _flashinfer_comm_kernel_kwargs[kernel_name] = supported_kwargs
+    return supported_kwargs
 
 
 def _unpack(
@@ -546,6 +606,52 @@ class MoERunner(MoERunnerInterface):
             fused_out,
         )
 
+    def _apply_quant_method_unfinalized(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self._maybe_apply_shared_experts(
+            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+        )
+
+        if not self._quant_method.is_monolithic:
+            raise RuntimeError("MoE finalize allreduce fusion requires monolithic MoE.")
+        if self.routed_output_transform is not None:
+            raise RuntimeError(
+                "MoE finalize allreduce fusion does not support routed output "
+                "transforms."
+            )
+        if not hasattr(self._quant_method, "apply_monolithic_unfinalized"):
+            raise RuntimeError(
+                f"{self._quant_method.__class__.__name__} does not support "
+                "unfinalized MoE output."
+            )
+
+        allreduce_in, expert_weights, expanded_idx_to_permuted_idx = (
+            self._quant_method.apply_monolithic_unfinalized(
+                layer=layer,
+                x=hidden_states,
+                router_logits=router_logits,
+                input_ids=input_ids,
+            )
+        )
+
+        self._maybe_apply_shared_experts(
+            shared_experts_input,
+            SharedExpertsOrder.MULTI_STREAM_OVERLAPPED,
+        )
+
+        return (
+            self._shared_experts.output if self._shared_experts is not None else None,
+            allreduce_in,
+            expert_weights,
+            expanded_idx_to_permuted_idx,
+        )
+
     def _sequence_parallel_context(self):
         """Return a context manager for sequence-parallel token
         redistribution.
@@ -588,6 +694,101 @@ class MoERunner(MoERunnerInterface):
             assert zero_expert_output is not None
             result = result + zero_expert_output
         return result
+
+    def _forward_finalize_allreduce_norm_impl(
+        self,
+        layer: torch.nn.Module,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+        norm_eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        import flashinfer.comm as flashinfer_comm
+
+        from vllm.distributed.device_communicators.flashinfer_all_reduce import (
+            get_fi_ar_workspace,
+        )
+
+        if self.moe_config.is_sequence_parallel:
+            raise RuntimeError(
+                "MoE finalize allreduce fusion does not support sequence parallel MoE."
+            )
+        if self.do_naive_dispatch_combine or self.moe_config.pcp_size > 1:
+            raise RuntimeError(
+                "MoE finalize allreduce fusion does not support dispatch/combine MoE."
+            )
+        if isinstance(self.router, ZeroExpertRouter):
+            raise RuntimeError(
+                "MoE finalize allreduce fusion does not support zero-expert output."
+            )
+
+        layer.ensure_moe_quant_config_init()
+        self._maybe_sync_shared_experts_stream(shared_experts_input)
+
+        if self.gate is not None:
+            if self._fse_fuse_gate:
+                self._maybe_fuse_gate_weights()
+                router_logits = F.linear(hidden_states, self._combined_gate_weight)
+            else:
+                router_logits, _ = self.gate(hidden_states)
+
+        shared_output, allreduce_in, expert_weights, expanded_idx_to_permuted_idx = (
+            self._apply_quant_method_unfinalized(
+                layer=layer,
+                hidden_states=hidden_states,
+                router_logits=router_logits,
+                shared_experts_input=shared_experts_input,
+                input_ids=input_ids,
+            )
+        )
+
+        hidden_dim = hidden_states.shape[-1]
+        tp_group = get_tp_group()
+        workspace_token_num = max(1, int(residual.numel() // hidden_dim))
+        workspace = get_fi_ar_workspace(
+            world_size=tp_group.world_size,
+            rank=tp_group.rank_in_group,
+            max_token_num=workspace_token_num,
+            hidden_dim=hidden_dim,
+            dtype=hidden_states.dtype,
+            group=tp_group.device_group,
+        )
+        if workspace is None:
+            raise RuntimeError("Failed to initialize FlashInfer allreduce workspace.")
+
+        norm_out = torch.empty_like(hidden_states)
+        residual_out = torch.empty_like(residual)
+        fusion_fn = flashinfer_comm.trtllm_moe_finalize_allreduce_fusion
+        fusion_kwargs: dict[str, Any] = dict(
+            allreduce_in=allreduce_in,
+            residual_in=residual,
+            norm_weight=norm_weight,
+            expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
+            norm_out=norm_out,
+            residual_out=residual_out,
+            workspace_ptrs=workspace.workspace_tensor,
+            launch_with_pdl=True,
+            world_rank=tp_group.rank_in_group,
+            world_size=tp_group.world_size,
+            eps=norm_eps,
+            shared_expert_output=shared_output,
+            expert_scale_factor=expert_weights,
+        )
+        supported_kwargs = _flashinfer_comm_supported_kwargs(fusion_fn)
+        for key, value in (
+            ("quant_out", None),
+            ("scale_out", None),
+            # routed_scaling_factor was already passed into the unfinalized
+            # FlashInfer MoE call; its returned expert weights carry the scale.
+            ("routed_scaling_factor", None),
+        ):
+            if key in supported_kwargs:
+                fusion_kwargs[key] = value
+        fusion_fn(**fusion_kwargs)
+        return norm_out, residual_out
 
     def forward(
         self,

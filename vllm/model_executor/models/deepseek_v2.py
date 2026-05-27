@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -112,6 +113,14 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _k26_moe_finalize_ar_enabled() -> bool:
+    return os.environ.get("VLLM_K26_MOE_FINALIZE_AR_FUSION", "0") == "1"
+
+
+def _k26_moe_finalize_ar_max_tokens() -> int:
+    return int(os.environ.get("VLLM_K26_MOE_FINALIZE_AR_MAX_TOKENS", "256"))
 
 
 class DeepseekAttention(nn.Module):
@@ -263,6 +272,10 @@ class DeepseekV2MoE(nn.Module):
         self.n_shared_experts: int = config.n_shared_experts
 
         self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.is_modelopt_fp4 = (
+            quant_config is not None
+            and getattr(quant_config, "get_name", lambda: None)() == "modelopt_fp4"
+        )
 
         if config.hidden_act != "silu":
             raise ValueError(
@@ -276,8 +289,9 @@ class DeepseekV2MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         if getattr(config, "topk_method", None) == "noaux_tc":
+            bias_dtype = torch.bfloat16 if self.is_modelopt_fp4 else torch.float32
             self.gate.e_score_correction_bias = nn.Parameter(
-                torch.empty(config.n_routed_experts, dtype=torch.float32)
+                torch.empty(config.n_routed_experts, dtype=bias_dtype)
             )
         else:
             self.gate.e_score_correction_bias = None
@@ -351,13 +365,16 @@ class DeepseekV2MoE(nn.Module):
             router_logits_dtype=self.gate.out_dtype,
         )
 
-        if (
-            self.is_rocm_aiter_moe_enabled
-            and self.gate.e_score_correction_bias is not None
-        ):
-            self.gate.e_score_correction_bias.data = (
-                self.gate.e_score_correction_bias.data.to(self.gate.out_dtype)
-            )
+        if self.gate.e_score_correction_bias is not None:
+            bias_dtype = None
+            if self.is_rocm_aiter_moe_enabled:
+                bias_dtype = self.gate.out_dtype
+            elif self.is_modelopt_fp4:
+                bias_dtype = torch.bfloat16
+            if bias_dtype is not None:
+                self.gate.e_score_correction_bias.data = (
+                    self.gate.e_score_correction_bias.data.to(bias_dtype)
+                )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
@@ -387,6 +404,36 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = final_hidden_states[:num_tokens]
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+    def forward_finalize_allreduce_norm(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_layer: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        residual = residual.view(-1, hidden_dim)
+
+        if self.is_sequence_parallel:
+            raise RuntimeError(
+                "MoE finalize allreduce fusion does not support sequence parallel MoE."
+            )
+
+        if self.experts.is_internal_router:
+            router_logits = hidden_states
+        else:
+            router_logits, _ = self.gate(hidden_states)
+
+        norm_out, residual_out = self.experts.forward_finalize_allreduce_norm(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            residual=residual,
+            norm_layer=norm_layer,
+        )
+        return norm_out.view(num_tokens, hidden_dim), residual_out.view(
+            num_tokens, hidden_dim
+        )
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
@@ -1200,6 +1247,60 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+    def forward_with_optional_fused_moe_tail(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor | None,
+        llama_4_scaling: torch.Tensor | None,
+        *,
+        skip_input_layernorm: bool,
+        next_input_layernorm: RMSNorm | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        if skip_input_layernorm:
+            assert residual is not None
+        elif residual is None:
+            residual = hidden_states.clone()
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        attn_kwargs = {
+            "positions": positions,
+            "hidden_states": hidden_states,
+        }
+        if not self.use_mha:
+            attn_kwargs["llama_4_scaling"] = llama_4_scaling
+        hidden_states = self.self_attn(**attn_kwargs)
+
+        if (
+            not isinstance(self.self_attn, DeepseekAttention)
+            and hidden_states.dtype == torch.float16
+        ):
+            hidden_states *= 1.0 / self.routed_scaling_factor
+            if self.layer_idx == 0:
+                residual *= 1.0 / self.routed_scaling_factor
+
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        if (
+            next_input_layernorm is not None
+            and isinstance(self.mlp, DeepseekV2MoE)
+            and _k26_moe_finalize_ar_enabled()
+        ):
+            hidden_states, residual = self.mlp.forward_finalize_allreduce_norm(
+                hidden_states,
+                residual,
+                next_input_layernorm,
+            )
+            return hidden_states, residual, True
+
+        hidden_states = self.mlp(hidden_states)
+
+        if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
+            hidden_states *= 1.0 / self.routed_scaling_factor
+
+        return hidden_states, residual, False
+
 
 @support_torch_compile
 class DeepseekV2Model(nn.Module):
@@ -1306,22 +1407,49 @@ class DeepseekV2Model(nn.Module):
             llama_4_scaling = None
 
         aux_hidden_states = []
+        fused_moe_tail_enabled = _k26_moe_finalize_ar_enabled()
+        fused_moe_tail_max_tokens = _k26_moe_finalize_ar_max_tokens()
+        input_layernorm_done = False
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
             start=self.start_layer,
         ):
             if idx in self.aux_hidden_state_layers:
                 aux_hidden_states.append(hidden_states + residual)
-            hidden_states, residual = layer(
-                positions, hidden_states, residual, llama_4_scaling
-            )
+            if fused_moe_tail_enabled and hidden_states.shape[0] <= (
+                fused_moe_tail_max_tokens
+            ):
+                next_input_layernorm = None
+                if idx + 1 in self.aux_hidden_state_layers:
+                    pass
+                elif idx + 1 < self.end_layer:
+                    next_input_layernorm = self.layers[idx + 1].input_layernorm
+                elif get_pp_group().is_last_rank:
+                    next_input_layernorm = self.norm
+
+                hidden_states, residual, input_layernorm_done = (
+                    layer.forward_with_optional_fused_moe_tail(
+                        positions,
+                        hidden_states,
+                        residual,
+                        llama_4_scaling,
+                        skip_input_layernorm=input_layernorm_done,
+                        next_input_layernorm=next_input_layernorm,
+                    )
+                )
+            else:
+                hidden_states, residual = layer(
+                    positions, hidden_states, residual, llama_4_scaling
+                )
+                input_layernorm_done = False
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
+        if not input_layernorm_done:
+            hidden_states, _ = self.norm(hidden_states, residual)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states

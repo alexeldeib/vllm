@@ -25,6 +25,14 @@ MAX_PROMPT_SIZE = 100
 DEVICE_TYPE = current_platform.device_type
 DEVICES = [f"{DEVICE_TYPE}:{i}" for i in range(min(current_platform.device_count(), 2))]
 MAX_NUM_PROMPT_TOKENS = 64
+THINK_START_TOKEN_ID = 999
+THINK_END_TOKEN_ID = 998
+
+
+class MockReasoningConfig:
+    reasoning_start_token_ids = [THINK_START_TOKEN_ID]
+    reasoning_end_token_ids = [THINK_END_TOKEN_ID]
+    enabled = True
 
 
 def _compare_objs(obj1, obj2, skip: Sequence = ("logitsprocs", "batch_update_builder")):
@@ -215,6 +223,83 @@ def _construct_cached_request_state(req_id_suffix: int):
         num_computed_tokens=len(output_token_ids),
         output_token_ids=output_token_ids,
     )
+
+
+def _construct_no_penalty_request(
+    req_id: str,
+    output_token_ids: list[int],
+    thinking_token_budget: int | None = None,
+) -> CachedRequestState:
+    return CachedRequestState(
+        req_id=req_id,
+        prompt_token_ids=[1, 2, 3],
+        sampling_params=SamplingParams(
+            temperature=0.0,
+            top_p=1.0,
+            top_k=0,
+            presence_penalty=0.0,
+            frequency_penalty=0.0,
+            repetition_penalty=1.0,
+            thinking_token_budget=thinking_token_budget,
+        ),
+        pooling_params=None,
+        mm_features=[],
+        block_ids=([],),
+        generator=None,
+        num_computed_tokens=3 + len(output_token_ids),
+        output_token_ids=output_token_ids,
+    )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_reasoning_config_without_budget_does_not_need_output_token_ids(device: str):
+    input_batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=1024,
+        max_num_batched_tokens=1024,
+        device=torch.device(device),
+        pin_memory=is_pin_memory_available(),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[1],
+        kernel_block_sizes=[1],
+        reasoning_config=MockReasoningConfig(),
+    )
+    input_batch.add_request(
+        _construct_no_penalty_request("req_no_budget", [11, 12, 13])
+    )
+    input_batch.refresh_metadata()
+
+    holder = input_batch.thinking_budget_state_holder
+    assert holder is not None
+    assert not holder.has_tracked_requests()
+    assert input_batch.sampling_metadata.output_token_ids == []
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_thinking_budget_request_needs_output_token_ids(device: str):
+    output_token_ids = [THINK_START_TOKEN_ID, 11, 12]
+    input_batch = InputBatch(
+        max_num_reqs=1,
+        max_model_len=1024,
+        max_num_batched_tokens=1024,
+        device=torch.device(device),
+        pin_memory=is_pin_memory_available(),
+        vocab_size=VOCAB_SIZE,
+        block_sizes=[1],
+        kernel_block_sizes=[1],
+        reasoning_config=MockReasoningConfig(),
+    )
+    input_batch.add_request(
+        _construct_no_penalty_request(
+            "req_with_budget", output_token_ids, thinking_token_budget=3
+        )
+    )
+    input_batch.refresh_metadata()
+
+    holder = input_batch.thinking_budget_state_holder
+    assert holder is not None
+    assert holder.has_tracked_requests()
+    assert input_batch.sampling_metadata.output_token_ids == [output_token_ids]
 
 
 @pytest.mark.parametrize("device", DEVICES)

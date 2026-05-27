@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import json
 import multiprocessing
+import os
 import threading
 import time
 import weakref
@@ -560,6 +561,168 @@ def report_usage_stats(
 
 
 _PROFILER_FUNC = None
+_K26_RUNTIME_EVENT_TRACER_UNSET = object()
+_K26_RUNTIME_EVENT_TRACER = _K26_RUNTIME_EVENT_TRACER_UNSET
+
+
+class _K26RuntimeEventTracer:
+    """Env-gated CUDA event tracer for K2.6 runtime-envelope experiments."""
+
+    def __init__(self, trace_dir: str) -> None:
+        self.trace_dir = trace_dir
+        self.limit = int(os.environ.get("VLLM_K26_RUNTIME_EVENT_TRACE_LIMIT", "32"))
+        raw_flush_scopes = os.environ.get(
+            "VLLM_K26_RUNTIME_EVENT_TRACE_FLUSH_SCOPES",
+            "gpu_model_runner: ModelRunnerOutput,"
+            "gpu_model_runner: AsyncGPUModelRunnerOutput",
+        )
+        self.flush_scopes = {
+            item.strip() for item in raw_flush_scopes.split(",") if item.strip()
+        }
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._flush_count = 0
+
+    def context(
+        self,
+        name: str,
+        base_context: AbstractContextManager,
+    ) -> AbstractContextManager:
+        return _K26RuntimeEventContext(self, name, base_context)
+
+    def append(
+        self,
+        *,
+        name: str,
+        start_event: torch.cuda.Event,
+        end_event: torch.cuda.Event,
+        cpu_start_ns: int,
+        cpu_end_ns: int,
+    ) -> None:
+        ranges = getattr(self._local, "ranges", None)
+        if ranges is None:
+            ranges = []
+            self._local.ranges = ranges
+        ranges.append(
+            {
+                "name": name,
+                "start_event": start_event,
+                "end_event": end_event,
+                "cpu_start_ns": cpu_start_ns,
+                "cpu_end_ns": cpu_end_ns,
+            }
+        )
+
+    def maybe_flush(self, scope: str) -> None:
+        if scope in self.flush_scopes:
+            self.flush(scope)
+
+    def flush(self, scope: str) -> None:
+        ranges = getattr(self._local, "ranges", None)
+        if not ranges:
+            return
+        self._local.ranges = []
+        with self._lock:
+            if self._flush_count >= self.limit:
+                return
+            sequence = self._flush_count
+            self._flush_count += 1
+
+        rows = []
+        for item in ranges:
+            end_event = item["end_event"]
+            try:
+                end_event.synchronize()
+                elapsed_ms = item["start_event"].elapsed_time(end_event)
+            except Exception as exc:
+                elapsed_ms = None
+                item["error"] = repr(exc)
+            rows.append(
+                {
+                    "name": item["name"],
+                    "cuda_elapsed_ms": elapsed_ms,
+                    "cpu_elapsed_ms": (
+                        item["cpu_end_ns"] - item["cpu_start_ns"]
+                    )
+                    / 1_000_000.0,
+                    "cpu_start_ns": item["cpu_start_ns"],
+                    "cpu_end_ns": item["cpu_end_ns"],
+                    **({"error": item["error"]} if "error" in item else {}),
+                }
+            )
+
+        os.makedirs(self.trace_dir, exist_ok=True)
+        payload = {
+            "time_ns": time.time_ns(),
+            "pid": os.getpid(),
+            "thread": threading.current_thread().name,
+            "flush_sequence": sequence,
+            "flush_scope": scope,
+            "range_count": len(rows),
+            "ranges": rows,
+        }
+        path = os.path.join(
+            self.trace_dir,
+            f"k26_runtime_events_pid{os.getpid()}_{sequence:04d}.jsonl",
+        )
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+class _K26RuntimeEventContext:
+    def __init__(
+        self,
+        tracer: _K26RuntimeEventTracer,
+        name: str,
+        base_context: AbstractContextManager,
+    ) -> None:
+        self.tracer = tracer
+        self.name = name
+        self.base_context = base_context
+        self.start_event: torch.cuda.Event | None = None
+        self.end_event: torch.cuda.Event | None = None
+        self.cpu_start_ns = 0
+
+    def __enter__(self) -> Any:
+        value = self.base_context.__enter__()
+        try:
+            if torch.cuda.is_available():
+                self.start_event = torch.cuda.Event(enable_timing=True)
+                self.end_event = torch.cuda.Event(enable_timing=True)
+                self.cpu_start_ns = time.perf_counter_ns()
+                self.start_event.record()
+        except Exception:
+            self.start_event = None
+            self.end_event = None
+        return value
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool | None:
+        cpu_end_ns = time.perf_counter_ns()
+        if self.start_event is not None and self.end_event is not None:
+            try:
+                self.end_event.record()
+                self.tracer.append(
+                    name=self.name,
+                    start_event=self.start_event,
+                    end_event=self.end_event,
+                    cpu_start_ns=self.cpu_start_ns,
+                    cpu_end_ns=cpu_end_ns,
+                )
+            except Exception:
+                pass
+        suppress = self.base_context.__exit__(exc_type, exc, tb)
+        self.tracer.maybe_flush(self.name)
+        return suppress
+
+
+def _get_k26_runtime_event_tracer() -> _K26RuntimeEventTracer | None:
+    global _K26_RUNTIME_EVENT_TRACER
+    if _K26_RUNTIME_EVENT_TRACER is _K26_RUNTIME_EVENT_TRACER_UNSET:
+        trace_dir = os.environ.get("VLLM_K26_RUNTIME_EVENT_TRACE_DIR")
+        _K26_RUNTIME_EVENT_TRACER = (
+            _K26RuntimeEventTracer(trace_dir) if trace_dir else None
+        )
+    return _K26_RUNTIME_EVENT_TRACER
 
 
 def record_function_or_nullcontext(name: str) -> AbstractContextManager:
@@ -567,7 +730,11 @@ def record_function_or_nullcontext(name: str) -> AbstractContextManager:
 
     # fast path assume it is set
     if _PROFILER_FUNC is not None:
-        return _PROFILER_FUNC(name)
+        base_context = _PROFILER_FUNC(name)
+        tracer = _get_k26_runtime_event_tracer()
+        if tracer is None:
+            return base_context
+        return tracer.context(name, base_context)
 
     func = contextlib.nullcontext
     if envs.VLLM_CUSTOM_SCOPES_FOR_PROFILING:
@@ -578,7 +745,11 @@ def record_function_or_nullcontext(name: str) -> AbstractContextManager:
         func = nvtx.annotate
 
     _PROFILER_FUNC = func
-    return func(name)
+    base_context = func(name)
+    tracer = _get_k26_runtime_event_tracer()
+    if tracer is None:
+        return base_context
+    return tracer.context(name, base_context)
 
 
 def tensor_data(tensor: torch.Tensor) -> memoryview:

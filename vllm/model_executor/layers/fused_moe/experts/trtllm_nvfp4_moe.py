@@ -310,7 +310,10 @@ class TrtLlmNvFp4ExpertsMonolithic(
 
         # Currently FI requires bfloat16 routing bias.
         # https://github.com/flashinfer-ai/flashinfer/issues/2909
-        if e_score_correction_bias is not None:
+        if (
+            e_score_correction_bias is not None
+            and e_score_correction_bias.dtype != torch.bfloat16
+        ):
             e_score_correction_bias = e_score_correction_bias.to(torch.bfloat16)
 
         # Invoke kernel.
@@ -347,3 +350,98 @@ class TrtLlmNvFp4ExpertsMonolithic(
             do_finalize=True,
             activation_type=activation_to_flashinfer_int(activation),
         )[0]
+
+    def apply_unfinalized(
+        self,
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        router_logits: torch.Tensor,
+        expert_weights: torch.Tensor,
+        activation: MoEActivation,
+        global_num_experts: int,
+        expert_map: torch.Tensor | None,
+        a1q_scale: torch.Tensor | None,
+        apply_router_weight_on_input: bool,
+        # grouped topk + fused topk bias parameters
+        num_expert_group: int | None = None,
+        e_score_correction_bias: torch.Tensor | None = None,
+        routed_scaling_factor: float | None = None,
+        topk_group: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        assert self._supports_activation(activation)
+        assert a1q_scale is not None
+        assert self.quant_config.w1_scale is not None
+        assert self.quant_config.w2_scale is not None
+        assert (
+            apply_router_weight_on_input
+            and self.routing_method_type == RoutingMethodType.Llama4
+        ) or (
+            not apply_router_weight_on_input
+            and self.routing_method_type != RoutingMethodType.Llama4
+        )
+        assert expert_map is None
+
+        if (
+            e_score_correction_bias is not None
+            and e_score_correction_bias.dtype != torch.bfloat16
+        ):
+            e_score_correction_bias = e_score_correction_bias.to(torch.bfloat16)
+
+        from flashinfer.fused_moe.core import get_trtllm_moe_sm100_module
+
+        result = get_trtllm_moe_sm100_module().trtllm_fp4_block_scale_moe(
+            router_logits,
+            None,
+            expert_weights,
+            e_score_correction_bias,
+            hidden_states,
+            a1q_scale.view(torch.float8_e4m3fn).reshape(*hidden_states.shape[:-1], -1),
+            w1,
+            self.quant_config.w1_scale.view(torch.float8_e4m3fn),
+            None,
+            None,
+            None,
+            None,
+            w2,
+            self.quant_config.w2_scale.view(torch.float8_e4m3fn),
+            None,
+            self.g1_scale_c,
+            self.quant_config.g1_alphas,
+            self.quant_config.g2_alphas,
+            global_num_experts,
+            self.topk,
+            num_expert_group,
+            topk_group,
+            self.intermediate_size_per_partition,
+            self.ep_rank * self.local_num_experts,
+            self.local_num_experts,
+            routed_scaling_factor,
+            self.routing_method_type,
+            False,
+            True,
+            activation_to_flashinfer_int(activation),
+        )
+        if len(result) != 3:
+            raise RuntimeError(
+                "FlashInfer TRTLLM NVFP4 MoE returned an unexpected result "
+                f"for do_finalize=False: {len(result)} tensors."
+            )
+        expanded_idx_to_permuted_idx = result[2]
+        if expanded_idx_to_permuted_idx.dim() == 1:
+            expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx.view(
+                -1, self.topk
+            )
+        elif expanded_idx_to_permuted_idx.shape[-1] != self.topk:
+            raise RuntimeError(
+                "FlashInfer TRTLLM NVFP4 MoE returned an unexpected "
+                "expanded-index shape for do_finalize=False: "
+                f"{tuple(expanded_idx_to_permuted_idx.shape)}."
+            )
+        if result[1].dtype != expert_weights.dtype:
+            raise RuntimeError(
+                "FlashInfer TRTLLM NVFP4 MoE returned an unexpected "
+                "expert-weight dtype for do_finalize=False: "
+                f"{result[1].dtype}, expected {expert_weights.dtype}."
+            )
+        return result[0], result[1], expanded_idx_to_permuted_idx

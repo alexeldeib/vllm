@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import time
 from collections import defaultdict
 from contextlib import contextmanager
@@ -257,6 +258,7 @@ def set_forward_context(
     ubatch_slices: UBatchSlices | None = None,
     slot_mapping: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None,
     skip_compiled: bool = False,
+    trace_label: str | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -305,6 +307,8 @@ def set_forward_context(
         batch_descriptor=batch_descriptor,
         ubatch_slices=ubatch_slices,
     )
+    if trace_label is not None and os.environ.get("VLLM_K26_MLA_TRACE_DIR"):
+        additional_kwargs["trace_label"] = trace_label
 
     forward_context = create_forward_context(
         attn_metadata,

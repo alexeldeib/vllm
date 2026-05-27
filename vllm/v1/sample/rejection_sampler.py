@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import json
+import os
+import time
 from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
@@ -21,6 +24,7 @@ from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.utils import unconditional_to_conditional_rates
+from vllm.v1.utils import record_function_or_nullcontext
 
 if TYPE_CHECKING:
     from vllm.config.speculative import SpeculativeConfig
@@ -83,6 +87,68 @@ class RejectionSampler(nn.Module):
                 device=device,
             )
         self.synthetic_mode = self.synthetic_conditional_rates is not None
+        self._k26_rejection_trace_dir = os.environ.get(
+            "VLLM_K26_SPEC_REJECTION_TRACE_DIR"
+        )
+        self._k26_rejection_trace_limit = int(
+            os.environ.get("VLLM_K26_SPEC_REJECTION_TRACE_LIMIT", "16")
+        )
+        self._k26_rejection_trace_k = int(
+            os.environ.get("VLLM_K26_SPEC_REJECTION_TRACE_K", "8")
+        )
+        self._k26_rejection_trace_count = 0
+        self._k26_bonus_skip_logprobs = (
+            os.environ.get("VLLM_K26_BONUS_SKIP_LOGPROBS") == "1"
+        )
+
+    def _maybe_trace_rejection(
+        self,
+        metadata: SpecDecodeMetadata,
+        target_logits: torch.Tensor,
+        bonus_token_ids: torch.Tensor,
+        output_token_ids: torch.Tensor,
+    ) -> None:
+        trace_dir = self._k26_rejection_trace_dir
+        if (
+            not trace_dir
+            or self._k26_rejection_trace_count >= self._k26_rejection_trace_limit
+        ):
+            return
+
+        logits_fp32 = target_logits.float()
+        k = min(max(1, self._k26_rejection_trace_k), logits_fp32.shape[-1])
+        topk_values, topk_ids = torch.topk(logits_fp32, k=k, dim=-1)
+        topk_logprobs = topk_values - torch.logsumexp(
+            logits_fp32, dim=-1, keepdim=True
+        )
+
+        os.makedirs(trace_dir, exist_ok=True)
+        trace_idx = self._k26_rejection_trace_count
+        payload = {
+            "time_ns": time.time_ns(),
+            "trace_index": trace_idx,
+            "num_draft_tokens": metadata.num_draft_tokens,
+            "max_spec_len": metadata.max_spec_len,
+            "draft_token_ids": metadata.draft_token_ids.detach().cpu().tolist(),
+            "cu_num_draft_tokens": metadata.cu_num_draft_tokens.detach()
+            .cpu()
+            .tolist(),
+            "target_logits_indices": metadata.target_logits_indices.detach()
+            .cpu()
+            .tolist(),
+            "bonus_logits_indices": metadata.bonus_logits_indices.detach()
+            .cpu()
+            .tolist(),
+            "bonus_token_ids": bonus_token_ids.detach().cpu().tolist(),
+            "output_token_ids": output_token_ids.detach().cpu().tolist(),
+            "target_topk_ids": topk_ids.detach().cpu().tolist(),
+            "target_topk_logits": topk_values.detach().cpu().tolist(),
+            "target_topk_logprobs": topk_logprobs.detach().cpu().tolist(),
+        }
+        filename = f"rejection_trace_{trace_idx:04d}_{payload['time_ns']}.json"
+        with open(os.path.join(trace_dir, filename), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        self._k26_rejection_trace_count += 1
 
     def forward(
         self,
@@ -125,69 +191,97 @@ class RejectionSampler(nn.Module):
         # logits tensor. This means any in-place operations on bonus_logits
         # won't affect the original logits tensor.
         assert logits is not None
-        bonus_logits = logits[bonus_logits_indices]
-        bonus_sampler_output = self.sampler(
-            logits=bonus_logits,
-            sampling_metadata=replace(
+        with record_function_or_nullcontext("rejection_sampler: bonus_logits"):
+            bonus_logits = logits[bonus_logits_indices]
+        bonus_needs_logprobs = (
+            not self._k26_bonus_skip_logprobs
+            or sampling_metadata.max_num_logprobs is not None
+            or bool(sampling_metadata.logprob_token_ids)
+        )
+        if bonus_needs_logprobs:
+            bonus_sampling_metadata = replace(
                 sampling_metadata,
                 max_num_logprobs=-1,
-            ),
-            predict_bonus_token=True,
-            # Override the logprobs mode to return logits because they are
-            # needed later to compute the accepted token logprobs.
-            logprobs_mode_override="processed_logits"
-            if self.is_processed_logprobs_mode
-            else "raw_logits",
-        )
+            )
+            bonus_logprobs_mode_override = (
+                "processed_logits"
+                if self.is_processed_logprobs_mode
+                else "raw_logits"
+            )
+        else:
+            bonus_sampling_metadata = sampling_metadata
+            bonus_logprobs_mode_override = None
+        with record_function_or_nullcontext("rejection_sampler: bonus_sample"):
+            bonus_sampler_output = self.sampler(
+                logits=bonus_logits,
+                sampling_metadata=bonus_sampling_metadata,
+                predict_bonus_token=True,
+                # Override the logprobs mode to return logits because they are
+                # needed later to compute the accepted token logprobs.
+                logprobs_mode_override=bonus_logprobs_mode_override,
+            )
         bonus_token_ids = bonus_sampler_output.sampled_token_ids
 
         # Just like `bonus_logits`, `target_logits` is a new tensor with
         # separate storage from the original `logits` tensor. Therefore,
         # it is safe to update `target_logits` in place.
-        raw_target_logits = logits[target_logits_indices]
-        # Use float32 for the target_logits.
-        raw_target_logits = raw_target_logits.to(torch.float32)
+        with record_function_or_nullcontext("rejection_sampler: target_logits"):
+            raw_target_logits = logits[target_logits_indices]
+            # Use float32 for the target_logits.
+            raw_target_logits = raw_target_logits.to(torch.float32)
         target_logits = raw_target_logits
         if not self.is_processed_logprobs_mode:
             # Clone raw_target_logits before applying processors to preserve
             # the original raw logits for logprobs computation, since
             # apply_logits_processors modifies the tensor in-place.
             target_logits = target_logits.clone()
-        target_logits = self.apply_logits_processors(
-            target_logits, sampling_metadata, metadata
-        )
+        with record_function_or_nullcontext("rejection_sampler: logits_processors"):
+            target_logits = self.apply_logits_processors(
+                target_logits, sampling_metadata, metadata
+            )
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `apply_sampling_constraints` function.
-        target_logits = apply_sampling_constraints(
-            target_logits,
-            metadata.cu_num_draft_tokens,
-            sampling_metadata,
-        )
+        with record_function_or_nullcontext("rejection_sampler: constraints"):
+            target_logits = apply_sampling_constraints(
+                target_logits,
+                metadata.cu_num_draft_tokens,
+                sampling_metadata,
+            )
 
-        output_token_ids = rejection_sample(
-            metadata.draft_token_ids,
-            metadata.num_draft_tokens,
-            metadata.max_spec_len,
-            metadata.cu_num_draft_tokens,
-            draft_probs,
+        with record_function_or_nullcontext("rejection_sampler: rejection_sample"):
+            output_token_ids = rejection_sample(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                draft_probs,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+                synthetic_mode=self.synthetic_mode,
+                synthetic_conditional_rates=self.synthetic_conditional_rates,
+            )
+        self._maybe_trace_rejection(
+            metadata,
             target_logits,
             bonus_token_ids,
-            sampling_metadata,
-            synthetic_mode=self.synthetic_mode,
-            synthetic_conditional_rates=self.synthetic_conditional_rates,
+            output_token_ids,
         )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
-            logprobs_tensors = self._get_logprobs_tensors(
-                sampling_metadata.max_num_logprobs,
-                metadata,
-                logits,
-                target_logits if self.is_processed_logprobs_mode else raw_target_logits,
-                bonus_sampler_output.logprobs_tensors.logprobs,
-                output_token_ids,
-            )
+            with record_function_or_nullcontext("rejection_sampler: logprobs"):
+                logprobs_tensors = self._get_logprobs_tensors(
+                    sampling_metadata.max_num_logprobs,
+                    metadata,
+                    logits,
+                    target_logits
+                    if self.is_processed_logprobs_mode
+                    else raw_target_logits,
+                    bonus_sampler_output.logprobs_tensors.logprobs,
+                    output_token_ids,
+                )
 
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
@@ -262,23 +356,30 @@ class RejectionSampler(nn.Module):
         Returns:
             A list of lists of token IDs.
         """
-        output_token_ids_np = output_token_ids.cpu().numpy()
-        # Create mask for valid tokens.
-        valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
-            output_token_ids_np < vocab_size
-        )
-        output_logprobs = None
-        if logprobs_tensors is not None:
-            cu_num_tokens = [0] + valid_mask.sum(axis=1).cumsum().tolist()
-            filtered_tensors = logprobs_tensors.filter(valid_mask.flatten())
-            output_logprobs = filtered_tensors.tolists(cu_num_tokens)
+        with record_function_or_nullcontext("rejection_sampler: parse_output_total"):
+            with record_function_or_nullcontext("rejection_sampler: parse_output_cpu"):
+                output_token_ids_np = output_token_ids.cpu().numpy()
+                # Create mask for valid tokens.
+                valid_mask = (output_token_ids_np != PLACEHOLDER_TOKEN_ID) & (
+                    output_token_ids_np < vocab_size
+                )
+            output_logprobs = None
+            if logprobs_tensors is not None:
+                with record_function_or_nullcontext(
+                    "rejection_sampler: parse_output_logprobs"
+                ):
+                    cu_num_tokens = [0] + valid_mask.sum(axis=1).cumsum().tolist()
+                    filtered_tensors = logprobs_tensors.filter(valid_mask.flatten())
+                    output_logprobs = filtered_tensors.tolists(cu_num_tokens)
 
-        if len(discard_req_indices) > 0:
-            valid_mask[discard_req_indices] = False
-        outputs = [
-            row[valid_mask[i]].tolist() for i, row in enumerate(output_token_ids_np)
-        ]
-        return outputs, output_logprobs
+            if len(discard_req_indices) > 0:
+                valid_mask[discard_req_indices] = False
+            with record_function_or_nullcontext("rejection_sampler: parse_output_lists"):
+                outputs = [
+                    row[valid_mask[i]].tolist()
+                    for i, row in enumerate(output_token_ids_np)
+                ]
+            return outputs, output_logprobs
 
     def apply_logits_processors(
         self,
@@ -422,12 +523,13 @@ def rejection_sample(
     assert target_logits.shape == (num_tokens, vocab_size)
 
     # Create output buffer.
-    output_token_ids = torch.full(
-        (batch_size, max_spec_len + 1),
-        PLACEHOLDER_TOKEN_ID,
-        dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
-        device=device,
-    )
+    with record_function_or_nullcontext("rejection_sample: output_buffer"):
+        output_token_ids = torch.full(
+            (batch_size, max_spec_len + 1),
+            PLACEHOLDER_TOKEN_ID,
+            dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
+            device=device,
+        )
 
     if sampling_metadata.all_greedy:
         is_greedy = None
@@ -440,66 +542,72 @@ def rejection_sample(
     # [num_tokens]
     uniform_probs: torch.Tensor | None = None
     if synthetic_mode or not sampling_metadata.all_greedy:
-        uniform_probs = generate_uniform_probs(
-            num_tokens,
-            num_draft_tokens,
-            sampling_metadata.generators,
-            device,
-        )
+        with record_function_or_nullcontext("rejection_sample: uniform_probs"):
+            uniform_probs = generate_uniform_probs(
+                num_tokens,
+                num_draft_tokens,
+                sampling_metadata.generators,
+                device,
+            )
 
     if not sampling_metadata.all_random:
         # Rejection sampling for greedy sampling requests.
-        target_argmax = target_logits.argmax(dim=-1)
-        rejection_greedy_sample_kernel[(batch_size,)](
-            output_token_ids,
-            cu_num_draft_tokens,
-            draft_token_ids,
-            target_argmax,
-            bonus_token_ids,
-            is_greedy,
-            max_spec_len,
-            uniform_probs,
-            synthetic_conditional_rates,
-            SYNTHETIC_MODE=synthetic_mode,
-        )
+        with record_function_or_nullcontext("rejection_sample: greedy_argmax"):
+            target_argmax = target_logits.argmax(dim=-1)
+        with record_function_or_nullcontext("rejection_sample: greedy_kernel"):
+            rejection_greedy_sample_kernel[(batch_size,)](
+                output_token_ids,
+                cu_num_draft_tokens,
+                draft_token_ids,
+                target_argmax,
+                bonus_token_ids,
+                is_greedy,
+                max_spec_len,
+                uniform_probs,
+                synthetic_conditional_rates,
+                SYNTHETIC_MODE=synthetic_mode,
+            )
         if sampling_metadata.all_greedy:
             return output_token_ids
 
     # Compute probability distribution from target logits.
-    target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
+    with record_function_or_nullcontext("rejection_sample: target_softmax"):
+        target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
     assert target_probs.is_contiguous()
 
     # Sample recovered tokens for each position.
     # [num_tokens]
-    recovered_token_ids = sample_recovered_tokens(
-        max_spec_len,
-        num_draft_tokens,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        sampling_metadata,
-        device,
-    )
+    with record_function_or_nullcontext("rejection_sample: recovered_tokens"):
+        recovered_token_ids = sample_recovered_tokens(
+            max_spec_len,
+            num_draft_tokens,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            draft_probs,
+            target_probs,
+            sampling_metadata,
+            device,
+        )
 
     # Rejection sampling for random sampling requests.
     assert uniform_probs is not None
-    rejection_random_sample_kernel[(batch_size,)](
-        output_token_ids,
-        cu_num_draft_tokens,
-        draft_token_ids,
-        draft_probs,
-        target_probs,
-        bonus_token_ids,
-        recovered_token_ids,
-        uniform_probs,
-        is_greedy,
-        max_spec_len,
-        vocab_size,
-        synthetic_conditional_rates,
-        NO_DRAFT_PROBS=draft_probs is None,
-        SYNTHETIC_MODE=synthetic_mode,
-    )
+    with record_function_or_nullcontext("rejection_sample: random_kernel"):
+        rejection_random_sample_kernel[(batch_size,)](
+            output_token_ids,
+            cu_num_draft_tokens,
+            draft_token_ids,
+            draft_probs,
+            target_probs,
+            bonus_token_ids,
+            recovered_token_ids,
+            uniform_probs,
+            is_greedy,
+            max_spec_len,
+            vocab_size,
+            synthetic_conditional_rates,
+            NO_DRAFT_PROBS=draft_probs is None,
+            SYNTHETIC_MODE=synthetic_mode,
+        )
     return output_token_ids
 
 

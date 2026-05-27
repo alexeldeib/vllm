@@ -23,6 +23,7 @@ from vllm.v1.attention.backend import (
     AttentionType,
     MultipleOf,
 )
+from vllm.v1.attention.backends.mla.trace import maybe_trace_mla_forward
 from vllm.v1.attention.backends.utils import KVCacheLayoutType
 
 logger = init_logger(__name__)
@@ -256,19 +257,22 @@ class TokenspeedMLAImpl(MLACommonImpl[MLACommonMetadata]):
 
         # vLLM kv_c_and_k_pe_cache is already (num_blocks, block_size, head_size).
         # tokenspeed_mla_decode wants 3D — pass as-is (no unsqueeze, unlike trtllm).
-        o = tokenspeed_mla_decode(
-            query=q,
-            kv_cache=kv_c_and_k_pe_cache,
-            workspace_buffer=self._workspace_buffer,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            block_tables=attn_metadata.decode.block_table,
-            seq_lens=attn_metadata.decode.seq_lens,
-            max_seq_len=attn_metadata.max_seq_len,
-            softmax_scale=self.softmax_scale,
-            output_scale=self.output_scale,
-            enable_pdl=False,
-        )
+        with maybe_trace_mla_forward(
+            "tokenspeed", q, kv_c_and_k_pe_cache, attn_metadata, layer
+        ):
+            o = tokenspeed_mla_decode(
+                query=q,
+                kv_cache=kv_c_and_k_pe_cache,
+                workspace_buffer=self._workspace_buffer,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                block_tables=attn_metadata.decode.block_table,
+                seq_lens=attn_metadata.decode.seq_lens,
+                max_seq_len=attn_metadata.max_seq_len,
+                softmax_scale=self.softmax_scale,
+                output_scale=self.output_scale,
+                enable_pdl=False,
+            )
 
         # Flatten the output for consistent shape
         o = o.view(-1, o.shape[-2], o.shape[-1])
