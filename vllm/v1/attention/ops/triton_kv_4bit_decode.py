@@ -669,6 +669,10 @@ def triton_kv_4bit_gather_k(
     """Gather and dequantize KV-4BIT K entries into an MLA workspace."""
     assert kv_cache.dtype == torch.uint8
     assert k_out.ndim == 2
+    if isinstance(num_tokens, torch.Tensor):
+        num_tokens = int(num_tokens.item())
+    else:
+        num_tokens = int(num_tokens)
     if num_tokens <= 0:
         return
 
