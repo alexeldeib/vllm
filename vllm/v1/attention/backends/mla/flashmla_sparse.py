@@ -858,7 +858,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
 
         local_indices = torch.arange(
             flat_slots.numel(),
-            device=topk_indices.device,
+            device=topk_indices_physical.device,
             dtype=torch.int32,
         ).view(num_tokens, topk)
         local_indices = torch.where(
