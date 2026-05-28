@@ -585,6 +585,143 @@ def triton_kv_4bit_dequant_kv(
     )
 
 
+@triton.jit
+def _kv_4bit_gather_k_kernel(
+    KV_cache_ptr,
+    K_scale_ptr,
+    K_zero_ptr,
+    Block_table_ptr,
+    Cu_seq_lens_ptr,
+    Token_to_seq_ptr,
+    Seq_starts_ptr,
+    K_out_ptr,
+    Num_tokens: tl.constexpr,
+    stride_cache_block,
+    stride_cache_pos,
+    stride_cache_head,
+    stride_ks_block,
+    stride_ks_pos,
+    stride_ks_head,
+    stride_bt_b,
+    stride_ko_t,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    ROTATE_K: tl.constexpr,
+    LOG_ORDER: tl.constexpr,
+    PRE_SCALE: tl.constexpr,
+    HAS_SEQ_STARTS: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    if token_id >= Num_tokens:
+        return
+
+    batch_id = tl.load(Token_to_seq_ptr + token_id).to(tl.int64)
+    batch_start = tl.load(Cu_seq_lens_ptr + batch_id)
+    batch_end = tl.load(Cu_seq_lens_ptr + batch_id + 1)
+    if token_id >= batch_end:
+        return
+
+    batch_offset = token_id - batch_start
+    if HAS_SEQ_STARTS:
+        batch_offset += tl.load(Seq_starts_ptr + batch_id)
+
+    table_id = batch_offset // BLOCK_SIZE
+    slot_id = batch_offset % BLOCK_SIZE
+    block_id = tl.load(Block_table_ptr + batch_id * stride_bt_b + table_id)
+    slot_base = block_id * stride_cache_block + slot_id * stride_cache_pos
+    scale_base = block_id * stride_ks_block + slot_id * stride_ks_pos
+
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < HEAD_DIM
+    half = HEAD_DIM // 2
+    packed_offs = d_offs % half
+    is_upper = d_offs >= half
+
+    k_packed = tl.load(
+        KV_cache_ptr + slot_base + packed_offs,
+        mask=d_mask,
+        other=0,
+    )
+    k_scale = tl.load(K_scale_ptr + scale_base)
+    k_zero = tl.load(K_zero_ptr + scale_base)
+    k_q = tl.where(is_upper, (k_packed >> 4) & 0x0F, k_packed & 0x0F).to(
+        tl.float32
+    )
+    k_vals = (k_q - k_zero) * k_scale
+    if ROTATE_K:
+        k_vals = _fwht_blocked_vector(k_vals, BLOCK_D, LOG_ORDER) * PRE_SCALE
+
+    tl.store(K_out_ptr + token_id * stride_ko_t + d_offs, k_vals, mask=d_mask)
+
+
+def triton_kv_4bit_gather_k(
+    kv_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seq_lens: torch.Tensor,
+    token_to_seq: torch.Tensor,
+    k_out: torch.Tensor,
+    num_tokens: int,
+    *,
+    hadamard_order: int,
+    seq_starts: torch.Tensor | None = None,
+) -> None:
+    """Gather and dequantize KV-4BIT K entries into an MLA workspace."""
+    assert kv_cache.dtype == torch.uint8
+    assert k_out.ndim == 2
+    if num_tokens <= 0:
+        return
+
+    if kv_cache.ndim == 3:
+        kv_cache = kv_cache.unsqueeze(2)
+    assert kv_cache.ndim == 4 and kv_cache.shape[2] == 1
+
+    head_dim = k_out.shape[-1]
+    if hadamard_order < 2 or hadamard_order & (hadamard_order - 1):
+        raise ValueError(
+            f"hadamard_order must be a power of two >= 2, got {hadamard_order}"
+        )
+    if head_dim % hadamard_order:
+        raise ValueError(
+            f"head_dim ({head_dim}) must be divisible by hadamard_order "
+            f"({hadamard_order})"
+        )
+
+    k_scale, k_zero, _, _ = get_kv_4bit_scale_zero_views(kv_cache, head_dim)
+    block_d = triton.next_power_of_2(head_dim)
+    log_order = int(math.log2(hadamard_order))
+    pre_scale = 1.0 / math.sqrt(float(hadamard_order))
+    seq_starts_arg = seq_starts if seq_starts is not None else cu_seq_lens
+
+    _kv_4bit_gather_k_kernel[(num_tokens,)](
+        kv_cache.view(-1),
+        k_scale,
+        k_zero,
+        block_table,
+        cu_seq_lens,
+        token_to_seq,
+        seq_starts_arg,
+        k_out,
+        Num_tokens=num_tokens,
+        stride_cache_block=kv_cache.stride(0),
+        stride_cache_pos=kv_cache.stride(1),
+        stride_cache_head=kv_cache.stride(2),
+        stride_ks_block=k_scale.stride(0),
+        stride_ks_pos=k_scale.stride(1),
+        stride_ks_head=k_scale.stride(2),
+        stride_bt_b=block_table.stride(0),
+        stride_ko_t=k_out.stride(0),
+        HEAD_DIM=head_dim,
+        BLOCK_SIZE=kv_cache.shape[1],
+        BLOCK_D=block_d,
+        ROTATE_K=True,
+        LOG_ORDER=log_order,
+        PRE_SCALE=pre_scale,
+        HAS_SEQ_STARTS=seq_starts is not None,
+        num_warps=4,
+    )
+
+
 def triton_kv_4bit_decode_attention(
     query: torch.Tensor,
     kv_cache: torch.Tensor,

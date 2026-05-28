@@ -2057,16 +2057,34 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         if use_fp8_prefill:
             q = q.to(prefill_metadata.q_data_type)
 
+        kv_4bit_config = None
         if self.kv_cache_dtype == "kv_4bit":
-            raise NotImplementedError(
-                "KV-4BIT MLA chunked-context prefill is not implemented yet. "
-                "The compatibility path currently supports cache update, "
-                "new-token prefill, and decode."
+            from vllm.model_executor.layers.quantization.kv_4bit.config import (
+                KV4BitConfig,
+            )
+            from vllm.v1.attention.ops.triton_kv_4bit_decode import (
+                triton_kv_4bit_gather_k,
+            )
+
+            kv_4bit_config = KV4BitConfig.from_mla_cache_dtype(
+                self.kv_cache_dtype,
+                self.kv_lora_rank + self.qk_rope_head_dim,
             )
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            if not use_fp8_prefill:
+            if kv_4bit_config is not None:
+                triton_kv_4bit_gather_k(
+                    kv_cache=kv_c_and_k_pe_cache,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
+                    token_to_seq=prefill_metadata.chunked_context.token_to_seq[i],
+                    k_out=workspace,
+                    num_tokens=prefill_metadata.chunked_context.chunk_total_token[i],
+                    hadamard_order=kv_4bit_config.hadamard_order,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
+            elif not use_fp8_prefill:
                 ops.gather_and_maybe_dequant_cache(
                     src_cache=kv_c_and_k_pe_cache,
                     dst=workspace,
