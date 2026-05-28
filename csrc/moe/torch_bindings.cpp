@@ -131,6 +131,13 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "dsv4_norm_router_gemm(Tensor! logits, Tensor! normed_x, Tensor x, "
       "Tensor norm_weight, Tensor gate_weight, float eps) -> ()");
   // conditionally compiled so impl registration is in source file
+
+  // DeepSeek V4 fused residual add + RMSNorm + router GEMV for SM90+
+  m.def(
+      "dsv4_add_norm_router_gemm(Tensor! logits, Tensor! normed_x, "
+      "Tensor! residual_out, Tensor x, Tensor residual, Tensor norm_weight, "
+      "Tensor gate_weight, float eps) -> ()");
+  // conditionally compiled so impl registration is in source file
 #endif
 }
 

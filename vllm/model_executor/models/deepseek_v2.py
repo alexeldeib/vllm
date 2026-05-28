@@ -123,6 +123,54 @@ def _k26_moe_finalize_ar_max_tokens() -> int:
     return int(os.environ.get("VLLM_K26_MOE_FINALIZE_AR_MAX_TOKENS", "256"))
 
 
+def _k26_add_norm_router_enabled() -> bool:
+    return os.environ.get("VLLM_K26_ADD_NORM_ROUTER_FUSION", "0") == "1"
+
+
+def _k26_add_norm_router_max_tokens() -> int:
+    return int(os.environ.get("VLLM_K26_ADD_NORM_ROUTER_MAX_TOKENS", "9"))
+
+
+def _k26_add_norm_router(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+    rms_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return ops.dsv4_add_norm_router_gemm(
+        x, residual, norm_weight, gate_weight, rms_eps
+    )
+
+
+def _k26_add_norm_router_fake(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+    rms_eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del residual, norm_weight, rms_eps
+    return (
+        torch.empty_like(x),
+        torch.empty_like(x),
+        torch.empty(
+            x.shape[0],
+            gate_weight.shape[0],
+            dtype=torch.float32,
+            device=x.device,
+        ),
+    )
+
+
+direct_register_custom_op(
+    op_name="k26_add_norm_router",
+    op_func=_k26_add_norm_router,
+    mutates_args=[],
+    fake_impl=_k26_add_norm_router_fake,
+)
+
+
 class DeepseekAttention(nn.Module):
     """Normal MHA implementation used by Deepseek v1."""
 
@@ -432,6 +480,60 @@ class DeepseekV2MoE(nn.Module):
             norm_layer=norm_layer,
         )
         return norm_out.view(num_tokens, hidden_dim), residual_out.view(
+            num_tokens, hidden_dim
+        )
+
+    def can_forward_add_norm_router(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_layer: RMSNorm,
+    ) -> bool:
+        num_tokens, hidden_dim = hidden_states.shape
+        return (
+            not self.is_sequence_parallel
+            and not self.experts.is_internal_router
+            and 1 <= num_tokens <= _k26_add_norm_router_max_tokens()
+            and hidden_dim == 7168
+            and self.n_routed_experts == 384
+            and hidden_states.shape == residual.shape
+            and hidden_states.dtype == torch.bfloat16
+            and residual.dtype == torch.bfloat16
+            and norm_layer.weight.dtype == torch.bfloat16
+            and self.gate.weight.dtype == torch.bfloat16
+            and hidden_states.is_cuda
+            and residual.is_cuda
+            and hidden_states.is_contiguous()
+            and residual.is_contiguous()
+            and norm_layer.weight.is_contiguous()
+            and self.gate.weight.is_contiguous()
+            and self.gate.allow_dsv3_router_gemm
+        )
+
+    def forward_add_norm_router(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_layer: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        residual = residual.view(-1, hidden_dim)
+
+        normed_hidden_states, residual_out, router_logits = (
+            torch.ops.vllm.k26_add_norm_router(
+                hidden_states,
+                residual,
+                norm_layer.weight,
+                self.gate.weight,
+                float(norm_layer.variance_epsilon),
+            )
+        )
+        final_hidden_states = self.experts(
+            hidden_states=normed_hidden_states,
+            router_logits=router_logits,
+        )
+        return final_hidden_states.view(num_tokens, hidden_dim), residual_out.view(
             num_tokens, hidden_dim
         )
 
@@ -1281,11 +1383,27 @@ class DeepseekV2DecoderLayer(nn.Module):
             if self.layer_idx == 0:
                 residual *= 1.0 / self.routed_scaling_factor
 
+        if (
+            isinstance(self.mlp, DeepseekV2MoE)
+            and _k26_add_norm_router_enabled()
+            and residual is not None
+            and self.mlp.can_forward_add_norm_router(
+                hidden_states, residual, self.post_attention_layernorm
+            )
+        ):
+            hidden_states, residual = self.mlp.forward_add_norm_router(
+                hidden_states,
+                residual,
+                self.post_attention_layernorm,
+            )
+            return hidden_states, residual, False
+
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         if (
             next_input_layernorm is not None
             and isinstance(self.mlp, DeepseekV2MoE)
             and _k26_moe_finalize_ar_enabled()
+            and hidden_states.shape[0] <= _k26_moe_finalize_ar_max_tokens()
         ):
             hidden_states, residual = self.mlp.forward_finalize_allreduce_norm(
                 hidden_states,
@@ -1407,8 +1525,13 @@ class DeepseekV2Model(nn.Module):
             llama_4_scaling = None
 
         aux_hidden_states = []
-        fused_moe_tail_enabled = _k26_moe_finalize_ar_enabled()
-        fused_moe_tail_max_tokens = _k26_moe_finalize_ar_max_tokens()
+        finalize_ar_enabled = _k26_moe_finalize_ar_enabled()
+        add_norm_router_enabled = _k26_add_norm_router_enabled()
+        fused_moe_tail_enabled = finalize_ar_enabled or add_norm_router_enabled
+        fused_moe_tail_max_tokens = max(
+            _k26_moe_finalize_ar_max_tokens() if finalize_ar_enabled else 0,
+            _k26_add_norm_router_max_tokens() if add_norm_router_enabled else 0,
+        )
         input_layernorm_done = False
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),

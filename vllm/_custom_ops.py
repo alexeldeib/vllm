@@ -2397,6 +2397,41 @@ def dsv4_norm_router_gemm(
     return normed_x, logits
 
 
+def dsv4_add_norm_router_gemm(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    gate_weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused residual add + RMSNorm + router GEMV for DeepSeek V4/K2.6.
+
+    Returns ``(normed_x, residual_out, router_logits)`` where
+        residual_out[m,k]  = bf16(x[m,k] + residual[m,k])
+        normed_x[m,k]     = RMSNorm(residual_out)[m,k]
+        router_logits[m,n] = sum_k(normed_x[m,k] * gate_weight[n,k])
+
+    Shape/dtype constraints match ``dsv4_norm_router_gemm`` with an
+    additional bf16 contiguous residual input.
+    """
+    num_tokens, _ = x.shape
+    num_experts = gate_weight.shape[0]
+    normed_x = torch.empty_like(x)
+    residual_out = torch.empty_like(x)
+    logits = torch.empty(num_tokens, num_experts, device=x.device, dtype=torch.float32)
+    torch.ops._moe_C.dsv4_add_norm_router_gemm(
+        logits,
+        normed_x,
+        residual_out,
+        x,
+        residual,
+        norm_weight,
+        gate_weight,
+        float(eps),
+    )
+    return normed_x, residual_out, logits
+
+
 def topk_softmax(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
