@@ -20,6 +20,7 @@ from vllm.multimodal.inputs import (
 from vllm.sampling_params import SamplingParams
 from vllm.utils.hashing import sha256, sha256_cbor
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.torch_utils import nvfp4_mla_kv_cache_full_dim
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 from vllm.v1.core.kv_cache_utils import (
     BlockHash,
@@ -51,6 +52,7 @@ from vllm.v1.kv_cache_interface import (
     SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
+    get_kv_quant_mode,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
@@ -1868,6 +1870,49 @@ def new_mla_spec(cache_dtype_str=None):
         dtype=torch.float32,
         cache_dtype_str=cache_dtype_str,
     )
+
+
+def test_nvfp4_mla_cache_layout_sizes():
+    # First NVFP4 MLA layout: quantize kv_c_normed and keep k_pe in bf16/fp16.
+    # 512 latent elements => 256 packed fp4 bytes + 32 scale bytes.
+    # 64 RoPE elements stay 2 bytes each.
+    assert nvfp4_mla_kv_cache_full_dim(
+        head_size=576,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    ) == 416
+    assert nvfp4_mla_kv_cache_full_dim(
+        head_size=512,
+        kv_lora_rank=448,
+        qk_rope_head_dim=64,
+    ) == 380
+
+
+def test_nvfp4_mla_attention_spec_page_size():
+    spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        kv_quant_mode=get_kv_quant_mode("nvfp4"),
+        cache_dtype_str="nvfp4",
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+    )
+    assert spec.real_page_size_bytes == 16 * 416
+    assert spec.page_size_bytes == 16 * 416
+
+
+def test_nvfp4_mla_attention_spec_infers_common_rope_dim():
+    spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        kv_quant_mode=get_kv_quant_mode("nvfp4"),
+        cache_dtype_str="nvfp4",
+    )
+    assert spec.real_page_size_bytes == 16 * 416
 
 
 def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():

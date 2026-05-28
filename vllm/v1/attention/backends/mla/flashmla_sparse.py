@@ -18,7 +18,7 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import num_compute_units
-from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.utils.torch_utils import is_quantized_kv_cache, nvfp4_mla_kv_cache_full_dim
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -146,6 +146,8 @@ class FlashMLASparseBackend(AttentionBackend):
         if cache_dtype_str == "fp8_ds_mla":
             # V3.2 main MLA: 656-byte custom storage format. See module docstring.
             return (num_blocks, block_size, 656)
+        elif cache_dtype_str == "nvfp4":
+            return (num_blocks, block_size, nvfp4_mla_kv_cache_full_dim(head_size))
         else:
             return (num_blocks, block_size, head_size)
 

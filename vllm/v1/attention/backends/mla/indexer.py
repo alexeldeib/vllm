@@ -15,6 +15,7 @@ from vllm.utils.deep_gemm import (
 )
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import num_compute_units
+from vllm.utils.torch_utils import nvfp4_mla_kv_cache_full_dim
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -141,6 +142,8 @@ class DeepseekV32IndexerBackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         assert num_kv_heads == 1
+        if cache_dtype_str == "nvfp4":
+            return (num_blocks, block_size, nvfp4_mla_kv_cache_full_dim(head_size))
         return (num_blocks, block_size, head_size)
 
     @staticmethod

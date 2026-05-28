@@ -249,6 +249,7 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
+    nvfp4_mla_kv_cache_full_dim,
 )
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -276,6 +277,7 @@ from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheSpec,
     MLAAttentionSpec,
+    get_kv_quant_mode,
 )
 
 logger = init_logger(__name__)
@@ -966,7 +968,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             num_kv_heads=1,
             head_size=self.head_size,
             dtype=kv_cache_dtype,
+            kv_quant_mode=get_kv_quant_mode(self.kv_cache_dtype),
             cache_dtype_str=vllm_config.cache_config.cache_dtype,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
         )
 
     def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
@@ -1180,6 +1185,12 @@ class MLACommonBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "nvfp4":
+            return (
+                num_blocks,
+                block_size,
+                nvfp4_mla_kv_cache_full_dim(head_size),
+            )
         return (num_blocks, block_size, head_size)
 
     @staticmethod

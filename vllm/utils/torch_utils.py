@@ -417,6 +417,64 @@ def nvfp4_kv_cache_full_dim(head_size: int) -> int:
     return head_size // 2 + head_size // 16
 
 
+def infer_mla_kv_cache_dims(
+    head_size: int,
+    kv_lora_rank: int | None = None,
+    qk_rope_head_dim: int | None = None,
+) -> tuple[int, int]:
+    """Resolve MLA latent and RoPE dimensions from the semantic cache size.
+
+    MLA stores ``kv_c_normed`` plus ``k_pe``. Most vLLM MLA models use a
+    64-wide RoPE component, so callers that only have the combined
+    ``head_size`` can still resolve the common 512+64 and 448+64 layouts.
+    """
+    if kv_lora_rank is None and qk_rope_head_dim is None:
+        qk_rope_head_dim = 64
+        kv_lora_rank = head_size - qk_rope_head_dim
+    elif kv_lora_rank is None:
+        kv_lora_rank = head_size - qk_rope_head_dim
+    elif qk_rope_head_dim is None:
+        qk_rope_head_dim = head_size - kv_lora_rank
+
+    if kv_lora_rank <= 0 or qk_rope_head_dim < 0:
+        raise ValueError(
+            "Invalid MLA cache dimensions: "
+            f"{head_size=}, {kv_lora_rank=}, {qk_rope_head_dim=}"
+        )
+    if kv_lora_rank + qk_rope_head_dim != head_size:
+        raise ValueError(
+            "MLA cache dimensions must sum to head_size: "
+            f"{head_size=}, {kv_lora_rank=}, {qk_rope_head_dim=}"
+        )
+    if kv_lora_rank % 16 != 0:
+        raise ValueError(
+            "NVFP4 MLA cache requires kv_lora_rank divisible by 16, "
+            f"got {kv_lora_rank}"
+        )
+    return kv_lora_rank, qk_rope_head_dim
+
+
+def nvfp4_mla_kv_cache_full_dim(
+    head_size: int,
+    kv_lora_rank: int | None = None,
+    qk_rope_head_dim: int | None = None,
+    k_pe_dtype: torch.dtype = torch.bfloat16,
+) -> int:
+    """Packed last dim for the first NVFP4 MLA KV-cache layout.
+
+    The initial MLA layout quantizes the latent ``kv_c_normed`` part to
+    NVFP4 and keeps the smaller RoPE ``k_pe`` part in the model dtype. The
+    cache tensor itself is byte-addressed, so the returned value is a byte
+    count used as the uint8 last dimension.
+    """
+    kv_lora_rank, qk_rope_head_dim = infer_mla_kv_cache_dims(
+        head_size, kv_lora_rank, qk_rope_head_dim
+    )
+    return nvfp4_kv_cache_full_dim(kv_lora_rank) + (
+        qk_rope_head_dim * get_dtype_size(k_pe_dtype)
+    )
+
+
 def _nvfp4_split_data_scale(
     kv_side: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:

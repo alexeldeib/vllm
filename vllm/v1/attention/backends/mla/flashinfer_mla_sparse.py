@@ -26,7 +26,7 @@ from vllm.model_executor.layers.attention.mla_attention import (
     get_mla_dims,
 )
 from vllm.platforms.interface import DeviceCapability
-from vllm.utils.torch_utils import is_quantized_kv_cache
+from vllm.utils.torch_utils import is_quantized_kv_cache, nvfp4_mla_kv_cache_full_dim
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -138,6 +138,8 @@ class FlashInferMLASparseBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "nvfp4":
+            return (num_blocks, block_size, nvfp4_mla_kv_cache_full_dim(head_size))
         return (num_blocks, block_size, head_size)
 
     @classmethod

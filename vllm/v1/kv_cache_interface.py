@@ -15,7 +15,11 @@ from typing_extensions import Self
 
 from vllm.logger import init_logger
 from vllm.utils.math_utils import cdiv, round_up
-from vllm.utils.torch_utils import get_dtype_size, nvfp4_kv_cache_full_dim
+from vllm.utils.torch_utils import (
+    get_dtype_size,
+    nvfp4_kv_cache_full_dim,
+    nvfp4_mla_kv_cache_full_dim,
+)
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 if TYPE_CHECKING:
@@ -337,6 +341,8 @@ class TQFullAttentionSpec(FullAttentionSpec):
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None
+    kv_lora_rank: int | None = None
+    qk_rope_head_dim: int | None = None
     # DeepseekV4 only fields. Non-DeepseekV4 MLA models leave these at defaults.
     alignment: int | None = None  # Default to None for no padding.
     compress_ratio: int = 1  # Default to 1 for no compression.
@@ -360,6 +366,17 @@ class MLAAttentionSpec(FullAttentionSpec):
             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
             return self.block_size * 656
+        if self.kv_quant_mode.is_nvfp4:
+            return (
+                self.storage_block_size
+                * self.num_kv_heads
+                * nvfp4_mla_kv_cache_full_dim(
+                    self.head_size,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                )
+                * get_dtype_size(self.dtype)
+            )
         return (
             self.storage_block_size
             * self.num_kv_heads
@@ -373,15 +390,20 @@ class MLAAttentionSpec(FullAttentionSpec):
             "All attention layers in the same KV cache group must be MLAAttentionSpec."
         )
         cache_dtype_str_set = set(spec.cache_dtype_str for spec in specs)
+        kv_lora_rank_set = set(spec.kv_lora_rank for spec in specs)
+        qk_rope_head_dim_set = set(spec.qk_rope_head_dim for spec in specs)
         compress_ratio_set = set(spec.compress_ratio for spec in specs)
         model_version_set = set(spec.model_version for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
+            and len(kv_lora_rank_set) == 1
+            and len(qk_rope_head_dim_set) == 1
             and len(compress_ratio_set) == 1
             and len(model_version_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
-            "quantization method, compress ratio, and model version."
+            "quantization method, MLA dimensions, compress ratio, and model "
+            "version."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -391,6 +413,8 @@ class MLAAttentionSpec(FullAttentionSpec):
             kv_quant_mode=specs[0].kv_quant_mode,
             page_size_padded=specs[0].page_size_padded,
             cache_dtype_str=cache_dtype_str_set.pop(),
+            kv_lora_rank=kv_lora_rank_set.pop(),
+            qk_rope_head_dim=qk_rope_head_dim_set.pop(),
             compress_ratio=compress_ratio_set.pop(),
             model_version=model_version_set.pop(),
         )

@@ -9,6 +9,7 @@ from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.torch_utils import nvfp4_mla_kv_cache_full_dim
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -133,6 +134,8 @@ class DeepseekSparseSWABackend(AttentionBackend):
             # DeepseekV4 SWA: 584B per token (448 NoPE + 128 RoPE + 8 fp8 scale).
             # head_size passed in is the semantic head_dim (512).
             return (num_blocks, block_size, 584)
+        elif cache_dtype_str == "nvfp4":
+            return (num_blocks, block_size, nvfp4_mla_kv_cache_full_dim(head_size))
         else:
             return (num_blocks, block_size, head_size)
 
