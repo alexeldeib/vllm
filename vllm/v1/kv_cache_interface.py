@@ -360,6 +360,16 @@ class MLAAttentionSpec(FullAttentionSpec):
             # V3.2 main MLA: 656-byte custom layout (kv_lora_rank=512 +
             # qk_rope_head_dim=64, head_size=576). See flashmla_sparse.py.
             return self.block_size * 656
+        if self.cache_dtype_str == "kv_4bit":
+            from vllm.model_executor.layers.quantization.kv_4bit.config import (
+                KV4BitConfig,
+            )
+
+            cfg = KV4BitConfig.from_mla_cache_dtype(
+                self.cache_dtype_str,
+                self.head_size,
+            )
+            return self.storage_block_size * self.num_kv_heads * cfg.slot_size_aligned
         return (
             self.storage_block_size
             * self.num_kv_heads

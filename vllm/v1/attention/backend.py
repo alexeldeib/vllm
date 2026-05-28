@@ -52,6 +52,30 @@ class MultipleOf:
         self.base = base
 
 
+def _kv_4bit_mla_cache_update(
+    kv_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+) -> None:
+    from vllm.model_executor.layers.quantization.kv_4bit.config import KV4BitConfig
+    from vllm.v1.attention.ops.triton_kv_4bit_store import triton_kv_4bit_store
+
+    k_pe = k_pe.squeeze(1)
+    head_size = kv_c_normed.shape[-1] + k_pe.shape[-1]
+    cfg = KV4BitConfig.from_mla_cache_dtype(kv_cache_dtype, head_size)
+    key = torch.cat((kv_c_normed, k_pe), dim=-1).unsqueeze(1)
+    value = torch.cat((kv_c_normed, torch.zeros_like(k_pe)), dim=-1)
+    triton_kv_4bit_store(
+        key,
+        value.unsqueeze(1),
+        kv_cache.unsqueeze(2) if kv_cache.ndim == 3 else kv_cache,
+        slot_mapping.flatten(),
+        hadamard_order=cfg.hadamard_order,
+    )
+
+
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
 
@@ -918,6 +942,12 @@ class MLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     ) -> None:
         if kv_cache.numel() == 0:
             return
+        if kv_cache_dtype == "kv_4bit":
+            _kv_4bit_mla_cache_update(
+                kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype
+            )
+            return
+
         from vllm import _custom_ops as ops
 
         ops.concat_and_cache_mla(
@@ -998,6 +1028,12 @@ class SparseMLAAttentionImpl(AttentionImplBase[T], Generic[T]):
     ) -> None:
         if kv_cache.numel() == 0:
             return
+        if kv_cache_dtype == "kv_4bit":
+            _kv_4bit_mla_cache_update(
+                kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype
+            )
+            return
+
         from vllm import _custom_ops as ops
 
         ops.concat_and_cache_mla(

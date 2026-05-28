@@ -1180,6 +1180,13 @@ class MLACommonBackend(AttentionBackend):
         head_size: int,
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
+        if cache_dtype_str == "kv_4bit":
+            from vllm.model_executor.layers.quantization.kv_4bit.config import (
+                KV4BitConfig,
+            )
+
+            cfg = KV4BitConfig.from_mla_cache_dtype(cache_dtype_str, head_size)
+            return (num_blocks, block_size, cfg.slot_size_aligned)
         return (num_blocks, block_size, head_size)
 
     @staticmethod
@@ -2049,6 +2056,13 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         if use_fp8_prefill:
             q = q.to(prefill_metadata.q_data_type)
+
+        if self.kv_cache_dtype == "kv_4bit":
+            raise NotImplementedError(
+                "KV-4BIT MLA chunked-context prefill is not implemented yet. "
+                "The compatibility path currently supports cache update, "
+                "new-token prefill, and decode."
+            )
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]

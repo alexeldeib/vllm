@@ -50,6 +50,7 @@ from vllm.v1.kv_cache_interface import (
     SinkFullAttentionSpec,
     SlidingWindowMLASpec,
     SlidingWindowSpec,
+    TQFullAttentionSpec,
     UniformTypeKVCacheSpecs,
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
@@ -125,6 +126,24 @@ def new_kv_cache_spec(
         page_size_padded=page_size_padded,
         sliding_window=sliding_window,
         attention_chunk_size=attention_chunk_size,
+    )
+
+
+def new_tq_kv_cache_spec(
+    block_size=16,
+    num_kv_heads=2,
+    head_size=64,
+    dtype=torch.uint8,
+    sliding_window=None,
+    tq_slot_size=36,
+):
+    return TQFullAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=dtype,
+        sliding_window=sliding_window,
+        tq_slot_size=tq_slot_size,
     )
 
 
@@ -1870,6 +1889,26 @@ def new_mla_spec(cache_dtype_str=None):
     )
 
 
+def test_kv_4bit_mla_cache_layout_size():
+    from vllm.model_executor.layers.quantization.kv_4bit.config import KV4BitConfig
+
+    cfg = KV4BitConfig.from_mla_cache_dtype("kv_4bit", head_dim=576)
+    assert cfg.hadamard_order == 64
+    assert cfg.slot_size_aligned == 592
+
+
+def test_kv_4bit_mla_attention_spec_page_size():
+    spec = MLAAttentionSpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=576,
+        dtype=torch.uint8,
+        cache_dtype_str="kv_4bit",
+    )
+    assert spec.real_page_size_bytes == 16 * 592
+    assert spec.page_size_bytes == 16 * 592
+
+
 def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
     assert get_kv_cache_spec_kind(new_mla_spec()) == KVCacheSpecKind.MLA_ATTENTION
 
@@ -2335,6 +2374,25 @@ def test_unify_hybrid_kv_cache_specs():
 
     with pytest.raises(ValueError):
         kv_cache_utils.unify_hybrid_kv_cache_specs(kv_cache_spec)
+
+
+def test_turboquant_hybrid_sliding_specs_are_uniform():
+    kv_cache_spec = {
+        "layer_1": new_tq_kv_cache_spec(),
+        "layer_2": new_tq_kv_cache_spec(sliding_window=1024),
+    }
+
+    assert is_kv_cache_spec_uniform(kv_cache_spec)
+    kv_cache_groups = kv_cache_utils.get_kv_cache_groups(
+        VllmConfig(), kv_cache_spec
+    )
+
+    assert len(kv_cache_groups) == 1
+    merged_spec = kv_cache_groups[0].kv_cache_spec
+    assert isinstance(merged_spec, TQFullAttentionSpec)
+    assert merged_spec.tq_slot_size == 36
+    assert merged_spec.page_size_bytes == 16 * 2 * 36
+    assert merged_spec.sliding_window == 1024
 
 
 def test_hma_not_disabled_when_kv_events_enabled():
