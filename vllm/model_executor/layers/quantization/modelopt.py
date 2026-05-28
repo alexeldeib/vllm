@@ -1231,6 +1231,24 @@ class ModelOptNvFp4LinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
+    def apply_add_norm_fp4_quant(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.kernel.apply_add_norm_fp4_quant(
+            layer=layer,
+            x=x,
+            residual=residual,
+            norm_weight=norm_weight,
+            eps=eps,
+            bias=bias,
+        )
+
 
 class ModelOptNvFp4W4A16LinearMethod(LinearMethodBase):
     """Linear method for ModelOpt NVFP4 W4A16.

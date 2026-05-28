@@ -1250,6 +1250,23 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
       CUDA_ARCHS "${DSV3_ROUTER_GEMM_ARCHS}")
     list(APPEND VLLM_MOE_EXT_SRC "${DSV4_NORM_ROUTER_GEMM_SRC}")
     message(STATUS "Building DSV4 norm+router GEMV kernel for archs: ${DSV3_ROUTER_GEMM_ARCHS}")
+
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
+      cuda_archs_loose_intersection(K26_ADD_NORM_FP4_ARCHS "10.0f;11.0f" "${CUDA_ARCHS}")
+    else()
+      cuda_archs_loose_intersection(K26_ADD_NORM_FP4_ARCHS "10.0a;10.1a;10.3a" "${CUDA_ARCHS}")
+    endif()
+    if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8 AND K26_ADD_NORM_FP4_ARCHS)
+      set(K26_ADD_NORM_FP4_SRC "csrc/moe/k26_add_norm_fp4_quant.cu")
+      set_gencode_flags_for_srcs(
+        SRCS "${K26_ADD_NORM_FP4_SRC}"
+        CUDA_ARCHS "${K26_ADD_NORM_FP4_ARCHS}")
+      list(APPEND VLLM_MOE_EXT_SRC "${K26_ADD_NORM_FP4_SRC}")
+      message(STATUS "Building K26 add+norm+FP4 quant kernel for archs: ${K26_ADD_NORM_FP4_ARCHS}")
+    else()
+      message(STATUS "Not building K26 add+norm+FP4 quant kernel as no compatible archs found"
+                     " (requires SM100+ and CUDA >= 12.8)")
+    endif()
   else()
     message(STATUS "Not building DSV3 router GEMM kernel as no compatible archs found"
                    " (requires SM90+ and CUDA >= 12.0)")

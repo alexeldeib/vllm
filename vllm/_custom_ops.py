@@ -110,6 +110,22 @@ if hasattr(torch.ops, "_C") and hasattr(torch.ops._C, "scaled_fp4_quant"):
         return None
 
 
+if hasattr(torch.ops, "_moe_C") and hasattr(torch.ops._moe_C, "k26_add_norm_fp4_quant"):
+
+    @register_fake("_moe_C::k26_add_norm_fp4_quant")
+    def _k26_add_norm_fp4_quant_fake(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        input_global_scale: torch.Tensor,
+        eps: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del residual, norm_weight, input_global_scale, eps
+        return create_fp4_output_tensors(
+            x.shape[0], x.shape[1], x.device, is_sf_swizzled_layout=True
+        )
+
+
 # page attention ops
 def paged_attention_v1(
     out: torch.Tensor,
@@ -1669,6 +1685,23 @@ def scaled_fp4_quant(
 
     output_scale = output_scale.view(torch.float8_e4m3fn)
     return output, output_scale
+
+
+def k26_add_norm_fp4_quant(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    norm_weight: torch.Tensor,
+    input_global_scale: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output, output_scale = torch.ops._moe_C.k26_add_norm_fp4_quant(
+        x,
+        residual,
+        norm_weight,
+        input_global_scale,
+        float(eps),
+    )
+    return output, output_scale.view(torch.float8_e4m3fn)
 
 
 def scaled_fp4_experts_quant(

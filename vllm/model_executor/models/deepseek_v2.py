@@ -131,6 +131,14 @@ def _k26_add_norm_router_max_tokens() -> int:
     return int(os.environ.get("VLLM_K26_ADD_NORM_ROUTER_MAX_TOKENS", "9"))
 
 
+def _k26_add_norm_fp4_quant_enabled() -> bool:
+    return os.environ.get("VLLM_K26_ADD_NORM_FP4_QUANT_FUSION", "0") == "1"
+
+
+def _k26_add_norm_fp4_quant_max_tokens() -> int:
+    return int(os.environ.get("VLLM_K26_ADD_NORM_FP4_QUANT_MAX_TOKENS", "16"))
+
+
 def _k26_add_norm_router(
     x: torch.Tensor,
     residual: torch.Tensor,
@@ -1010,6 +1018,27 @@ class DeepSeekV2FusedQkvAProjLinear(MergedColumnParallelLinear):
             # the fused A GEMM kernel cannot be used.
             return super().forward(input_)
 
+    def apply_add_norm_fp4_quant(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+        eps: float,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.nn.Parameter | None]:
+        bias = self.bias if not self.skip_bias_add else None
+        output = self.quant_method.apply_add_norm_fp4_quant(
+            self,
+            input_,
+            residual,
+            norm_weight,
+            eps,
+            bias,
+        )
+        if not self.return_bias:
+            return output
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias
+
 
 class DeepseekV2MLAAttention(nn.Module):
     """
@@ -1215,6 +1244,34 @@ class DeepseekV2MLAAttention(nn.Module):
     ) -> torch.Tensor:
         return self.mla_attn(positions, hidden_states, llama_4_scaling)
 
+    def can_forward_add_norm_fp4_quant(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_layer: RMSNorm,
+    ) -> bool:
+        return self.mla_attn.can_forward_add_norm_fp4_quant(
+            hidden_states,
+            residual,
+            norm_layer,
+        )
+
+    def forward_with_add_norm_fp4_quant(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_layer: RMSNorm,
+        llama_4_scaling: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.mla_attn.forward_with_add_norm_fp4_quant(
+            positions,
+            hidden_states,
+            residual,
+            norm_layer,
+            llama_4_scaling,
+        )
+
 
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
@@ -1308,19 +1365,39 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         # Self Attention
+        input_layernorm_fused = False
         if residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
+        elif (
+            _k26_add_norm_fp4_quant_enabled()
+            and hidden_states.shape[0] <= _k26_add_norm_fp4_quant_max_tokens()
+            and isinstance(self.self_attn, DeepseekV2MLAAttention)
+            and self.self_attn.can_forward_add_norm_fp4_quant(
+                hidden_states,
+                residual,
+                self.input_layernorm,
+            )
+        ):
+            hidden_states, residual = self.self_attn.forward_with_add_norm_fp4_quant(
+                positions,
+                hidden_states,
+                residual,
+                self.input_layernorm,
+                llama_4_scaling,
+            )
+            input_layernorm_fused = True
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        attn_kwargs = {
-            "positions": positions,
-            "hidden_states": hidden_states,
-        }
-        if not self.use_mha:
-            attn_kwargs["llama_4_scaling"] = llama_4_scaling
-        hidden_states = self.self_attn(**attn_kwargs)
+        if not input_layernorm_fused:
+            attn_kwargs = {
+                "positions": positions,
+                "hidden_states": hidden_states,
+            }
+            if not self.use_mha:
+                attn_kwargs["llama_4_scaling"] = llama_4_scaling
+            hidden_states = self.self_attn(**attn_kwargs)
 
         if (
             not isinstance(self.self_attn, DeepseekAttention)
@@ -1359,21 +1436,41 @@ class DeepseekV2DecoderLayer(nn.Module):
         skip_input_layernorm: bool,
         next_input_layernorm: RMSNorm | None,
     ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        input_layernorm_fused = False
         if skip_input_layernorm:
             assert residual is not None
         elif residual is None:
             residual = hidden_states.clone()
             hidden_states = self.input_layernorm(hidden_states)
+        elif (
+            _k26_add_norm_fp4_quant_enabled()
+            and hidden_states.shape[0] <= _k26_add_norm_fp4_quant_max_tokens()
+            and isinstance(self.self_attn, DeepseekV2MLAAttention)
+            and self.self_attn.can_forward_add_norm_fp4_quant(
+                hidden_states,
+                residual,
+                self.input_layernorm,
+            )
+        ):
+            hidden_states, residual = self.self_attn.forward_with_add_norm_fp4_quant(
+                positions,
+                hidden_states,
+                residual,
+                self.input_layernorm,
+                llama_4_scaling,
+            )
+            input_layernorm_fused = True
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        attn_kwargs = {
-            "positions": positions,
-            "hidden_states": hidden_states,
-        }
-        if not self.use_mha:
-            attn_kwargs["llama_4_scaling"] = llama_4_scaling
-        hidden_states = self.self_attn(**attn_kwargs)
+        if not input_layernorm_fused:
+            attn_kwargs = {
+                "positions": positions,
+                "hidden_states": hidden_states,
+            }
+            if not self.use_mha:
+                attn_kwargs["llama_4_scaling"] = llama_4_scaling
+            hidden_states = self.self_attn(**attn_kwargs)
 
         if (
             not isinstance(self.self_attn, DeepseekAttention)

@@ -138,6 +138,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "Tensor! residual_out, Tensor x, Tensor residual, Tensor norm_weight, "
       "Tensor gate_weight, float eps) -> ()");
   // conditionally compiled so impl registration is in source file
+
+  m.def(
+      "k26_add_norm_fp4_quant(Tensor x, Tensor! residual, Tensor norm_weight, "
+      "Tensor input_global_scale, float eps) -> (Tensor, Tensor)");
+  // conditionally compiled so impl registration is in source file
 #endif
 }
 

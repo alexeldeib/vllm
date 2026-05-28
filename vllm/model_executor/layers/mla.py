@@ -179,3 +179,81 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         )
 
         return self.o_proj(attn_out)[0]
+
+    def can_forward_add_norm_fp4_quant(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_layer: torch.nn.Module,
+    ) -> bool:
+        return (
+            self.q_lora_rank is not None
+            and self.fused_qkv_a_proj is not None
+            and not self.is_sparse
+            and hasattr(self.fused_qkv_a_proj, "apply_add_norm_fp4_quant")
+            and hasattr(
+                self.fused_qkv_a_proj.quant_method,
+                "apply_add_norm_fp4_quant",
+            )
+            and hidden_states.dim() == 2
+            and hidden_states.shape == residual.shape
+            and hidden_states.shape[1] == 7168
+            and hidden_states.dtype == torch.bfloat16
+            and residual.dtype == torch.bfloat16
+            and norm_layer.weight.dtype == torch.bfloat16
+            and hidden_states.is_cuda
+            and residual.is_cuda
+            and norm_layer.weight.is_cuda
+            and hidden_states.is_contiguous()
+            and residual.is_contiguous()
+            and norm_layer.weight.is_contiguous()
+        )
+
+    def forward_with_add_norm_fp4_quant(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        norm_layer: torch.nn.Module,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert self.fused_qkv_a_proj is not None
+        assert self.q_a_layernorm is not None
+        assert self.q_b_proj is not None
+
+        qkv_lora_out = self.fused_qkv_a_proj.apply_add_norm_fp4_quant(
+            hidden_states,
+            residual,
+            norm_layer.weight,
+            float(norm_layer.variance_epsilon),
+        )
+        qkv_lora = qkv_lora_out[0] if isinstance(qkv_lora_out, tuple) else qkv_lora_out
+        q_c, kv_lora = qkv_lora.split(
+            [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+            dim=-1,
+        )
+        q_c = self.q_a_layernorm(q_c)
+        q = self.q_b_proj(q_c)[0]
+
+        kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        k_pe = k_pe.unsqueeze(1)
+
+        if self.rotary_emb is not None:
+            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                positions, q[..., self.qk_nope_head_dim :], k_pe
+            )
+
+        if llama_4_scaling is not None:
+            q *= llama_4_scaling
+
+        attn_out = self.mla_attn(
+            q,
+            kv_c_normed,
+            k_pe,
+            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+        )
+
+        return self.o_proj(attn_out)[0], residual

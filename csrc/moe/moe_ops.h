@@ -90,4 +90,10 @@ void dsv4_add_norm_router_gemm(
     at::Tensor& logits, at::Tensor& normed_x, at::Tensor& residual_out,
     at::Tensor const& x, at::Tensor const& residual,
     at::Tensor const& norm_weight, at::Tensor const& gate_weight, double eps);
+
+// K2.6-specific fused residual add + RMSNorm + CUTLASS-layout NVFP4
+// activation quantization for the decoder input path.
+std::tuple<at::Tensor, at::Tensor> k26_add_norm_fp4_quant(
+    at::Tensor const& x, at::Tensor& residual, at::Tensor const& norm_weight,
+    at::Tensor const& input_global_scale, double eps);
 #endif
