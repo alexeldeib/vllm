@@ -212,6 +212,8 @@ class FlashMLASparseMetadata(AttentionMetadata):
                 """
 
                 seq_lens: torch.Tensor
+                cu_seq_lens: torch.Tensor
+                token_to_seq: torch.Tensor
                 tokens_slice: slice
                 block_table: torch.Tensor
                 req_start_idx: int
@@ -283,6 +285,7 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
 
         self.topk_tokens = vllm_config.model_config.hf_config.index_topk
         self.use_fp8_kv_cache = cache_config.cache_dtype == "fp8_ds_mla"
+        self.use_kv4_cache = cache_config.cache_dtype == "kv_4bit"
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         # Shape: [max_num_seqs], all elements = topk_tokens (constant for full-CG)
         self.topk_tokens_tensor = torch.full(
@@ -516,10 +519,23 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 prefill_workspace_starts_cpu[chunk_start:chunk_end] -= offset
 
                 chunk_seq_lens = prefill_seq_lens[chunk_start:chunk_end]
+                chunk_seq_lens_cpu = prefill_seq_lens_cpu[chunk_start:chunk_end]
                 chunk_tot_seqlen = prefill_seq_lens_cpu[chunk_start:chunk_end].sum()
                 token_start = query_start_loc_cpu[num_decodes + chunk_start].item()
                 token_end = query_start_loc_cpu[num_decodes + chunk_end].item()
                 tokens_slice = slice(token_start, token_end)
+                chunk_cu_seq_lens_cpu = torch.zeros(
+                    chunk_end - chunk_start + 1,
+                    dtype=torch.int32,
+                    pin_memory=True,
+                )
+                chunk_cu_seq_lens_cpu[1:] = torch.cumsum(
+                    chunk_seq_lens_cpu, dim=0
+                )
+                chunk_token_to_seq = np.repeat(
+                    np.arange(chunk_end - chunk_start, dtype=np.int32),
+                    np.asarray(chunk_seq_lens_cpu, dtype=np.int32),
+                )
 
                 # Create chunk view of gpu tensor
                 chunk_workspace_starts = prefill_workspace_starts[chunk_start:chunk_end]
@@ -530,6 +546,12 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
                 prefill_chunks.append(
                     FP8Meta.Prefill.Chunk(
                         seq_lens=chunk_seq_lens,
+                        cu_seq_lens=chunk_cu_seq_lens_cpu.to(
+                            device=self.device, non_blocking=True
+                        ),
+                        token_to_seq=torch.from_numpy(chunk_token_to_seq).to(
+                            device=self.device, non_blocking=True
+                        ),
                         tokens_slice=tokens_slice,
                         block_table=chunk_block_table,
                         req_start_idx=chunk_start,
@@ -615,9 +637,14 @@ class FlashMLASparseMetadataBuilder(AttentionMetadataBuilder[FlashMLASparseMetad
         # forced D2H sync on seq_lens that would otherwise fire on every
         # prefill-bearing step, lifting GPU utilization on long-prefill
         # workloads (e.g. LongBench) from ~83% to ~100%.
-        if self.use_fp8_kv_cache and not self.is_deepseek_v4:
+        if (self.use_fp8_kv_cache or self.use_kv4_cache) and not self.is_deepseek_v4:
             if fp8_use_mixed_batch:
-                fp8_extra_metadata = self._build_fp8_mixed_decode_prefill(cm)
+                if self.use_kv4_cache:
+                    # KV4Bit sparse MLA has no direct mixed prefill/decode
+                    # kernel. Use the chunked BF16 workspace path instead.
+                    fp8_extra_metadata = self._build_fp8_separate_prefill_decode(cm)
+                else:
+                    fp8_extra_metadata = self._build_fp8_mixed_decode_prefill(cm)
             else:
                 fp8_extra_metadata = self._build_fp8_separate_prefill_decode(cm)
 
@@ -742,7 +769,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
                 "fp8_ds_mla kv-cache dtype"
             )
 
-        if kv_cache_dtype == "fp8_ds_mla":
+        if kv_cache_dtype in ("fp8_ds_mla", "kv_4bit"):
             # Reserve workspace during initialization
             assert vllm_config is not None and vllm_config.model_config is not None
             prefill_workspace_size = get_prefill_workspace_size(
@@ -783,12 +810,11 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             topk_indices,
         )
 
-    def _forward_kv4_kv(
+    def _forward_kv4_decode(
         self,
         q: torch.Tensor,
         kv_c_and_k_pe_cache: torch.Tensor,
-        topk_indices: torch.Tensor,
-        attn_metadata: FlashMLASparseMetadata,
+        topk_indices_physical: torch.Tensor,
     ) -> torch.Tensor:
         from vllm.model_executor.layers.quantization.kv_4bit.config import (
             KV4BitConfig,
@@ -797,13 +823,6 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             triton_kv_4bit_gather_k_by_slot,
         )
 
-        topk_indices_physical = triton_convert_req_index_to_global_index(
-            attn_metadata.req_id_per_token,
-            attn_metadata.block_table,
-            topk_indices,
-            BLOCK_SIZE=attn_metadata.block_size,
-            NUM_TOPK_TOKENS=topk_indices.shape[1],
-        )
         num_tokens, topk = topk_indices_physical.shape
         flat_slots = topk_indices_physical.reshape(-1).contiguous()
         kv_workspace = q.new_empty((flat_slots.numel(), self.head_size))
@@ -826,6 +845,104 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             torch.full_like(local_indices, -1),
         )
         return self._bf16_flash_mla_kernel(q, kv_workspace, local_indices)
+
+    def _forward_kv4_kv(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+    ) -> torch.Tensor:
+        topk_indices_physical = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+        )
+        return self._forward_kv4_decode(
+            q, kv_c_and_k_pe_cache, topk_indices_physical
+        )
+
+    def _forward_kv4_kv_separate_prefill_decode(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+    ) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization.kv_4bit.config import (
+            KV4BitConfig,
+        )
+        from vllm.v1.attention.ops.triton_kv_4bit_decode import (
+            triton_kv_4bit_gather_k,
+        )
+
+        kv4_metadata = attn_metadata.fp8_extra_metadata
+        assert isinstance(
+            kv4_metadata, FlashMLASparseMetadata.FP8SeparatePrefillDecode
+        )
+
+        prefill_request_ids = None
+        prefill_workspace_starts = None
+        has_prefill_workspace = False
+        if kv4_metadata.prefill is not None:
+            prefill_request_ids = kv4_metadata.prefill.request_ids
+            prefill_workspace_starts = kv4_metadata.prefill.workspace_starts
+            has_prefill_workspace = True
+
+        topk_indices = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+            HAS_PREFILL_WORKSPACE=has_prefill_workspace,
+            prefill_workspace_request_ids=prefill_request_ids,
+            prefill_workspace_starts=prefill_workspace_starts,
+        )
+
+        num_decode_tokens = kv4_metadata.num_decode_tokens
+        num_prefill_tokens = kv4_metadata.num_prefill_tokens
+        if num_decode_tokens > 0 and num_prefill_tokens == 0:
+            return self._forward_kv4_decode(q, kv_c_and_k_pe_cache, topk_indices)
+
+        attn_out = q.new_empty(
+            (attn_metadata.num_actual_tokens, self.num_heads, self.kv_lora_rank),
+            dtype=q.dtype,
+            device=q.device,
+        )
+
+        if num_decode_tokens > 0:
+            attn_out[:num_decode_tokens] = self._forward_kv4_decode(
+                q[:num_decode_tokens],
+                kv_c_and_k_pe_cache,
+                topk_indices[:num_decode_tokens],
+            )
+
+        assert kv4_metadata.prefill is not None
+        cfg = KV4BitConfig.from_mla_cache_dtype(self.kv_cache_dtype, self.head_size)
+        for chunk in kv4_metadata.prefill.chunks:
+            chunk_workspace = self.prefill_bf16_workspace[: chunk.chunk_tot_seqlen]
+            triton_kv_4bit_gather_k(
+                kv_c_and_k_pe_cache,
+                chunk.block_table,
+                chunk.cu_seq_lens,
+                chunk.token_to_seq,
+                chunk_workspace,
+                chunk.chunk_tot_seqlen,
+                hadamard_order=cfg.hadamard_order,
+            )
+
+            chunk_q = q[chunk.tokens_slice]
+            chunk_topk_indices_workspace = topk_indices[chunk.tokens_slice]
+            attn_out[chunk.tokens_slice] = self._bf16_flash_mla_kernel(
+                chunk_q,
+                chunk_workspace,
+                chunk_topk_indices_workspace,
+            )
+
+        return attn_out
 
     def _forward_fp8_kv_separate_prefill_decode(
         self,
@@ -1066,9 +1183,17 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         use_fp8_cache = self.kv_cache_dtype == "fp8_ds_mla"
 
         if self.kv_cache_dtype == "kv_4bit":
-            attn_out = self._forward_kv4_kv(
-                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
-            )
+            if isinstance(
+                attn_metadata.fp8_extra_metadata,
+                FlashMLASparseMetadata.FP8SeparatePrefillDecode,
+            ):
+                attn_out = self._forward_kv4_kv_separate_prefill_decode(
+                    q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+                )
+            else:
+                attn_out = self._forward_kv4_kv(
+                    q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+                )
         elif not use_fp8_cache:
             attn_out = self._forward_bf16_kv(
                 q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
