@@ -97,6 +97,7 @@ class FlashMLASparseBackend(AttentionBackend):
         "bfloat16",
         "fp8_ds_mla",
         "fp8",  # alias for fp8_ds_mla
+        "kv_4bit",
     ]
 
     @staticmethod
@@ -143,6 +144,13 @@ class FlashMLASparseBackend(AttentionBackend):
         if cache_dtype_str == "fp8_ds_mla":
             # V3.2 main MLA: 656-byte custom storage format. See module docstring.
             return (num_blocks, block_size, 656)
+        if cache_dtype_str == "kv_4bit":
+            from vllm.model_executor.layers.quantization.kv_4bit.config import (
+                KV4BitConfig,
+            )
+
+            cfg = KV4BitConfig.from_mla_cache_dtype(cache_dtype_str, head_size)
+            return (num_blocks, block_size, cfg.slot_size_aligned)
         else:
             return (num_blocks, block_size, head_size)
 
@@ -750,7 +758,7 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
         vllm_config = get_current_vllm_config()
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         q_concat_shape = (max_tokens, num_heads, head_size)
-        if is_quantized_kv_cache(kv_cache_dtype):
+        if is_quantized_kv_cache(kv_cache_dtype) and kv_cache_dtype != "kv_4bit":
             assert kv_cache_dtype == "fp8_ds_mla", (
                 "FlashMLA Sparse Attention backend fp8 only supports "
                 "fp8_ds_mla kv-cache dtype"
@@ -796,6 +804,50 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
             kv_c_and_k_pe_cache,
             topk_indices,
         )
+
+    def _forward_kv4_kv(
+        self,
+        q: torch.Tensor,
+        kv_c_and_k_pe_cache: torch.Tensor,
+        topk_indices: torch.Tensor,
+        attn_metadata: FlashMLASparseMetadata,
+    ) -> torch.Tensor:
+        from vllm.model_executor.layers.quantization.kv_4bit.config import (
+            KV4BitConfig,
+        )
+        from vllm.v1.attention.ops.triton_kv_4bit_decode import (
+            triton_kv_4bit_gather_k_by_slot,
+        )
+
+        topk_indices_physical = triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token,
+            attn_metadata.block_table,
+            topk_indices,
+            BLOCK_SIZE=attn_metadata.block_size,
+            NUM_TOPK_TOKENS=topk_indices.shape[1],
+        )
+        num_tokens, topk = topk_indices_physical.shape
+        flat_slots = topk_indices_physical.reshape(-1).contiguous()
+        kv_workspace = q.new_empty((flat_slots.numel(), self.head_size))
+        cfg = KV4BitConfig.from_mla_cache_dtype(self.kv_cache_dtype, self.head_size)
+        triton_kv_4bit_gather_k_by_slot(
+            kv_c_and_k_pe_cache,
+            flat_slots,
+            kv_workspace,
+            hadamard_order=cfg.hadamard_order,
+        )
+
+        local_indices = torch.arange(
+            flat_slots.numel(),
+            device=topk_indices.device,
+            dtype=torch.int32,
+        ).view(num_tokens, topk)
+        local_indices = torch.where(
+            topk_indices_physical >= 0,
+            local_indices,
+            torch.full_like(local_indices, -1),
+        )
+        return self._bf16_flash_mla_kernel(q, kv_workspace, local_indices)
 
     def _forward_fp8_kv_separate_prefill_decode(
         self,
@@ -1035,7 +1087,11 @@ class FlashMLASparseImpl(SparseMLAAttentionImpl[FlashMLASparseMetadata]):
 
         use_fp8_cache = self.kv_cache_dtype == "fp8_ds_mla"
 
-        if not use_fp8_cache:
+        if self.kv_cache_dtype == "kv_4bit":
+            attn_out = self._forward_kv4_kv(
+                q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
+            )
+        elif not use_fp8_cache:
             attn_out = self._forward_bf16_kv(
                 q, kv_c_and_k_pe_cache, topk_indices, attn_metadata
             )

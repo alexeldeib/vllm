@@ -388,6 +388,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if (
             self.attn_backend.get_name() == "FLASHMLA_SPARSE"
             and is_quantized_kv_cache(kv_cache_dtype)
+            and kv_cache_dtype.startswith("fp8")
             and kv_cache_dtype != "fp8_ds_mla"
         ):
             assert cache_config is not None

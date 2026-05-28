@@ -726,6 +726,135 @@ def triton_kv_4bit_gather_k(
     )
 
 
+@triton.jit
+def _kv_4bit_gather_k_by_slot_kernel(
+    KV_cache_ptr,
+    K_scale_ptr,
+    K_zero_ptr,
+    Slot_indices_ptr,
+    K_out_ptr,
+    Num_entries: tl.constexpr,
+    stride_cache_block,
+    stride_cache_pos,
+    stride_cache_head,
+    stride_ks_block,
+    stride_ks_pos,
+    stride_ks_head,
+    stride_slots,
+    stride_ko_t,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    ROTATE_K: tl.constexpr,
+    LOG_ORDER: tl.constexpr,
+    PRE_SCALE: tl.constexpr,
+):
+    entry_id = tl.program_id(0)
+    if entry_id >= Num_entries:
+        return
+
+    slot_idx = tl.load(Slot_indices_ptr + entry_id * stride_slots).to(tl.int64)
+    valid_slot = slot_idx >= 0
+    safe_slot = tl.maximum(slot_idx, 0)
+    block_id = safe_slot // BLOCK_SIZE
+    slot_id = safe_slot % BLOCK_SIZE
+
+    slot_base = block_id * stride_cache_block + slot_id * stride_cache_pos
+    scale_base = block_id * stride_ks_block + slot_id * stride_ks_pos
+
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < HEAD_DIM
+    half = HEAD_DIM // 2
+    packed_offs = d_offs % half
+    is_upper = d_offs >= half
+
+    k_packed = tl.load(
+        KV_cache_ptr + slot_base + packed_offs,
+        mask=d_mask & valid_slot,
+        other=0,
+    )
+    k_scale = tl.load(K_scale_ptr + scale_base, mask=valid_slot, other=0.0)
+    k_zero = tl.load(K_zero_ptr + scale_base, mask=valid_slot, other=0.0)
+    k_q = tl.where(is_upper, (k_packed >> 4) & 0x0F, k_packed & 0x0F).to(
+        tl.float32
+    )
+    k_vals = (k_q - k_zero) * k_scale
+    if ROTATE_K:
+        k_vals = _fwht_blocked_vector(k_vals, BLOCK_D, LOG_ORDER) * PRE_SCALE
+    k_vals = tl.where(valid_slot, k_vals, 0.0)
+
+    tl.store(K_out_ptr + entry_id * stride_ko_t + d_offs, k_vals, mask=d_mask)
+
+
+def triton_kv_4bit_gather_k_by_slot(
+    kv_cache: torch.Tensor,
+    slot_indices: torch.Tensor,
+    k_out: torch.Tensor,
+    *,
+    hadamard_order: int,
+) -> None:
+    """Gather and dequantize KV-4BIT K entries by physical slot id.
+
+    ``slot_indices`` contains global physical cache slots, typically after sparse
+    per-request top-k indices have been translated through the block table.
+    Negative slots are treated as padding and produce zero rows.
+    """
+    assert kv_cache.dtype == torch.uint8
+    assert k_out.ndim == 2
+    if kv_cache.ndim == 3:
+        kv_cache = kv_cache.unsqueeze(2)
+    assert kv_cache.ndim == 4 and kv_cache.shape[2] == 1
+
+    flat_slots = slot_indices.reshape(-1).contiguous()
+    num_entries = int(flat_slots.numel())
+    if num_entries <= 0:
+        return
+    if k_out.shape[0] < num_entries:
+        raise ValueError(
+            f"k_out has {k_out.shape[0]} rows but {num_entries} slots were requested"
+        )
+
+    head_dim = k_out.shape[-1]
+    if hadamard_order < 2 or hadamard_order & (hadamard_order - 1):
+        raise ValueError(
+            f"hadamard_order must be a power of two >= 2, got {hadamard_order}"
+        )
+    if head_dim % hadamard_order:
+        raise ValueError(
+            f"head_dim ({head_dim}) must be divisible by hadamard_order "
+            f"({hadamard_order})"
+        )
+
+    k_scale, k_zero, _, _ = get_kv_4bit_scale_zero_views(kv_cache, head_dim)
+    block_d = triton.next_power_of_2(head_dim)
+    log_order = int(math.log2(hadamard_order))
+    pre_scale = 1.0 / math.sqrt(float(hadamard_order))
+
+    _kv_4bit_gather_k_by_slot_kernel[(num_entries,)](
+        kv_cache.view(-1),
+        k_scale,
+        k_zero,
+        flat_slots,
+        k_out,
+        Num_entries=num_entries,
+        stride_cache_block=kv_cache.stride(0),
+        stride_cache_pos=kv_cache.stride(1),
+        stride_cache_head=kv_cache.stride(2),
+        stride_ks_block=k_scale.stride(0),
+        stride_ks_pos=k_scale.stride(1),
+        stride_ks_head=k_scale.stride(2),
+        stride_slots=flat_slots.stride(0),
+        stride_ko_t=k_out.stride(0),
+        HEAD_DIM=head_dim,
+        BLOCK_SIZE=kv_cache.shape[1],
+        BLOCK_D=block_d,
+        ROTATE_K=True,
+        LOG_ORDER=log_order,
+        PRE_SCALE=pre_scale,
+        num_warps=4,
+    )
+
+
 def triton_kv_4bit_decode_attention(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
