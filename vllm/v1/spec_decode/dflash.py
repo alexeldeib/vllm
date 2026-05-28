@@ -14,6 +14,7 @@ from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import triton
+from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
@@ -88,8 +89,16 @@ class DFlashProposer(SpecDecodeBaseProposer):
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
+        cache_config = base.cache_config
+        if cache_config is not None and is_quantized_kv_cache(cache_config.cache_dtype):
+            cache_config = replace(
+                cache_config,
+                cache_dtype="auto",
+                calculate_kv_scales=False,
+            )
         return replace(
             base,
+            cache_config=cache_config,
             attention_config=replace(
                 base.attention_config,
                 use_non_causal=True,
