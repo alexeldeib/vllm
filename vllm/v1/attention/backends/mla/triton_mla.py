@@ -35,6 +35,7 @@ class TritonMLABackend(MLACommonBackend):
         "bfloat16",
         "fp8",
         "fp8_e4m3",
+        "kv_4bit",
     ]
 
     @classmethod
@@ -139,10 +140,6 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
         q_num_heads = q.shape[1]
-        o = torch.zeros(
-            B, q_num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
-        )
-        lse = torch.zeros(B, q_num_heads, dtype=q.dtype, device=q.device)
 
         # For batch invariance, use only 1 split to ensure deterministic reduction
         if envs.VLLM_BATCH_INVARIANT:
@@ -163,6 +160,39 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
             occupancy_multiplier = 2
             max_splits = self._sm_count * occupancy_multiplier
             num_kv_splits = min(ideal_splits, max_splits)
+
+        if self.kv_cache_dtype == "kv_4bit":
+            from vllm.model_executor.layers.quantization.kv_4bit.config import (
+                KV4BitConfig,
+            )
+            from vllm.v1.attention.ops.triton_kv_4bit_decode import (
+                triton_kv_4bit_decode_attention,
+            )
+
+            cfg = KV4BitConfig.from_mla_cache_dtype(
+                self.kv_cache_dtype,
+                self.head_size,
+            )
+            full_o = triton_kv_4bit_decode_attention(
+                query=q,
+                kv_cache=(
+                    kv_c_and_k_pe_cache.unsqueeze(2)
+                    if kv_c_and_k_pe_cache.ndim == 3
+                    else kv_c_and_k_pe_cache
+                ),
+                block_table=attn_metadata.decode.block_table,
+                seq_lens=attn_metadata.decode.seq_lens,
+                scale=self.scale,
+                hadamard_order=cfg.hadamard_order,
+                max_num_kv_splits=num_kv_splits,
+                buf_holder=layer,
+            )
+            return full_o[..., : self.kv_lora_rank].contiguous(), None
+
+        o = torch.zeros(
+            B, q_num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
+        )
+        lse = torch.zeros(B, q_num_heads, dtype=q.dtype, device=q.device)
 
         # TODO(lucas) Allocate ahead of time
         attn_logits = torch.empty(

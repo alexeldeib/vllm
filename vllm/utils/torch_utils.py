@@ -47,6 +47,7 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_4bit_nc": torch.uint8,
     "turboquant_k3v4_nc": torch.uint8,
     "turboquant_3bit_nc": torch.uint8,
+    "kv_4bit": torch.uint8,
     "nvfp4": torch.uint8,
 }
 
@@ -76,6 +77,8 @@ PIN_MEMORY = "microsoft" not in " ".join(platform.uname()).lower()
 def is_quantized_kv_cache(kv_cache_dtype: str) -> bool:
     return (
         kv_cache_dtype.startswith("fp8")
+        or kv_cache_dtype.startswith("turboquant_")
+        or kv_cache_dtype == "kv_4bit"
         or kv_cache_dtype.endswith("per_token_head")
         or kv_cache_dtype == "nvfp4"
     )

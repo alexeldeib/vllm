@@ -83,6 +83,16 @@ def _get_backend_priorities(
     kv_cache_dtype: CacheDType | None = None,
 ) -> list[AttentionBackendEnum]:
     """Get backend priorities with lazy import to avoid circular dependency."""
+    if (
+        not use_mla
+        and isinstance(kv_cache_dtype, str)
+        and kv_cache_dtype == "kv_4bit"
+    ):
+        return [AttentionBackendEnum.KV_4BIT]
+
+    if use_mla and isinstance(kv_cache_dtype, str) and kv_cache_dtype == "kv_4bit":
+        return [AttentionBackendEnum.TRITON_MLA]
+
     if use_mla:
         if device_capability.major == 10:
             # Sparse MLA backend priorities
@@ -136,6 +146,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
+                AttentionBackendEnum.KV_4BIT,
             ]
         else:
             return [
@@ -144,6 +155,7 @@ def _get_backend_priorities(
                 AttentionBackendEnum.TRITON_ATTN,
                 AttentionBackendEnum.FLEX_ATTENTION,
                 AttentionBackendEnum.TURBOQUANT,
+                AttentionBackendEnum.KV_4BIT,
             ]
 
 
