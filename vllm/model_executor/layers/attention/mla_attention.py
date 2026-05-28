@@ -649,7 +649,10 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         if self.impl.dcp_world_size == -1:
             self.impl.dcp_world_size = get_dcp_group().world_size
 
-        fp8_attention = is_quantized_kv_cache(self.kv_cache_dtype)
+        fp8_attention = (
+            is_quantized_kv_cache(self.kv_cache_dtype)
+            and self.kv_cache_dtype != "kv_4bit"
+        )
 
         num_actual_toks = attn_metadata.num_actual_tokens
 
