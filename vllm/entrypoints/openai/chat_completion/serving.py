@@ -327,9 +327,8 @@ class OpenAIServingChat(OpenAIServing):
                 if not request.include_reasoning:
                     reasoning_ended = True
                 elif request._grammar_from_tool_parser:
-                    # The Mistral grammar already includes an optional
-                    # `think?` rule that handles both reasoning and
-                    # non-reasoning outputs.
+                    # Parser-owned tool grammars own the whole generated
+                    # surface, including any model-specific reasoning syntax.
                     reasoning_ended = True
                 elif reasoning_parser:
                     reasoning_ended = reasoning_parser.is_reasoning_end(

@@ -16,6 +16,8 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionToolsParam,
     FunctionDefinition,
 )
+from vllm.parser.abstract_parser import DelegatingParser
+from vllm.reasoning.deepseek_v3_reasoning_parser import DeepSeekV3ReasoningParser
 from vllm.tool_parsers import ToolParserManager
 from vllm.tool_parsers.deepseekv4_tool_parser import DeepSeekV4ToolParser
 
@@ -28,6 +30,8 @@ INV_START = '<｜DSML｜invoke name="'
 INV_END = "</｜DSML｜invoke>"
 PARAM_START = '<｜DSML｜parameter name="'
 PARAM_END = "</｜DSML｜parameter>"
+
+pytestmark = pytest.mark.skip_global_cleanup
 
 
 @pytest.fixture
@@ -250,6 +254,142 @@ def test_get_vllm_registry_structural_tag_returns_structural_tag(
         )
         tag = parser.get_structural_tag(req)
         assert isinstance(tag, StructuralTag)
+
+
+def test_required_tool_choice_uses_phase_aware_tool_grammar(
+    sample_tools: list[ChatCompletionToolsParam],
+) -> None:
+    parser = make_parser(sample_tools)
+    req = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=sample_tools,
+        tool_choice="required",
+        chat_template_kwargs={"thinking": True, "enable_thinking": True},
+    )
+
+    out = parser.adjust_request(req)
+
+    assert out._grammar_from_tool_parser is True
+    assert out.response_format is None
+    assert out.skip_special_tokens is False
+    assert out.structured_outputs is not None
+    assert out.structured_outputs.structural_tag is not None
+    loaded = json.loads(out.structured_outputs.structural_tag)
+    serialized = json.dumps(loaded, ensure_ascii=False)
+    assert "</think>" not in serialized
+    assert "<｜DSML｜tool_calls>" in serialized
+
+
+def test_named_tool_choice_uses_phase_aware_tool_grammar(
+    sample_tools: list[ChatCompletionToolsParam],
+) -> None:
+    parser = make_parser(sample_tools)
+    tool = sample_tools[0]
+    req = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=sample_tools,
+        chat_template_kwargs={"thinking": True, "enable_thinking": True},
+    )
+    req.tool_choice = ChatCompletionNamedToolChoiceParam(
+        function=ChatCompletionNamedFunction(name=tool.function.name)
+    )
+
+    out = parser.adjust_request(req)
+
+    assert out._grammar_from_tool_parser is True
+    assert out.response_format is None
+    assert out.skip_special_tokens is False
+    assert out.structured_outputs is not None
+    assert out.structured_outputs.structural_tag is not None
+    loaded = json.loads(out.structured_outputs.structural_tag)
+    serialized = json.dumps(loaded, ensure_ascii=False)
+    assert "</think>" not in serialized
+    assert tool.function.name in serialized
+
+
+def test_named_tool_choice_without_thinking_omits_thinking_prefix(
+    sample_tools: list[ChatCompletionToolsParam],
+) -> None:
+    parser = make_parser(sample_tools)
+    tool = sample_tools[0]
+    req = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=sample_tools,
+        chat_template_kwargs={"thinking": False, "enable_thinking": False},
+    )
+    req.tool_choice = ChatCompletionNamedToolChoiceParam(
+        function=ChatCompletionNamedFunction(name=tool.function.name)
+    )
+
+    out = parser.adjust_request(req)
+
+    assert out._grammar_from_tool_parser is True
+    assert out.structured_outputs is not None
+    assert out.structured_outputs.structural_tag is not None
+    loaded = json.loads(out.structured_outputs.structural_tag)
+    serialized = json.dumps(loaded, ensure_ascii=False)
+    assert "</think>" not in serialized
+    assert tool.function.name in serialized
+
+
+def test_parser_owned_grammar_streams_tool_calls_in_thinking_phase(
+    sample_tools: list[ChatCompletionToolsParam],
+) -> None:
+    tokenizer = MagicMock()
+    tokenizer.get_vocab.return_value = {"<think>": 1, "</think>": 2}
+
+    class Parser(DelegatingParser):
+        reasoning_parser_cls = DeepSeekV3ReasoningParser
+        tool_parser_cls = DeepSeekV4ToolParser
+
+    parser = Parser(
+        tokenizer,
+        tools=sample_tools,
+        chat_template_kwargs={"thinking": True, "enable_thinking": True},
+    )
+    request = ChatCompletionRequest(
+        messages=[],
+        model="m",
+        tools=sample_tools,
+        tool_choice="required",
+        chat_template_kwargs={"thinking": True, "enable_thinking": True},
+    )
+    request._grammar_from_tool_parser = True
+    full_text = build_tool_call(
+        "get_current_weather",
+        {"city": "Boston", "state": "MA", "unit": "fahrenheit"},
+    )
+
+    deltas = []
+    for start in range(0, len(full_text), 4):
+        chunk = full_text[start : start + 4]
+        delta = parser.parse_delta(
+            delta_text=chunk,
+            delta_token_ids=[start + 100],
+            request=request,
+            prompt_token_ids=[],
+            finished=start + 4 >= len(full_text),
+        )
+        if delta is not None:
+            deltas.append(delta)
+
+    assert all(delta.reasoning is None for delta in deltas)
+    assert "".join(delta.content or "" for delta in deltas) == ""
+    names = [
+        tool_call.function.name
+        for delta in deltas
+        for tool_call in delta.tool_calls or []
+        if tool_call.function and tool_call.function.name
+    ]
+    assert names == ["get_current_weather"]
+    assert json.loads(reconstruct_args(deltas)) == {
+        "city": "Boston",
+        "state": "MA",
+        "unit": "fahrenheit",
+    }
 
 
 def test_extract_tool_calls_arguments_wrapper():

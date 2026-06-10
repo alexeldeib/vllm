@@ -236,7 +236,7 @@ def get_deepseek_v4_structural_tag(
             ]
         )
 
-    if not reasoning:
+    if not reasoning or tool_choice in ("forced", "required"):
         return StructuralTag(format=suffix_tag)
 
     prefix_tag = TagFormat(begin="", content=AnyTextFormat(), end=think_tag_end)

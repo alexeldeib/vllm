@@ -807,6 +807,10 @@ class DelegatingParser(Parser):
                 prompt_token_ids
             ):
                 state.reasoning_ended = True
+        if getattr(request, "_grammar_from_tool_parser", False):
+            # Parser-owned tool grammars are applied from the first generated
+            # token, matching the engine-side reasoning_ended override.
+            state.reasoning_ended = True
 
         current_text = state.previous_text + delta_text
         current_token_ids = state.previous_token_ids + delta_token_ids
