@@ -5,7 +5,6 @@ import json
 from typing import TYPE_CHECKING
 
 import partial_json_parser
-import regex as re
 from partial_json_parser.core.options import Allow
 
 from vllm.entrypoints.chat_utils import make_tool_call_id
@@ -33,6 +32,101 @@ def _bracket_level(s: str, opening: str = "{", closing: str = "}") -> int:
         elif char == closing:
             level -= 1
     return level
+
+
+def _consume_space(s: str, index: int) -> int:
+    while index < len(s) and s[index].isspace():
+        index += 1
+    return index
+
+
+def _consume_json_string(s: str, index: int) -> tuple[str, int] | None:
+    if index >= len(s) or s[index] != '"':
+        return None
+    try:
+        value, end = json.JSONDecoder().raw_decode(s[index:])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, str):
+        return None
+    return value, index + end
+
+
+def _find_last_top_level_parameters_start(s: str) -> int | None:
+    """Find the latest tool-call object's top-level parameters value."""
+    array_level = 0
+    object_level = 0
+    parameters_start: int | None = None
+    index = 0
+
+    while index < len(s):
+        char = s[index]
+
+        if char == '"':
+            parsed_string = _consume_json_string(s, index)
+            if parsed_string is None:
+                return parameters_start
+
+            value, end = parsed_string
+            after_key = _consume_space(s, end)
+            if (
+                value == "parameters"
+                and array_level == 1
+                and object_level == 1
+                and after_key < len(s)
+                and s[after_key] == ":"
+            ):
+                parameters_start = _consume_space(s, after_key + 1)
+
+            index = end
+            continue
+
+        if char == "[":
+            array_level += 1
+        elif char == "]":
+            array_level -= 1
+        elif char == "{":
+            object_level += 1
+        elif char == "}":
+            object_level -= 1
+
+        index += 1
+
+    return parameters_start
+
+
+def _trim_to_json_value(s: str) -> str:
+    """Return the complete leading JSON value, or the input if incomplete."""
+    lstripped = s.lstrip()
+    if not lstripped:
+        return s
+
+    leading_ws = len(s) - len(lstripped)
+    try:
+        _, end = json.JSONDecoder().raw_decode(lstripped)
+    except json.JSONDecodeError:
+        return s
+
+    return s[: leading_ws + end]
+
+
+def _parameters_text(s: str) -> str | None:
+    parameters_start = _find_last_top_level_parameters_start(s)
+    if parameters_start is None:
+        return None
+    return _trim_to_json_value(s[parameters_start:])
+
+
+def _parameters_delta(previous_text: str, current_text: str) -> str | None:
+    current = _parameters_text(current_text)
+    if current is None:
+        return None
+
+    previous = _parameters_text(previous_text) or ""
+    if current.startswith(previous):
+        return current[len(previous) :]
+
+    return current
 
 
 def filter_delta_text(
@@ -141,10 +235,12 @@ def extract_required_tool_call_streaming(
         else:
             if not function_name_returned:
                 # get partly generated arguments from the latest tool call
-                param_match = re.search(
-                    r'.*"parameters":\s*(.*)', current_text, re.DOTALL
+                arguments = _parameters_delta(
+                    previous_text=previous_text,
+                    current_text=current_text,
                 )
-                arguments = param_match.group(1) if param_match else ""
+                if arguments is None:
+                    arguments = ""
                 arguments, _ = filter_delta_text(arguments, previous_text)
 
                 # if this iteration finishes a previous tool call but a
@@ -173,6 +269,7 @@ def extract_required_tool_call_streaming(
                 )
 
             else:
+                delta_text = _parameters_delta(previous_text, current_text) or ""
                 delta_text, _ = filter_delta_text(delta_text, previous_text)
 
                 if delta_text != "":

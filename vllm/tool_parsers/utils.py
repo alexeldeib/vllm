@@ -180,11 +180,13 @@ def _get_tool_schema_from_tool(tool: Tool) -> dict:
     name, params = _extract_tool_info(tool)
     params = params if params else {"type": "object", "properties": {}}
     return {
+        "type": "object",
         "properties": {
             "name": {"type": "string", "enum": [name]},
             "parameters": params,
         },
         "required": ["name", "parameters"],
+        "additionalProperties": False,
     }
 
 
