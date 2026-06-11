@@ -275,20 +275,47 @@ class StructuredOutputManager:
                 grammar = structured_output_request.grammar
                 apply_bitmask = self.should_fill_bitmask(request)
 
-                state_advancements = 0
                 req_tokens = scheduled_spec_decode_tokens.get(req_id, ())
-                for token in itertools.chain(req_tokens, (-1,)):
-                    self._fill_bitmasks(((grammar, cumulative_index, apply_bitmask),))
-                    if token == -1:
-                        # Stop advancing the grammar once we hit a padding token.
-                        apply_bitmask = False
-                    if apply_bitmask and not grammar.is_terminated():
-                        accepted = grammar.accept_tokens(req_id, [token])
-                        assert accepted, (token, req_id, scheduled_spec_decode_tokens)
-                        state_advancements += 1
-                    cumulative_index += 1
-                if state_advancements > 0:
-                    grammar.rollback(state_advancements)
+                # Under speculative decoding we fill one bitmask per speculative
+                # position, which requires advancing the matcher through the
+                # draft tokens. Advancing and then rolling back the *live*
+                # matcher corrupts its parse state -- xgrammar's rollback does
+                # not reliably restore the full state (a broader form of
+                # vllm-project/vllm#27210) -- which produces an all-masked
+                # bitmask on a later step (invalid token -> terminated request),
+                # observed only under spec decode at small batch sizes. Advance
+                # an independent fork instead and discard it, leaving the live
+                # matcher untouched (no rollback needed). Backends that do not
+                # support fork() fall back to the advance-then-rollback path.
+                work = grammar.fork() if req_tokens else None
+                if work is not None:
+                    for token in itertools.chain(req_tokens, (-1,)):
+                        self._fill_bitmasks(((work, cumulative_index, apply_bitmask),))
+                        if token == -1:
+                            apply_bitmask = False
+                        if apply_bitmask and not work.is_terminated():
+                            work.accept_tokens(req_id, [token])
+                        cumulative_index += 1
+                else:
+                    state_advancements = 0
+                    for token in itertools.chain(req_tokens, (-1,)):
+                        self._fill_bitmasks(
+                            ((grammar, cumulative_index, apply_bitmask),)
+                        )
+                        if token == -1:
+                            # Stop advancing the grammar at the padding token.
+                            apply_bitmask = False
+                        if apply_bitmask and not grammar.is_terminated():
+                            accepted = grammar.accept_tokens(req_id, [token])
+                            assert accepted, (
+                                token,
+                                req_id,
+                                scheduled_spec_decode_tokens,
+                            )
+                            state_advancements += 1
+                        cumulative_index += 1
+                    if state_advancements > 0:
+                        grammar.rollback(state_advancements)
 
         bitmask_tensor = self._grammar_bitmask
         if cumulative_index < bitmask_tensor.shape[0]:

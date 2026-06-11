@@ -94,6 +94,19 @@ class StructuredOutputGrammar(ABC):
         Resets the state of the structured output grammar.
         """
 
+    def fork(self) -> "StructuredOutputGrammar | None":
+        """
+        Returns an independent copy of this grammar at its current parse state,
+        or ``None`` if the backend does not support forking.
+
+        Used to build per-position speculative-decoding bitmasks by advancing a
+        throwaway copy through the draft tokens, instead of advancing and then
+        rolling back the live grammar (whose rollback may not fully restore the
+        parse state). Returning ``None`` keeps the legacy advance-then-rollback
+        behavior.
+        """
+        return None
+
 
 @dataclass
 class StructuredOutputBackend(ABC):

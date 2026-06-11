@@ -187,27 +187,24 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
         Returns the prefix list of tokens that are accepted by the FSM.
         """
-        # Never call ``accept_token`` on a terminated matcher. xgrammar does not
-        # reliably clear the terminated flag on ``rollback`` (vllm-project/
-        # vllm#27210), so advancing the matcher at/after termination can leave it
-        # stuck terminated. Once that happens every later ``fill_bitmask`` is
-        # skipped and an all-allowed mask is emitted, silently disabling the
-        # grammar for the rest of the request. This path runs only under
-        # speculative decoding (it filters draft tokens), which is why the
-        # failure is MTP-only. Mirror the guard in ``accept_tokens``.
         if self._is_terminated:
             return []
+        # Validate on an independent fork so the live matcher is never advanced
+        # and then rolled back. xgrammar's rollback does not reliably restore
+        # the full parse state (a broader form of vllm-project/vllm#27210);
+        # mutating the live matcher here corrupts it and breaks later
+        # ``fill_bitmask`` calls -- observed under speculative decoding at small
+        # batch sizes as an all-masked bitmask, which forces an invalid token
+        # and terminates the request ("grammar rejected tokens ...").
+        matcher = self.matcher.fork()
         accepted_tokens = []
         for token in tokens:
-            if self.matcher.is_terminated():
+            if matcher.is_terminated():
                 break
-            if self.matcher.accept_token(token):
+            if matcher.accept_token(token):
                 accepted_tokens.append(token)
             else:
                 break
-        if len(accepted_tokens) > 0:
-            # Rollback the FSM to the initial state
-            self.matcher.rollback(len(accepted_tokens))
         return accepted_tokens
 
     def rollback(self, num_tokens: int) -> None:
@@ -232,6 +229,20 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
     def is_terminated(self) -> bool:
         return self._is_terminated
+
+    def fork(self) -> "XgrammarGrammar":
+        # ``GrammarMatcher.fork`` deep-copies the parse state, giving an
+        # independent matcher at the same position. Used to build speculative
+        # bitmasks without advancing/rolling back the live matcher.
+        new = XgrammarGrammar(
+            matcher=self.matcher.fork(),
+            vocab_size=self.vocab_size,
+            ctx=self.ctx,
+        )
+        new.num_processed_tokens = self.num_processed_tokens
+        new._is_terminated = self._is_terminated
+        new._terminated_at = self._terminated_at
+        return new
 
     def reset(self):
         self.num_processed_tokens = 0
