@@ -12,6 +12,8 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.structured_output.backend_types import StructuredOutputOptions
 
+pytestmark = pytest.mark.skip_global_cleanup
+
 
 class MockReasoner:
     def __init__(self, tokenizer):
@@ -65,6 +67,10 @@ class TestReasoningStructuredOutput:
         request.structured_output_request.grammar = Mock()
         request.structured_output_request.reasoning_parser_kwargs = None
         request.structured_output_request.reasoner = None
+        request.structured_output_request.structured_output_key = (
+            StructuredOutputOptions.JSON_OBJECT,
+            "",
+        )
         request.structured_output_request.grammar.is_terminated = Mock(
             return_value=False
         )
@@ -82,17 +88,41 @@ class TestReasoningStructuredOutput:
         manager.tokenizer = Mock()
         return manager
 
-    def test_should_fill_bitmask_with_enable_in_reasoning(
-        self, mock_vllm_config, mock_request_with_structured_output
+    def test_should_fill_bitmask_with_enable_in_reasoning_waits_for_json(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
     ):
-        """Test should_fill_bitmask when enable_in_reasoning is True."""
-        # Enable enable_in_reasoning
-        mock_vllm_config.structured_outputs_config.enable_in_reasoning = True
+        """Final-answer JSON grammars must still wait for reasoning to end."""
+        manager_with_reasoner.enable_in_reasoning = True
 
-        manager = StructuredOutputManager(mock_vllm_config)
+        result = manager_with_reasoner.should_fill_bitmask(
+            mock_request_with_structured_output
+        )
 
-        # Should always return True when enable_in_reasoning is enabled
-        result = manager.should_fill_bitmask(mock_request_with_structured_output)
+        assert (
+            mock_request_with_structured_output.structured_output_request.reasoning_ended
+            is False
+        )
+        assert result is False
+
+    def test_should_fill_bitmask_with_enable_in_reasoning_structural_tag(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        """Structural-tag grammars can cover reasoning and final output."""
+        manager_with_reasoner.enable_in_reasoning = True
+        structured_req = mock_request_with_structured_output.structured_output_request
+        structured_req.structured_output_key = (
+            StructuredOutputOptions.STRUCTURAL_TAG,
+            "{}",
+        )
+
+        result = manager_with_reasoner.should_fill_bitmask(
+            mock_request_with_structured_output
+        )
+
         assert result is True
 
     def test_should_fill_bitmask_without_enable_in_reasoning(
@@ -156,19 +186,40 @@ class TestReasoningStructuredOutput:
             is not None
         )
 
-    def test_should_advance_with_enable_in_reasoning(
+    def test_should_advance_with_enable_in_reasoning_waits_for_json(
         self,
         manager_with_reasoner,
         mock_request_with_structured_output,
     ):
-        """Test should_advance when enable_in_reasoning is True."""
-        # Enable enable_in_reasoning
+        """Final-answer JSON grammars do not advance during reasoning."""
         manager_with_reasoner.enable_in_reasoning = True
+        (
+            mock_request_with_structured_output.structured_output_request
+        ).reasoning_ended = False
 
-        # Should always return True when enable_in_reasoning is enabled
         result = manager_with_reasoner.should_advance(
             mock_request_with_structured_output
         )
+        assert result is False
+
+    def test_should_advance_with_enable_in_reasoning_structural_tag(
+        self,
+        manager_with_reasoner,
+        mock_request_with_structured_output,
+    ):
+        """Structural-tag grammars advance during reasoning when enabled."""
+        manager_with_reasoner.enable_in_reasoning = True
+        structured_req = mock_request_with_structured_output.structured_output_request
+        structured_req.reasoning_ended = False
+        structured_req.structured_output_key = (
+            StructuredOutputOptions.STRUCTURAL_TAG,
+            "{}",
+        )
+
+        result = manager_with_reasoner.should_advance(
+            mock_request_with_structured_output
+        )
+
         assert result is True
 
     def test_should_advance_reasoning_not_ended(

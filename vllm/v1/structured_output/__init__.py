@@ -300,12 +300,9 @@ class StructuredOutputManager:
         return bitmask_tensor.numpy()
 
     def should_fill_bitmask(self, request: "Request") -> bool:
-        # NOTE (Hanchen) if enable_in_reasoning is True, it means that
-        # the model needs to be constrained in reasoning. So we should always
-        # enable the bitmask filling.
         reasoner = self._get_reasoner(request)
         if reasoner is not None:
-            if self.enable_in_reasoning:
+            if self._should_apply_in_reasoning(request):
                 return True
             assert request.structured_output_request is not None
             if request.structured_output_request.reasoning_ended is None:
@@ -318,6 +315,16 @@ class StructuredOutputManager:
                 )
             return request.structured_output_request.reasoning_ended
         return True
+
+    def _should_apply_in_reasoning(self, request: "Request") -> bool:
+        """Whether this request's grammar can safely cover reasoning text."""
+        if not self.enable_in_reasoning:
+            return False
+        structured_req = request.structured_output_request
+        if structured_req is None:
+            return False
+        request_type, _ = structured_req.structured_output_key
+        return request_type == StructuredOutputOptions.STRUCTURAL_TAG
 
     def should_advance(self, request: "Request") -> bool:
         if not request.use_structured_output:
@@ -334,8 +341,10 @@ class StructuredOutputManager:
         if reasoner is None:
             return True
 
-        # if the model needs structured in reasoning, we should advance
-        if self.enable_in_reasoning:
+        # Only structural tags can describe both reasoning and final-answer
+        # phases. Plain JSON/regex/choice/grammar constraints are final-answer
+        # grammars and must wait until reasoning ends.
+        if self._should_apply_in_reasoning(request):
             return True
 
         structured_req = request.structured_output_request
