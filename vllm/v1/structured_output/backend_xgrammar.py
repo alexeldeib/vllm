@@ -144,6 +144,15 @@ class XgrammarGrammar(StructuredOutputGrammar):
         default_factory=lambda: 0, repr=False, hash=False, init=False
     )
     _is_terminated: bool = field(default=False, repr=False, hash=False)
+    # ``num_processed_tokens`` at which the matcher first reached a terminated
+    # (accepting/complete) state, or ``None`` if it has not terminated. xgrammar
+    # does not reliably clear the terminated flag on ``rollback``
+    # (vllm-project/vllm#27210), so ``matcher.is_terminated()`` cannot be trusted
+    # after a rollback. We track the terminating position ourselves and derive
+    # ``_is_terminated`` from it, which stays correct across the
+    # accept-then-rollback sequences used to build per-step bitmasks under
+    # speculative decoding.
+    _terminated_at: int | None = field(default=None, repr=False, hash=False, init=False)
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM.
@@ -163,7 +172,13 @@ class XgrammarGrammar(StructuredOutputGrammar):
                 )
                 return False
             self.num_processed_tokens += 1
-        self._is_terminated = self.matcher.is_terminated()
+            # ``is_terminated()`` is reliable while advancing forward (the
+            # vllm-project/vllm#27210 bug only affects the post-rollback read).
+            # Record the first terminating position so ``rollback`` can restore
+            # the flag correctly.
+            if self._terminated_at is None and self.matcher.is_terminated():
+                self._terminated_at = self.num_processed_tokens
+        self._is_terminated = self._terminated_at is not None
         return True
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
@@ -172,8 +187,20 @@ class XgrammarGrammar(StructuredOutputGrammar):
 
         Returns the prefix list of tokens that are accepted by the FSM.
         """
+        # Never call ``accept_token`` on a terminated matcher. xgrammar does not
+        # reliably clear the terminated flag on ``rollback`` (vllm-project/
+        # vllm#27210), so advancing the matcher at/after termination can leave it
+        # stuck terminated. Once that happens every later ``fill_bitmask`` is
+        # skipped and an all-allowed mask is emitted, silently disabling the
+        # grammar for the rest of the request. This path runs only under
+        # speculative decoding (it filters draft tokens), which is why the
+        # failure is MTP-only. Mirror the guard in ``accept_tokens``.
+        if self._is_terminated:
+            return []
         accepted_tokens = []
         for token in tokens:
+            if self.matcher.is_terminated():
+                break
             if self.matcher.accept_token(token):
                 accepted_tokens.append(token)
             else:
@@ -186,7 +213,19 @@ class XgrammarGrammar(StructuredOutputGrammar):
     def rollback(self, num_tokens: int) -> None:
         self.matcher.rollback(num_tokens)
         self.num_processed_tokens -= num_tokens
-        self._is_terminated = self.matcher.is_terminated()
+        # Do not trust ``matcher.is_terminated()`` here: xgrammar may leave it
+        # set after rolling back past the terminating token (#27210). Recompute
+        # from the tracked terminating position instead. This is what keeps the
+        # accept-then-rollback bitmask construction (used for every speculative
+        # step in ``StructuredOutputManager.grammar_bitmask``) from leaving the
+        # grammar wedged "terminated" -- which otherwise emits an all-allowed
+        # bitmask (silent empty output) or makes the next real ``accept_tokens``
+        # return False ("grammar rejected tokens ... Terminating request").
+        if self._terminated_at is not None and self.num_processed_tokens < (
+            self._terminated_at
+        ):
+            self._terminated_at = None
+        self._is_terminated = self._terminated_at is not None
 
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(bitmask, idx)
