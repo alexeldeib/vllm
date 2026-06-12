@@ -194,6 +194,167 @@ __global__ __launch_bounds__(128, 1) void norm_router_gemm_kernel(
 #endif
 }
 
+template <int kBlockSize, int VPT, int kNumTokens, int kNumExperts,
+          int kHiddenDim>
+__global__ __launch_bounds__(128, 1) void add_norm_router_gemm_kernel(
+    float* __restrict__ logits, __nv_bfloat16* __restrict__ normed_x,
+    __nv_bfloat16* __restrict__ residual_out,
+    __nv_bfloat16 const* __restrict__ x,
+    __nv_bfloat16 const* __restrict__ residual,
+    __nv_bfloat16 const* __restrict__ norm_weight,
+    __nv_bfloat16 const* __restrict__ gate_weight, float eps) {
+  static_assert(kBlockSize == 128, "kernel assumes blockDim.x == 128");
+  static_assert(kHiddenDim % (VPT * kBlockSize) == 0,
+                "kHiddenDim must be a multiple of VPT * kBlockSize");
+
+  int const n_idx = blockIdx.x;
+  int const tid = threadIdx.x;
+  constexpr int kWarpSize = 32;
+  constexpr int kNumWarps = kBlockSize / kWarpSize;
+  constexpr int k_elems_per_iter = VPT * kBlockSize;
+  constexpr int k_iterations = kHiddenDim / k_elems_per_iter;
+
+  __nv_bfloat16 const* gw_col = gate_weight + n_idx * kHiddenDim;
+
+  float partial[kNumTokens] = {};
+  float ss[kNumTokens] = {};
+
+  __shared__ float sm_partial[kNumTokens][kNumWarps];
+  __shared__ float sm_ss[kNumTokens][kNumWarps];
+  __shared__ float s_rsqrt[kNumTokens];
+
+  int k_bases[k_iterations];
+#pragma unroll
+  for (int ki = 0; ki < k_iterations; ki++) {
+    k_bases[ki] = ki * k_elems_per_iter + tid * VPT;
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.wait;");
+#endif
+
+  // Match fused_add_rms_norm semantics: add in fp32, round the residual
+  // state back to bf16, then compute RMSNorm/router from that rounded value.
+#pragma unroll
+  for (int ki = 0; ki < k_iterations; ki++) {
+    int const k_base = k_bases[ki];
+
+    uint4 nw_vec = *reinterpret_cast<uint4 const*>(norm_weight + k_base);
+    float nw_f[VPT];
+    bf16_uint4_to_float8<VPT>(nw_vec, nw_f);
+
+    uint4 b_vec = *reinterpret_cast<uint4 const*>(gw_col + k_base);
+    float b_f[VPT];
+    bf16_uint4_to_float8<VPT>(b_vec, b_f);
+
+#pragma unroll
+    for (int m = 0; m < kNumTokens; m++) {
+      uint4 x_vec =
+          *reinterpret_cast<uint4 const*>(x + m * kHiddenDim + k_base);
+      uint4 r_vec =
+          *reinterpret_cast<uint4 const*>(residual + m * kHiddenDim + k_base);
+      float x_f[VPT];
+      float r_f[VPT];
+      bf16_uint4_to_float8<VPT>(x_vec, x_f);
+      bf16_uint4_to_float8<VPT>(r_vec, r_f);
+
+#pragma unroll
+      for (int k = 0; k < VPT; k++) {
+        float a = __bfloat162float(__float2bfloat16(x_f[k] + r_f[k]));
+        ss[m] += a * a;
+        partial[m] += a * nw_f[k] * b_f[k];
+      }
+    }
+  }
+
+  int const warpId = tid / kWarpSize;
+  int const laneId = tid % kWarpSize;
+
+#pragma unroll
+  for (int m = 0; m < kNumTokens; m++) {
+    float p = partial[m];
+    float s = ss[m];
+
+    p += __shfl_xor_sync(0xffffffff, p, 16);
+    s += __shfl_xor_sync(0xffffffff, s, 16);
+    p += __shfl_xor_sync(0xffffffff, p, 8);
+    s += __shfl_xor_sync(0xffffffff, s, 8);
+    p += __shfl_xor_sync(0xffffffff, p, 4);
+    s += __shfl_xor_sync(0xffffffff, s, 4);
+    p += __shfl_xor_sync(0xffffffff, p, 2);
+    s += __shfl_xor_sync(0xffffffff, s, 2);
+    p += __shfl_xor_sync(0xffffffff, p, 1);
+    s += __shfl_xor_sync(0xffffffff, s, 1);
+
+    if (laneId == 0) {
+      sm_partial[m][warpId] = p;
+      sm_ss[m][warpId] = s;
+    }
+  }
+
+  __syncthreads();
+
+  if (tid == 0) {
+#pragma unroll
+    for (int m = 0; m < kNumTokens; m++) {
+      float p_sum = 0.0f;
+      float s_sum = 0.0f;
+#pragma unroll
+      for (int w = 0; w < kNumWarps; w++) {
+        p_sum += sm_partial[m][w];
+        s_sum += sm_ss[m][w];
+      }
+      float rs = rsqrtf(s_sum / static_cast<float>(kHiddenDim) + eps);
+      s_rsqrt[m] = rs;
+      logits[m * kNumExperts + n_idx] = p_sum * rs;
+    }
+  }
+
+  __syncthreads();
+
+  if (n_idx < kNumTokens) {
+    int const m_writer = n_idx;
+    float const rs = s_rsqrt[m_writer];
+    __nv_bfloat16 const* x_row = x + m_writer * kHiddenDim;
+    __nv_bfloat16 const* residual_row = residual + m_writer * kHiddenDim;
+    __nv_bfloat16* normed_row = normed_x + m_writer * kHiddenDim;
+    __nv_bfloat16* residual_out_row = residual_out + m_writer * kHiddenDim;
+
+#pragma unroll
+    for (int ki = 0; ki < k_iterations; ki++) {
+      int const k_base = k_bases[ki];
+
+      uint4 nw_vec = *reinterpret_cast<uint4 const*>(norm_weight + k_base);
+      float nw_f[VPT];
+      bf16_uint4_to_float8<VPT>(nw_vec, nw_f);
+
+      uint4 x_vec = *reinterpret_cast<uint4 const*>(x_row + k_base);
+      uint4 r_vec = *reinterpret_cast<uint4 const*>(residual_row + k_base);
+      float x_f[VPT];
+      float r_f[VPT];
+      bf16_uint4_to_float8<VPT>(x_vec, x_f);
+      bf16_uint4_to_float8<VPT>(r_vec, r_f);
+
+      uint4 normed_vec;
+      uint4 residual_vec;
+      __nv_bfloat16* np = reinterpret_cast<__nv_bfloat16*>(&normed_vec);
+      __nv_bfloat16* rp = reinterpret_cast<__nv_bfloat16*>(&residual_vec);
+#pragma unroll
+      for (int k = 0; k < VPT; k++) {
+        float a = __bfloat162float(__float2bfloat16(x_f[k] + r_f[k]));
+        rp[k] = __float2bfloat16(a);
+        np[k] = __float2bfloat16(a * rs * nw_f[k]);
+      }
+      *reinterpret_cast<uint4*>(normed_row + k_base) = normed_vec;
+      *reinterpret_cast<uint4*>(residual_out_row + k_base) = residual_vec;
+    }
+  }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 }  // namespace
 
 template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim>
@@ -247,3 +408,59 @@ INSTANTIATE(15)
 INSTANTIATE(16)
 
 #undef INSTANTIATE
+
+template <int kNumTokens, int kNumExperts, int kHiddenDim>
+void invokeAddNormRouterGemm(float* logits, __nv_bfloat16* normed_x,
+                             __nv_bfloat16* residual_out,
+                             __nv_bfloat16 const* x,
+                             __nv_bfloat16 const* residual,
+                             __nv_bfloat16 const* norm_weight,
+                             __nv_bfloat16 const* gate_weight, float eps,
+                             cudaStream_t stream) {
+  constexpr int VPT = 16 / sizeof(__nv_bfloat16);
+  constexpr int kBlockSize = 128;
+
+  cudaLaunchConfig_t config;
+  config.gridDim = kNumExperts;
+  config.blockDim = kBlockSize;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+
+  cudaLaunchAttribute attrs[1];
+  attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attrs[0].val.programmaticStreamSerializationAllowed = 1;
+  config.numAttrs = 1;
+  config.attrs = attrs;
+
+  cudaLaunchKernelEx(
+      &config,
+      add_norm_router_gemm_kernel<kBlockSize, VPT, kNumTokens, kNumExperts,
+                                  kHiddenDim>,
+      logits, normed_x, residual_out, x, residual, norm_weight, gate_weight,
+      eps);
+}
+
+#define INSTANTIATE_ADD(M)                                                \
+  template void invokeAddNormRouterGemm<M, 384, 7168>(                    \
+      float*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16 const*,       \
+      __nv_bfloat16 const*, __nv_bfloat16 const*, __nv_bfloat16 const*,   \
+      float, cudaStream_t);
+
+INSTANTIATE_ADD(1)
+INSTANTIATE_ADD(2)
+INSTANTIATE_ADD(3)
+INSTANTIATE_ADD(4)
+INSTANTIATE_ADD(5)
+INSTANTIATE_ADD(6)
+INSTANTIATE_ADD(7)
+INSTANTIATE_ADD(8)
+INSTANTIATE_ADD(9)
+INSTANTIATE_ADD(10)
+INSTANTIATE_ADD(11)
+INSTANTIATE_ADD(12)
+INSTANTIATE_ADD(13)
+INSTANTIATE_ADD(14)
+INSTANTIATE_ADD(15)
+INSTANTIATE_ADD(16)
+
+#undef INSTANTIATE_ADD

@@ -272,15 +272,25 @@ class FlashInferAllReduce:
         self.max_num_tokens = 0
         self.disabled = False
 
-    def _ensure_workspace(self, hidden_dim: int, dtype: torch.dtype) -> bool:
+    def _max_num_tokens_for_shape(
+        self,
+        hidden_dim: int,
+        dtype: torch.dtype,
+    ) -> int:
+        element_size = torch.tensor([], dtype=dtype, device="cpu").element_size()
+        return self.max_workspace_size // (hidden_dim * element_size)
+
+    def _ensure_workspace(
+        self,
+        hidden_dim: int,
+        dtype: torch.dtype,
+        max_num_tokens: int,
+    ) -> bool:
         """Ensure the all reduce workspace is initialized."""
-        if self.max_num_tokens == 0:
-            element_size = torch.tensor([], dtype=dtype, device="cpu").element_size()
-            self.max_num_tokens = self.max_workspace_size // (hidden_dim * element_size)
         workspace = get_fi_ar_workspace(
             world_size=self.world_size,
             rank=self.rank,
-            max_token_num=self.max_num_tokens,
+            max_token_num=max_num_tokens,
             hidden_dim=hidden_dim,
             dtype=dtype,
             group=self.group,
@@ -304,14 +314,13 @@ class FlashInferAllReduce:
             return False
 
         num_tokens, hidden_dim = input_tensor.shape
-        if not self.max_num_tokens:
-            element_size = torch.tensor([], dtype=input_tensor.dtype).element_size()
-            self.max_num_tokens = self.max_workspace_size // (hidden_dim * element_size)
+        max_num_tokens = self._max_num_tokens_for_shape(hidden_dim, input_tensor.dtype)
 
-        if num_tokens > self.max_num_tokens:
+        if num_tokens > max_num_tokens:
             return False
 
-        return self._ensure_workspace(hidden_dim, input_tensor.dtype)
+        self.max_num_tokens = max_num_tokens
+        return self._ensure_workspace(hidden_dim, input_tensor.dtype, max_num_tokens)
 
     def all_reduce(self, input_tensor: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = input_tensor.shape
@@ -323,12 +332,18 @@ class FlashInferAllReduce:
             dtype=input_tensor.dtype,
             group=self.group,
         )
+        launch_with_pdl = (
+            os.environ.get("VLLM_K26_FI_AR_STANDALONE_PDL", "1") != "0"
+        )
+        trigger_completion_at_end = num_tokens > PDL_ADVANCE_LAUNCH_TOKENS
+        if os.environ.get("VLLM_K26_FI_AR_STANDALONE_TRIGGER_AT_END", "0") == "1":
+            trigger_completion_at_end = True
         return flashinfer_comm.allreduce_fusion(
             input=input_tensor,
             workspace=workspace,
             pattern=flashinfer_comm.AllReduceFusionPattern.kAllReduce,
-            launch_with_pdl=True,
-            trigger_completion_at_end=num_tokens > PDL_ADVANCE_LAUNCH_TOKENS,
+            launch_with_pdl=launch_with_pdl,
+            trigger_completion_at_end=trigger_completion_at_end,
         )
 
     def destroy(self):

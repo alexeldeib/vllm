@@ -28,3 +28,12 @@ template <typename T, int kNumTokens, int kNumExperts, int kHiddenDim>
 void invokeNormRouterGemm(float* logits, __nv_bfloat16* normed_x, T const* x,
                           T const* norm_weight, T const* gate_weight, float eps,
                           cudaStream_t stream);
+
+template <int kNumTokens, int kNumExperts, int kHiddenDim>
+void invokeAddNormRouterGemm(float* logits, __nv_bfloat16* normed_x,
+                             __nv_bfloat16* residual_out,
+                             __nv_bfloat16 const* x,
+                             __nv_bfloat16 const* residual,
+                             __nv_bfloat16 const* norm_weight,
+                             __nv_bfloat16 const* gate_weight, float eps,
+                             cudaStream_t stream);

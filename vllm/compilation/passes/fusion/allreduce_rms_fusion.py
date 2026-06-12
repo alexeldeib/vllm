@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
+import os
 from importlib.util import find_spec
 from types import ModuleType
 from typing import Any
@@ -254,7 +255,7 @@ class FlashInferFusedAllReduceParams:
         max_token_num: int = 1024,
     ) -> None:
         self.world_size = world_size
-        self.launch_with_pdl = True
+        self.launch_with_pdl = os.environ.get("VLLM_K26_FI_AR_FUSION_PDL", "1") != "0"
         self.fp32_acc = True
         self.max_token_num = max_token_num
 

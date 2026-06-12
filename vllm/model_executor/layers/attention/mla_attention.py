@@ -1223,6 +1223,7 @@ class MLACommonPrefillMetadata:
         padded_local_chunk_seq_lens: list[list[int]] | None = None
         local_context_lens_allranks: list[list[int]] | None = None
         padded_local_cu_seq_lens: torch.Tensor | None = None
+        padded_local_token_to_seq: torch.Tensor | None = None
         cu_seq_lens_lst: list[list[int]] | None = None
         chunk_size: int | None = None
         prefill_tokens_with_context: int | None = None
@@ -1743,6 +1744,24 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         out=padded_local_cu_chunk_seq_lens_cpu[:, 1:],
                         dtype=torch.int32,
                     )
+                    padded_local_chunk_total_token = (
+                        padded_local_cu_chunk_seq_lens_cpu[:, -1]
+                    )
+                    max_padded_local_token_num_over_chunk = (
+                        padded_local_chunk_total_token.max().item()
+                    )
+                    padded_local_token_to_seq_tensor_cpu = torch.zeros(
+                        [num_chunks, max_padded_local_token_num_over_chunk],
+                        dtype=torch.int32,
+                    )
+                    for i in range(num_chunks):
+                        chunk_token_to_seq_tensor = torch.repeat_interleave(
+                            range_idx, padded_local_chunk_seq_lens[i]
+                        )
+                        chunk_len = chunk_token_to_seq_tensor.shape[0]
+                        padded_local_token_to_seq_tensor_cpu[i, :chunk_len] = (
+                            chunk_token_to_seq_tensor
+                        )
 
                 prefill_tokens_with_context = None
                 if num_prefills_with_context_cpu > 0:
@@ -1765,6 +1784,9 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                         padded_local_chunk_seq_lens=padded_local_chunk_seq_lens.tolist(),
                         local_context_lens_allranks=local_context_lens_allranks.tolist(),
                         padded_local_cu_seq_lens=padded_local_cu_chunk_seq_lens_cpu.to(
+                            device, non_blocking=True
+                        ),
+                        padded_local_token_to_seq=padded_local_token_to_seq_tensor_cpu.to(
                             device, non_blocking=True
                         ),
                         cu_seq_lens_lst=cu_seq_lens_cpu.tolist(),
@@ -2143,7 +2165,6 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         k_scale: torch.Tensor,
         dcp_world_size: int,
     ):
-        assert k_scale is None, "DCP not support scaled kvcache now."
         assert attn_metadata.prefill is not None
         prefill_metadata = attn_metadata.prefill
         assert prefill_metadata.prefill_backend is not None
@@ -2151,6 +2172,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
         assert prefill_metadata.chunked_context.padded_local_chunk_seq_lens is not None
         assert prefill_metadata.chunked_context.local_context_lens_allranks is not None
         assert prefill_metadata.chunked_context.padded_local_cu_seq_lens is not None
+        assert prefill_metadata.chunked_context.padded_local_token_to_seq is not None
         assert prefill_metadata.chunked_context.cu_seq_lens_lst is not None
         assert prefill_metadata.chunked_context.chunk_size is not None
 
@@ -2161,16 +2183,37 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
 
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            ops.cp_gather_cache(
-                src_cache=kv_c_and_k_pe_cache,
-                dst=workspace,
-                block_table=prefill_metadata.block_table,
-                cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
-                    i
-                ],
-                batch_size=attn_metadata.num_prefills,
-                seq_starts=prefill_metadata.chunked_context.starts[i],
-            )
+            if kv_c_and_k_pe_cache.dtype == workspace.dtype:
+                ops.cp_gather_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
+                        i
+                    ],
+                    batch_size=attn_metadata.num_prefills,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
+            else:
+                assert k_scale is not None, (
+                    "DCP with quantized MLA KV cache requires a KV scale "
+                    "for dequantizing gathered context."
+                )
+                ops.gather_and_maybe_dequant_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.padded_local_cu_seq_lens[
+                        i
+                    ],
+                    token_to_seq=prefill_metadata.chunked_context.padded_local_token_to_seq[
+                        i
+                    ],
+                    num_tokens=toks,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=k_scale,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
             # workspace
             # |------- N tokens --------|--------- N*dcp_size tokens ----------|
             # |<- use for local_gather ->|<--------- use for allgather -------->|
@@ -2292,7 +2335,7 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                         q,
                         kv_c_and_k_pe_cache,
                         attn_metadata,
-                        k_scale=None,
+                        k_scale=k_scale,
                         dcp_world_size=self.dcp_world_size,
                     )
                 )

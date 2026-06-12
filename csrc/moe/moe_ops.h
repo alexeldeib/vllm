@@ -83,4 +83,11 @@ void dsv3_router_gemm(torch::Tensor& output, const torch::Tensor& mat_a,
 void dsv4_norm_router_gemm(at::Tensor& logits, at::Tensor& normed_x,
                            at::Tensor const& x, at::Tensor const& norm_weight,
                            at::Tensor const& gate_weight, double eps);
+
+// Fused residual add + RMSNorm + router GEMV for the same DSV4-Pro shape.
+// Produces normed_x, residual_out, and fp32 router logits in one launch.
+void dsv4_add_norm_router_gemm(
+    at::Tensor& logits, at::Tensor& normed_x, at::Tensor& residual_out,
+    at::Tensor const& x, at::Tensor const& residual,
+    at::Tensor const& norm_weight, at::Tensor const& gate_weight, double eps);
 #endif
