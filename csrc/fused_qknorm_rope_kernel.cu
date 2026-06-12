@@ -306,6 +306,177 @@ __global__ void fusedQKNormRopeKernel(
 #endif
 }
 
+// Specialized one-warp-per-head kernel for K2.6 DFlash head_dim=112.
+// The generic kernel requires head_dim % 64 == 0 so every lane owns an even
+// number of elements. For 112, lanes 0..27 own four elements each and lanes
+// 28..31 only participate in warp collectives.
+template <typename scalar_t_in, typename scalar_t_cache, bool interleave>
+__global__ void fusedQKNormRopeKernel112(
+    void* qkv_void,                  // Combined QKV tensor
+    int const num_heads_q,           // Number of query heads
+    int const num_heads_k,           // Number of key heads
+    int const num_heads_v,           // Number of value heads
+    float const eps,                 // Epsilon for RMS normalization
+    void const* q_weight_void,       // RMSNorm weights for query
+    void const* k_weight_void,       // RMSNorm weights for key
+    void const* cos_sin_cache_void,  // Pre-computed cos/sin cache
+    int64_t const* position_ids,     // Position IDs for RoPE
+    int const num_tokens,            // Number of tokens
+    int const rotary_dim             // Dimension for RoPE
+) {
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
+  if constexpr ((std::is_same_v<scalar_t_in, c10::BFloat16>) ||
+                std::is_same_v<scalar_t_cache, c10::BFloat16>) {
+    return;
+  } else {
+#endif
+
+    static constexpr int head_dim_112 = 112;
+    static constexpr int elems_per_lane = 4;
+    using Converter = vllm::_typeConvert<scalar_t_in>;
+    static_assert(Converter::exists,
+                  "Input QKV data type is not supported for this CUDA "
+                  "architecture or toolkit version.");
+    using T_in = typename Converter::hip_type;
+
+    using CacheConverter = vllm::_typeConvert<scalar_t_cache>;
+    static_assert(CacheConverter::exists,
+                  "Cache data type is not supported for this CUDA architecture "
+                  "or toolkit version.");
+    using T_cache = typename CacheConverter::hip_type;
+
+    T_in* qkv = reinterpret_cast<T_in*>(qkv_void);
+    T_in const* q_weight = reinterpret_cast<T_in const*>(q_weight_void);
+    T_in const* k_weight = reinterpret_cast<T_in const*>(k_weight_void);
+    T_cache const* cos_sin_cache =
+        reinterpret_cast<T_cache const*>(cos_sin_cache_void);
+
+    int const warpsPerBlock = blockDim.x / 32;
+    int const warpId = threadIdx.x / 32;
+    int const laneId = threadIdx.x % 32;
+    int const globalWarpIdx = blockIdx.x * warpsPerBlock + warpId;
+
+    int const total_qk_heads = num_heads_q + num_heads_k;
+    int const tokenIdx = globalWarpIdx / total_qk_heads;
+    int const localHeadIdx = globalWarpIdx % total_qk_heads;
+    if (tokenIdx >= num_tokens) return;
+
+    bool const isQ = localHeadIdx < num_heads_q;
+    int const headIdx = isQ ? localHeadIdx : localHeadIdx - num_heads_q;
+    int const num_heads = num_heads_q + num_heads_k + num_heads_v;
+
+    int64_t const tokenOffset =
+        static_cast<int64_t>(tokenIdx) * num_heads * head_dim_112;
+    int64_t const offsetWarp =
+        isQ ? tokenOffset + static_cast<int64_t>(headIdx) * head_dim_112
+            : tokenOffset +
+                  static_cast<int64_t>(num_heads_q + headIdx) * head_dim_112;
+
+    float elements[elems_per_lane];
+    float sumOfSquares = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < elems_per_lane; ++i) {
+      int const dim = laneId * elems_per_lane + i;
+      float val = 0.0f;
+      if (dim < head_dim_112) {
+        val = Converter::convert(qkv[offsetWarp + dim]);
+        sumOfSquares += val * val;
+      }
+      elements[i] = val;
+    }
+
+    sumOfSquares = tensorrt_llm::common::warpReduceSum(sumOfSquares);
+    float rms_rcp =
+        rsqrtf(sumOfSquares / static_cast<float>(head_dim_112) + eps);
+
+#pragma unroll
+    for (int i = 0; i < elems_per_lane; ++i) {
+      int const dim = laneId * elems_per_lane + i;
+      if (dim < head_dim_112) {
+        float const weight = isQ ? Converter::convert(q_weight[dim])
+                                 : Converter::convert(k_weight[dim]);
+        elements[i] *= rms_rcp * weight;
+      }
+    }
+
+    int64_t const pos_id = position_ids[tokenIdx];
+    T_cache const* cache_ptr = cos_sin_cache + pos_id * rotary_dim;
+    int const embed_dim = rotary_dim / 2;
+    T_cache const* cos_ptr = cache_ptr;
+    T_cache const* sin_ptr = cache_ptr + embed_dim;
+
+    if constexpr (interleave) {
+#pragma unroll
+      for (int i = 0; i < elems_per_lane; i += 2) {
+        int const dim0 = laneId * elems_per_lane + i;
+        int const dim1 = dim0 + 1;
+        if (dim1 < rotary_dim) {
+          float const val0 = elements[i];
+          float const val1 = elements[i + 1];
+          int const half_dim = dim0 / 2;
+          float const cos_val =
+              CacheConverter::convert(VLLM_LDG(cos_ptr + half_dim));
+          float const sin_val =
+              CacheConverter::convert(VLLM_LDG(sin_ptr + half_dim));
+          elements[i] = val0 * cos_val - val1 * sin_val;
+          elements[i + 1] = val0 * sin_val + val1 * cos_val;
+        }
+      }
+    } else {
+      __syncwarp();
+      float rotated[elems_per_lane];
+#pragma unroll
+      for (int i = 0; i < elems_per_lane; ++i) {
+        rotated[i] = elements[i];
+      }
+#pragma unroll
+      for (int i = 0; i < elems_per_lane; ++i) {
+        int const dim = laneId * elems_per_lane + i;
+        bool const in_rotary = dim < rotary_dim;
+        bool const first_half = dim < embed_dim;
+        int const partner_dim =
+            in_rotary ? (first_half ? dim + embed_dim : dim - embed_dim) : 0;
+        int const partner_lane = partner_dim / elems_per_lane;
+        int const partner_slot = partner_dim - partner_lane * elems_per_lane;
+        float partner = 0.0f;
+#pragma unroll
+        for (int j = 0; j < elems_per_lane; ++j) {
+          // All lanes named in FINAL_MASK must execute the shuffle.
+          float const candidate =
+              __shfl_sync(FINAL_MASK, elements[j], partner_lane);
+          if (in_rotary && partner_slot == j) partner = candidate;
+        }
+        if (in_rotary) {
+          int const half_dim = first_half ? dim : dim - embed_dim;
+          float const cos_val =
+              CacheConverter::convert(VLLM_LDG(cos_ptr + half_dim));
+          float const sin_val =
+              CacheConverter::convert(VLLM_LDG(sin_ptr + half_dim));
+          rotated[i] =
+              elements[i] * cos_val + (first_half ? -partner : partner) * sin_val;
+        }
+      }
+      __syncwarp();
+#pragma unroll
+      for (int i = 0; i < elems_per_lane; ++i) {
+        elements[i] = rotated[i];
+      }
+    }
+
+#pragma unroll
+    for (int i = 0; i < elems_per_lane; ++i) {
+      int const dim = laneId * elems_per_lane + i;
+      if (dim < head_dim_112) {
+        qkv[offsetWarp + dim] = Converter::convert(elements[i]);
+      }
+    }
+
+#if (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800) && !defined(USE_ROCM)
+  }
+#endif
+}
+
 // Multi-token-head kernel: one warp processes HEADS_PER_WARP token-heads for
 // the same token, sharing cos/sin from shared memory via cp.async.
 // When HEADS_PER_WARP > 1 the warp reuses the loaded cos/sin across all heads,
@@ -572,6 +743,14 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens,
                 k_weight, cos_sin_cache, position_ids, num_tokens, rotary_dim);
       });
       break;
+    case 112:
+      DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
+        fusedQKNormRopeKernel112<scalar_t_in, scalar_t_cache, INTERLEAVE>
+            <<<gridDim, blockDim, 0, stream>>>(
+                qkv, num_heads_q, num_heads_k, num_heads_v, eps, q_weight,
+                k_weight, cos_sin_cache, position_ids, num_tokens, rotary_dim);
+      });
+      break;
     case 128:
       DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
         fusedQKNormRopeKernel<scalar_t_in, scalar_t_cache, 128, INTERLEAVE>
@@ -611,6 +790,16 @@ void launchFusedQKNormRopeNTokenHeads(
 
   // token_heads_per_warp == 1: delegate to the 1-head baseline kernel.
   if (token_heads_per_warp == 1) {
+    launchFusedQKNormRope<scalar_t_in, scalar_t_cache>(
+        qkv, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim,
+        rotary_dim, eps, q_weight, k_weight, cos_sin_cache, interleave,
+        position_ids, stream);
+    return;
+  }
+
+  // The 112-specialization uses a ragged 28-lane mapping and has only been
+  // validated for one token-head per warp.
+  if (head_dim == 112) {
     launchFusedQKNormRope<scalar_t_in, scalar_t_cache>(
         qkv, num_tokens, num_heads_q, num_heads_k, num_heads_v, head_dim,
         rotary_dim, eps, q_weight, k_weight, cos_sin_cache, interleave,
