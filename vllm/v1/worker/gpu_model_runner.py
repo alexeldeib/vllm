@@ -4265,6 +4265,33 @@ class GPUModelRunner(
 
                 sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states)
+                import os as _osn
+
+                if _osn.environ.get("VLLM_DBG_NAN"):
+                    try:
+                        _hs = hidden_states
+                        _hsn = (
+                            int(torch.isnan(_hs).any())
+                            if isinstance(_hs, torch.Tensor)
+                            else -1
+                        )
+                        _shn = int(torch.isnan(sample_hidden_states).any())
+                        _lgn = (
+                            int(torch.isnan(logits).any())
+                            if logits is not None
+                            else -9
+                        )
+                        logger.warning(
+                            "DBG NAN hidden_states=%d sample_hs=%d logits=%d "
+                            "hs_shape=%s logits_rows=%s",
+                            _hsn,
+                            _shn,
+                            _lgn,
+                            tuple(_hs.shape) if isinstance(_hs, torch.Tensor) else None,
+                            logits.shape[0] if logits is not None else None,
+                        )
+                    except Exception as _en:  # noqa: BLE001
+                        logger.warning("DBG NAN err=%s", _en)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4359,9 +4386,40 @@ class GPUModelRunner(
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
+            import os as _os
+
+            if _os.environ.get("VLLM_DBG_SAMPLE"):
+                _lf = logits.float()
+                _finite = torch.isfinite(_lf).sum(dim=-1).tolist()
+                _tok0_inf = torch.isinf(_lf[:, 0]).tolist()
+                _sd = (
+                    spec_decode_metadata.num_draft_tokens
+                    if spec_decode_metadata is not None
+                    else None
+                )
+                logger.warning(
+                    "DBG premask logits_rows=%d finite_per_row=%s tok0_inf=%s "
+                    "num_draft=%s",
+                    logits.shape[0],
+                    _finite[:12],
+                    _tok0_inf[:12],
+                    _sd,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+            import os as _os2
+
+            if _os2.environ.get("VLLM_DBG_SAMPLE"):
+                try:
+                    _st = sampler_output.sampled_token_ids
+                    logger.warning(
+                        "DBG sampled shape=%s vals=%s",
+                        tuple(_st.shape),
+                        _st.flatten()[:16].tolist(),
+                    )
+                except Exception as _e:  # noqa: BLE001
+                    logger.warning("DBG sampled err=%s", _e)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output

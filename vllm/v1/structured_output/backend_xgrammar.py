@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -179,6 +180,25 @@ class XgrammarGrammar(StructuredOutputGrammar):
             if self._terminated_at is None and self.matcher.is_terminated():
                 self._terminated_at = self.num_processed_tokens
         self._is_terminated = self._terminated_at is not None
+        if os.environ.get("VLLM_DBG_SAMPLE"):
+            _al = -1
+            if not self._is_terminated:
+                try:
+                    import numpy as _np
+
+                    _bm = xgr.allocate_token_bitmask(1, self.vocab_size)
+                    self.matcher.fork().fill_next_token_bitmask(_bm, 0)
+                    _al = int(_np.unpackbits(_bm.numpy().view("uint8")).sum())
+                except Exception as _e:  # noqa: BLE001
+                    _al = -2
+            logger.warning(
+                "DBG accept req=%s tokens=%s np=%d term=%s allowed_after=%d",
+                request_id,
+                tokens,
+                self.num_processed_tokens,
+                self._is_terminated,
+                _al,
+            )
         return True
 
     def validate_tokens(self, tokens: list[int]) -> list[int]:
