@@ -233,6 +233,12 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             kv_sharing_target_layer_name,
             **mla_args,
         )
+        # FLASHMLA descales with the `_q_scale` tensor (descale_q below), so opt
+        # into the per-step dynamic decode-query scale: it fixes fp8 saturation
+        # -> NaN on OOD long-context queries and stays CUDA-graph safe (the
+        # buffer is updated in place, no host sync, and the kernel already reads
+        # the tensor).
+        self.supports_dynamic_query_scale = True
 
         is_supported, reason = is_flashmla_dense_supported()
         assert is_supported, reason

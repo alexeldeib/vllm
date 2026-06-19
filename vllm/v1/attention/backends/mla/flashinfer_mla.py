@@ -150,8 +150,13 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             )
 
         self._workspace_buffer = g_fi_workspace
-        self.bmm1_scale: float | None = None
+        self.bmm1_scale: float | torch.Tensor | None = None
         self.bmm2_scale: float | None = None
+        # Use a per-step, on-device dynamic decode-query FP8 scale to avoid
+        # fp8 saturation -> NaN on OOD long-context queries (the trtllm MLA
+        # decode kernel accepts a tensor bmm1_scale, so this stays CUDA-graph
+        # safe with no host sync).
+        self.supports_dynamic_query_scale = True
 
     def forward_mqa(
         self,
@@ -178,10 +183,16 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         else:
             q = q.view(attn_metadata.num_decodes, -1, q.shape[-2], q.shape[-1])
 
-        if self.bmm1_scale is None:
-            self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+        # Recompute the bmm1 descale every step rather than caching it: the
+        # decode-query FP8 scale is refreshed per step on device (see the
+        # MLAAttention decode path), so descale with the `_q_scale` tensor --
+        # not the host-synced `_q_scale_float` -- to stay CUDA-graph safe with
+        # no per-step sync. The trtllm MLA decode kernel accepts a tensor
+        # bmm1_scale. bmm2_scale depends only on the static k-scale, so it can
+        # still be cached.
+        bmm1_scale: float | torch.Tensor = self.scale
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            bmm1_scale = self.scale * layer._q_scale * layer._k_scale
 
         if self.bmm2_scale is None:
             self.bmm2_scale = 1.0
@@ -198,7 +209,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             block_tables=attn_metadata.decode.block_table,
             seq_lens=attn_metadata.decode.seq_lens,
             max_seq_len=attn_metadata.max_seq_len,
-            bmm1_scale=self.bmm1_scale,
+            bmm1_scale=bmm1_scale,
             bmm2_scale=self.bmm2_scale,
         )
 

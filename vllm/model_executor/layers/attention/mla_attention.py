@@ -773,6 +773,26 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
+                if self.impl.supports_dynamic_query_scale:
+                    # Recompute the decode-query FP8 scale per step from the
+                    # live query amax. The default `_q_scale` is uncalibrated
+                    # (`calc_kv_scales` runs at most once and only when
+                    # `calculate_kv_scales` is set), so an out-of-distribution
+                    # long-context decode query can exceed `scale *
+                    # FP8_E4M3_MAX`, saturate, and collapse the logits to a
+                    # single repeated token. Update the `_q_scale` buffer in
+                    # place so the new scale stays on device (no host sync) and
+                    # remains valid under CUDA graphs; the backend descales with
+                    # the `_q_scale` tensor (see FlashInferMLAImpl).
+                    q_amax = torch.maximum(
+                        mqa_ql_nope.abs().max(), mqa_q_pe.abs().max()
+                    )
+                    # `q_range` mirrors `calc_kv_scales`' `getattr` fallback so a
+                    # layer without it degrades to a safe (conservative) scale
+                    # instead of raising. Float default avoids a CPU/GPU
+                    # device-mismatch in the division with the on-device amax.
+                    q_range = getattr(self, "q_range", 1.0)
+                    self._q_scale.copy_(q_amax / q_range)
                 mqa_q = self._decode_concat_quant_fp8_op(
                     mqa_ql_nope, mqa_q_pe, self._q_scale
                 )

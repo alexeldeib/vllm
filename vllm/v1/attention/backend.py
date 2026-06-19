@@ -736,6 +736,12 @@ class AttentionImplBase(ABC, Generic[T]):
     # https://github.com/vllm-project/vllm/issues/25584
     supports_quant_query_input: bool = False
 
+    # If True, MLAAttention recomputes the decode-query FP8 scale per step from
+    # the live query amax (on device, no host sync) instead of using the static
+    # `_q_scale`; the backend must then descale with the `_q_scale` tensor.
+    # Prevents fp8 saturation -> NaN on OOD long-context queries.
+    supports_dynamic_query_scale: bool = False
+
     dcp_world_size: int
     dcp_rank: int
 
