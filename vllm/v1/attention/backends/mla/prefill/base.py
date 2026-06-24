@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Abstract base class for MLA prefill backends."""
 
+import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
@@ -32,6 +33,11 @@ class MLADimensions:
             f"qk_rope_head_dim={self.qk_rope_head_dim}, "
             f"v_head_dim={self.v_head_dim})"
         )
+
+
+def flashinfer_log2_lse_to_natural_lse(lse: torch.Tensor) -> torch.Tensor:
+    """Convert FlashInfer's base-2 LSE to vLLM's natural-log LSE."""
+    return lse * math.log(2.0)
 
 
 class MLAPrefillBackend(ABC):

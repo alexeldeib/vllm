@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.v1.attention.backends.mla.prefill.base import (
     MLADimensions,
     MLAPrefillBackend,
+    flashinfer_log2_lse_to_natural_lse,
 )
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -90,6 +91,12 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
         self._query_seq_lens = (
             prefill_metadata.query_start_loc[1:] - prefill_metadata.query_start_loc[:-1]
         )
+        self._query_seq_lens_cpu = (
+            prefill_metadata.query_start_loc_cpu[1:]
+            - prefill_metadata.query_start_loc_cpu[:-1]
+            if prefill_metadata.query_start_loc_cpu is not None
+            else None
+        )
 
     def run_prefill_new_tokens(
         self,
@@ -129,11 +136,14 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             is_causal=True,
             return_lse=return_softmax_lse,
             out=out,
+            q_seq_lens_cpu=self._query_seq_lens_cpu,
+            kv_seq_lens_cpu=self._query_seq_lens_cpu,
         )
 
         if isinstance(ret, tuple):
             # Convert from (q_len, num_heads) to (num_heads, q_len)
-            return ret[0], ret[1].transpose(0, 1).contiguous()
+            lse = flashinfer_log2_lse_to_natural_lse(ret[1])
+            return ret[0], lse.transpose(0, 1).contiguous()
         return ret
 
     def run_prefill_context_chunk(
@@ -179,7 +189,10 @@ class TrtllmRaggedPrefillBackend(MLAPrefillBackend):
             is_causal=False,
             return_lse=True,
             out=out,
+            q_seq_lens_cpu=self._query_seq_lens_cpu,
+            kv_seq_lens_cpu=self._prefill_metadata.chunked_context.seq_lens[chunk_idx],
         )
 
         # Convert from (q_len, num_heads) to (num_heads, q_len)
+        lse = flashinfer_log2_lse_to_natural_lse(lse)
         return attn_out, lse.transpose(0, 1).contiguous()
