@@ -10,6 +10,7 @@ import vllm.envs as envs
 from vllm.v1.attention.backends.mla.prefill.base import (
     MLADimensions,
     MLAPrefillBackend,
+    flashinfer_lse_to_softmax_lse,
 )
 from vllm.v1.attention.backends.utils import (
     PerLayerParameters,
@@ -211,7 +212,8 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
 
         if isinstance(ret, tuple):
             # Convert from (q_len, num_heads) to (num_heads, q_len)
-            return ret[0], ret[1].transpose(0, 1).contiguous()
+            lse = flashinfer_lse_to_softmax_lse(ret[1])
+            return ret[0], lse.transpose(0, 1).contiguous()
         return ret
 
     def run_prefill_context_chunk(
@@ -229,4 +231,5 @@ class FlashInferPrefillBackend(MLAPrefillBackend):
         )
 
         # Convert from (q_len, num_heads) to (num_heads, q_len)
+        lse = flashinfer_lse_to_softmax_lse(lse)
         return attn_out, lse.transpose(0, 1).contiguous()
