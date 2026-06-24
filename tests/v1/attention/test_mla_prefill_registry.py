@@ -5,7 +5,10 @@
 import pytest
 import torch
 
-from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
+from vllm.v1.attention.backends.mla.prefill.base import (
+    MLAPrefillBackend,
+    flashinfer_lse_to_softmax_lse,
+)
 from vllm.v1.attention.backends.mla.prefill.registry import (
     MLAPrefillBackendEnum,
     register_mla_prefill_backend,
@@ -133,3 +136,12 @@ def test_clear_override():
 def test_unknown_backend_name_raises():
     with pytest.raises(ValueError, match="Unknown MLA prefill backend"):
         MLAPrefillBackendEnum["NONEXISTENT"]
+
+
+def test_flashinfer_lse_to_softmax_lse_converts_base2_to_natural_log():
+    flashinfer_lse = torch.tensor([[0.0, 1.0, 8.0, -float("inf")]], dtype=torch.float32)
+
+    softmax_lse = flashinfer_lse_to_softmax_lse(flashinfer_lse)
+
+    expected = torch.log(torch.tensor(2.0)) * flashinfer_lse
+    torch.testing.assert_close(softmax_lse, expected)

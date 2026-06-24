@@ -8,6 +8,8 @@ Known Issues:
   test_backend_correctness[small_prefill], but passes when run alone.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -332,6 +334,8 @@ class MockSparseMLAAttentionLayer:
 
         # Scale attributes needed by attention backends
         self._q_scale = torch.tensor(q_scale, device=device)
+        self._decode_q_scale = torch.tensor(1.0, device=device)
+        self._decode_q_range = 200.0
         self._k_scale = torch.tensor(k_scale, device=device)
         self._v_scale = torch.tensor(float("nan"), device=device)
         self._prob_scale = torch.tensor(1.0, device=device)
@@ -463,6 +467,8 @@ class MockMLAAttentionLayer(MLAAttention):
 
         # Scale attributes needed by attention backends
         self._q_scale = torch.tensor(q_scale, device=device)
+        self._decode_q_scale = torch.tensor(1.0, device=device)
+        self._decode_q_range = 200.0
         self._k_scale = torch.tensor(k_scale, device=device)
         self._v_scale = torch.tensor(float("nan"), device=device)
         self._prob_scale = torch.tensor(1.0, device=device)
@@ -549,9 +555,16 @@ class MockMLAAttentionLayer(MLAAttention):
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-                mqa_q = self._decode_concat_quant_fp8_op(
-                    mqa_ql_nope, mqa_q_pe, self._q_scale
-                )
+                q_scale = self._q_scale
+                if self.impl.supports_dynamic_query_scale:
+                    q_amax = torch.maximum(
+                        mqa_ql_nope.abs().max(), mqa_q_pe.abs().max()
+                    )
+                    self._decode_q_scale.copy_(
+                        (q_amax / self._decode_q_range).clamp_min(1e-12)
+                    )
+                    q_scale = self._decode_q_scale
+                mqa_q = self._decode_concat_quant_fp8_op(mqa_ql_nope, mqa_q_pe, q_scale)
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
             if self.impl.dcp_world_size > 1:
@@ -782,6 +795,105 @@ def test_flashmla_dcp_decode_metadata_uses_gathered_query_heads(
         assert metadata.scheduler_metadata.tile_scheduler_metadata is None
         assert metadata.scheduler_metadata.num_splits is None
         assert fp8_call is None
+
+
+class _CaptureDecodeQuant:
+    def __init__(self):
+        self.scale: torch.Tensor | None = None
+
+    def __call__(
+        self,
+        decode_ql_nope: torch.Tensor,
+        decode_q_pe: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        self.scale = scale.detach().clone()
+        return torch.empty(
+            *decode_ql_nope.shape[:-1],
+            decode_ql_nope.shape[-1] + decode_q_pe.shape[-1],
+            device=decode_ql_nope.device,
+            dtype=torch.float8_e4m3fn,
+        )
+
+
+class _DynamicScaleMLAImpl:
+    kv_cache_dtype = "fp8_e4m3"
+    supports_quant_query_input = True
+    supports_dynamic_query_scale = True
+    dcp_world_size = 1
+
+    def forward_mqa(self, q, kv_cache, attn_metadata, layer):
+        assert isinstance(q, torch.Tensor)
+        return torch.zeros(
+            attn_metadata.num_decode_tokens,
+            layer.num_heads,
+            layer.kv_lora_rank,
+            device=q.device,
+            dtype=torch.float32,
+        ), None
+
+
+def test_mla_decode_dynamic_query_scale_uses_post_projection_amax():
+    device = torch.device("cpu")
+    num_heads = 1
+    qk_nope_head_dim = 2
+    qk_rope_head_dim = 1
+    v_head_dim = 1
+    kv_lora_rank = 2
+
+    kv_b_proj_weight_t = torch.zeros(
+        kv_lora_rank, num_heads, qk_nope_head_dim + v_head_dim, device=device
+    )
+    kv_b_proj_weight_t[:, 0, :qk_nope_head_dim] = torch.eye(
+        kv_lora_rank, qk_nope_head_dim, device=device
+    )
+    kv_b_proj = SimpleNamespace(
+        weight=kv_b_proj_weight_t.reshape(kv_lora_rank, -1).T.contiguous()
+    )
+
+    layer = MockMLAAttentionLayer(
+        impl=_DynamicScaleMLAImpl(),
+        num_heads=num_heads,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        v_head_dim=v_head_dim,
+        kv_lora_rank=kv_lora_rank,
+        device=device,
+        kv_b_proj=kv_b_proj,
+        q_scale=1.0,
+        k_scale=0.25,
+    )
+    capture_quant = _CaptureDecodeQuant()
+    layer._decode_concat_quant_fp8_op = capture_quant
+
+    q = torch.tensor(
+        [
+            [[400.0, -200.0, 20.0]],
+            [[-20.0, 30.0, -10.0]],
+        ],
+        device=device,
+    )
+    attn_metadata = SimpleNamespace(
+        num_decode_tokens=2,
+        num_decodes=2,
+        num_prefills=0,
+    )
+    output = torch.empty(2, num_heads * v_head_dim, device=device)
+
+    layer.forward_impl(
+        q=q,
+        kv_c=torch.empty(0, kv_lora_rank, device=device),
+        k_pe=torch.empty(0, 1, qk_rope_head_dim, device=device),
+        kv_cache=torch.empty(0, device=device),
+        attn_metadata=attn_metadata,
+        output=output,
+    )
+
+    assert capture_quant.scale is not None
+    torch.testing.assert_close(capture_quant.scale, torch.tensor(2.0))
+    torch.testing.assert_close(layer._decode_q_scale, torch.tensor(2.0))
+    torch.testing.assert_close(layer._q_scale, torch.tensor(1.0))
+    assert layer._q_scale_float == 1.0
 
 
 def run_attention_backend(

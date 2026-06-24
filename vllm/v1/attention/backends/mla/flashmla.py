@@ -262,6 +262,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 "are not implemented for "
                 "FlashMLAImpl"
             )
+        self.supports_dynamic_query_scale = True
 
     def forward_mqa(
         self,
@@ -325,7 +326,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 num_splits=scheduler_metadata.num_splits,
                 softmax_scale=self.scale,
                 causal=True,
-                descale_q=layer._q_scale.reshape(1),
+                descale_q=layer._decode_q_scale.reshape(1),
                 descale_k=layer._k_scale.reshape(1),
             )
         else:

@@ -437,6 +437,12 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         self.kv_cache_dtype = kv_cache_dtype
         self.calculate_kv_scales = calculate_kv_scales
         _init_kv_cache_quant(self, quant_config, prefix)
+        self.register_buffer(
+            "_decode_q_scale",
+            torch.tensor(1.0, dtype=torch.float32),
+            persistent=False,
+        )
+        self._decode_q_range = float(envs.Q_SCALE_CONSTANT)
 
         if (
             cache_config is not None
@@ -794,9 +800,16 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             if fp8_attention and self.impl.supports_quant_query_input:
                 assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]
                 assert mqa_ql_nope.shape[1] == mqa_q_pe.shape[1]
-                mqa_q = self._decode_concat_quant_fp8_op(
-                    mqa_ql_nope, mqa_q_pe, self._q_scale
-                )
+                q_scale = self._q_scale
+                if self.impl.supports_dynamic_query_scale:
+                    q_amax = torch.maximum(
+                        mqa_ql_nope.abs().max(), mqa_q_pe.abs().max()
+                    )
+                    self._decode_q_scale.copy_(
+                        (q_amax / self._decode_q_range).clamp_min(1e-12)
+                    )
+                    q_scale = self._decode_q_scale
+                mqa_q = self._decode_concat_quant_fp8_op(mqa_ql_nope, mqa_q_pe, q_scale)
             else:
                 mqa_q = (mqa_ql_nope, mqa_q_pe)
             if self.impl.dcp_world_size > 1:

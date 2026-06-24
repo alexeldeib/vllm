@@ -714,6 +714,7 @@ class AttentionMetadataBuilder(ABC, Generic[M]):
 
 class AttentionLayer(Protocol):
     _q_scale: torch.Tensor
+    _decode_q_scale: torch.Tensor
     _k_scale: torch.Tensor
     _v_scale: torch.Tensor
     _q_scale_float: float
@@ -767,6 +768,11 @@ class AttentionImplBase(ABC, Generic[T]):
     # TODO add support to more backends:
     # https://github.com/vllm-project/vllm/issues/25584
     supports_quant_query_input: bool = False
+
+    # Whether an MLA backend can consume a per-step decode query FP8 scale.
+    # Backends that set this must read the tensor scale supplied by the layer
+    # for the same decode step instead of cached host-side _q_scale_float.
+    supports_dynamic_query_scale: bool = False
 
     dcp_world_size: int
     dcp_rank: int

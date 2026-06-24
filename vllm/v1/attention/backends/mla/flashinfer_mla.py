@@ -158,8 +158,8 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             )
 
         self._workspace_buffer = g_fi_workspace
-        self.bmm1_scale: float | None = None
         self.bmm2_scale: float | None = None
+        self.supports_dynamic_query_scale = True
 
     def forward_mqa(
         self,
@@ -186,10 +186,9 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         else:
             q = q.view(attn_metadata.num_decodes, -1, q.shape[-2], q.shape[-1])
 
-        if self.bmm1_scale is None:
-            self.bmm1_scale = self.scale
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+        bmm1_scale: float | torch.Tensor = self.scale
+        if is_quantized_kv_cache(self.kv_cache_dtype):
+            bmm1_scale = self.scale * layer._decode_q_scale * layer._k_scale
 
         if self.bmm2_scale is None:
             self.bmm2_scale = 1.0
@@ -206,7 +205,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             block_tables=attn_metadata.decode.block_table,
             seq_lens=attn_metadata.decode.seq_lens,
             max_seq_len=attn_metadata.max_seq_len,
-            bmm1_scale=self.bmm1_scale,
+            bmm1_scale=bmm1_scale,
             bmm2_scale=self.bmm2_scale,
         )
 
