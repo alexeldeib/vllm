@@ -4,8 +4,12 @@
 from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
+from openai.types.responses import ToolChoiceFunction
 from transformers import PreTrainedTokenizerBase
 
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionNamedToolChoiceParam,
+)
 from vllm.entrypoints.openai.engine.protocol import DeltaMessage
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParser
 from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
@@ -13,6 +17,52 @@ from vllm.reasoning.identity_reasoning_parser import IdentityReasoningParser
 if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
+
+_PRESERVED_STRUCTURED_OUTPUT_ATTR = "_vllm_kimi_structured_text_output_contract"
+
+
+def _has_non_structural_output_constraint(structured_outputs: object) -> bool:
+    return structured_outputs is not None and any(
+        getattr(structured_outputs, field, None) is not None
+        for field in ("json", "regex", "choice", "grammar", "json_object")
+    )
+
+
+def _request_has_structured_text_output_contract(request: object) -> bool:
+    if getattr(request, _PRESERVED_STRUCTURED_OUTPUT_ATTR, False):
+        return True
+
+    response_format = getattr(request, "response_format", None)
+    if response_format is not None and getattr(response_format, "type", None) not in (
+        "text",
+        "structural_tag",
+    ):
+        return True
+
+    if _has_non_structural_output_constraint(
+        getattr(request, "structured_outputs", None)
+    ):
+        return True
+
+    text_config = getattr(request, "text", None)
+    text_format = getattr(text_config, "format", None)
+    return text_format is not None and getattr(text_format, "type", None) not in (
+        "text",
+        "structural_tag",
+    )
+
+
+def _request_requires_tool_output(request: object) -> bool:
+    tool_choice = getattr(request, "tool_choice", None)
+    return tool_choice == "required" or isinstance(
+        tool_choice, (ToolChoiceFunction, ChatCompletionNamedToolChoiceParam)
+    )
+
+
+def _request_has_machine_output_contract(request: object) -> bool:
+    return _request_has_structured_text_output_contract(
+        request
+    ) or _request_requires_tool_output(request)
 
 
 class KimiK2ReasoningParser(ReasoningParser):
@@ -72,6 +122,89 @@ class KimiK2ReasoningParser(ReasoningParser):
     @property
     def reasoning_end_str(self) -> str | None:
         return self._end_token
+
+    def _output_starts_with_reasoning_boundary(
+        self,
+        text: str,
+        *,
+        allow_prefix: bool = False,
+    ) -> bool:
+        stripped = text.lstrip()
+        if not stripped:
+            return False
+
+        for boundary in (self._start_token, self._end_token):
+            if stripped.startswith(boundary) or (
+                allow_prefix and boundary.startswith(stripped)
+            ):
+                return True
+        return False
+
+    def _output_starts_with_machine_output_contract(
+        self,
+        text: str,
+        request: "ChatCompletionRequest | ResponsesRequest",
+    ) -> bool:
+        if not _request_has_machine_output_contract(request):
+            return False
+
+        if self._output_starts_with_reasoning_boundary(text):
+            return False
+
+        stripped = text.lstrip()
+        if not stripped:
+            return False
+
+        if _request_requires_tool_output(
+            request
+        ) and not _request_has_structured_text_output_contract(request):
+            return any(
+                stripped.startswith(prefix)
+                for prefix in (
+                    "[",
+                    "{",
+                    "<|tool_calls_section_begin|>",
+                    "<|tool_call_begin|>",
+                )
+            )
+
+        return True
+
+    def adjust_request(
+        self, request: "ChatCompletionRequest | ResponsesRequest"
+    ) -> "ChatCompletionRequest | ResponsesRequest":
+        if _request_has_structured_text_output_contract(request):
+            setattr(request, _PRESERVED_STRUCTURED_OUTPUT_ATTR, True)
+        return request
+
+    def should_ignore_prompt_reasoning_end(
+        self, request: "ChatCompletionRequest | ResponsesRequest"
+    ) -> bool:
+        return _request_has_machine_output_contract(request)
+
+    def should_force_content_before_reasoning_end(
+        self,
+        current_text: str,
+        request: "ChatCompletionRequest | ResponsesRequest",
+        *,
+        finished: bool,
+    ) -> bool | None:
+        if not _request_has_machine_output_contract(request):
+            return False
+
+        if not current_text.strip():
+            return True if finished else None
+
+        if (
+            not finished
+            and self._output_starts_with_reasoning_boundary(
+                current_text, allow_prefix=True
+            )
+            and not self._output_starts_with_reasoning_boundary(current_text)
+        ):
+            return None
+
+        return self._output_starts_with_machine_output_contract(current_text, request)
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         """
@@ -162,6 +295,9 @@ class KimiK2ReasoningParser(ReasoningParser):
         """
         if self._identity_parser is not None:
             return self._identity_parser.extract_reasoning(model_output, request)
+
+        if self._output_starts_with_machine_output_contract(model_output, request):
+            return None, model_output
 
         # thinking does not require a think start token but consume it if present
         start_token_index = model_output.find(self._start_token)

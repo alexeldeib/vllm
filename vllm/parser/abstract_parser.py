@@ -440,6 +440,20 @@ class DelegatingParser(Parser):
         )
 
         tool_calls = list[FunctionCall]()
+        if request.tool_choice == "none":
+            if tool_parser.preserve_raw_tool_calls_when_tool_choice_none:
+                return [], content
+
+            tool_call_info = self.extract_tool_calls(
+                content if content is not None else "",
+                request=request,
+            )
+            if tool_call_info is not None and tool_call_info.tools_called:
+                content = tool_call_info.content
+                if content and content.strip() == "":
+                    content = None
+            return [], content
+
         if is_named_tool_choice and supports_required_and_named:
             if content is None:
                 return [], None
@@ -646,10 +660,13 @@ class DelegatingParser(Parser):
         supports_required_and_named = self._tool_parser.supports_required_and_named
 
         if request.tool_choice == "none":
-            if self._engine_based:
+            if (
+                self._engine_based
+                or not self._tool_parser.preserve_raw_tool_calls_when_tool_choice_none
+            ):
                 # Engine-backed parsers route content extraction through
-                # extract_tool_calls_streaming, so run the full pipeline
-                # and strip tool_calls after.
+                # extract_tool_calls_streaming. Native special-token parsers
+                # can also opt in so leaked tool markup is suppressed.
                 delta_message = self.extract_tool_calls_streaming(
                     previous_text,
                     current_text,
@@ -661,6 +678,8 @@ class DelegatingParser(Parser):
                 )
                 if delta_message:
                     delta_message.tool_calls = []
+                    if not delta_message.content and not delta_message.reasoning:
+                        return None, False
                 return delta_message, False
             return (DeltaMessage(content=delta_text) if delta_text else None), False
 
@@ -795,11 +814,17 @@ class DelegatingParser(Parser):
     ) -> DeltaMessage | None:
         self._initialize_history_tool_call_cnt(request)
         state = self._stream_state
+        forced_content_before_reasoning_end = False
 
         if not state.prompt_reasoning_checked and prompt_token_ids is not None:
             state.prompt_reasoning_checked = True
-            if self._reasoning_parser is None or self.is_reasoning_end(
-                prompt_token_ids
+            ignore_prompt_reasoning_end = (
+                self._reasoning_parser is not None
+                and self._reasoning_parser.should_ignore_prompt_reasoning_end(request)
+            )
+            if self._reasoning_parser is None or (
+                not ignore_prompt_reasoning_end
+                and self.is_reasoning_end(prompt_token_ids)
             ):
                 state.reasoning_ended = True
             else:
@@ -813,6 +838,21 @@ class DelegatingParser(Parser):
         current_text, current_token_ids = state.advance(delta_text, delta_token_ids)
         delta_message: DeltaMessage | None = None
         reasoning_transitioned = False
+
+        if self._reasoning_parser is not None and not state.reasoning_ended:
+            force_content = (
+                self._reasoning_parser.should_force_content_before_reasoning_end(
+                    current_text,
+                    request,
+                    finished=finished,
+                )
+            )
+            if force_content is None:
+                state.commit(current_text, current_token_ids)
+                return None
+            if force_content:
+                state.reasoning_ended = True
+                forced_content_before_reasoning_end = True
 
         # Reasoning extraction
         if self._in_reasoning_phase(state):
@@ -903,7 +943,11 @@ class DelegatingParser(Parser):
             and not self._in_reasoning_phase(state)
             and not self._in_tool_call_phase(state)
         ):
-            delta_message = DeltaMessage(content=delta_text)
+            content = (
+                current_text if forced_content_before_reasoning_end else delta_text
+            )
+            if content != "":
+                delta_message = DeltaMessage(content=content)
 
         state.commit(current_text, current_token_ids)
 

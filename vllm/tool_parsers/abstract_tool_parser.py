@@ -57,6 +57,10 @@ class ToolParser:
     # extract_tool_calls / extract_tool_calls_streaming methods for
     # required/named tool_choice, treating them the same as "auto".
     supports_required_and_named: bool = True
+    # When True, tool-looking model output is surfaced as normal content for
+    # tool_choice="none". Parsers for native special-token tool formats can set
+    # this to False to suppress leaked parser markup without returning calls.
+    preserve_raw_tool_calls_when_tool_choice_none: bool = True
     # xgrammar builtin structural tag model key. Subclasses set this when
     # their parsed tool-call syntax matches a builtin xgrammar format.
     structural_tag_model: str | None = None

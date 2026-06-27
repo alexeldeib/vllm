@@ -30,6 +30,7 @@ logger = init_logger(__name__)
 
 class KimiK2ToolParser(ToolParser):
     structural_tag_model = "kimi"
+    preserve_raw_tool_calls_when_tool_choice_none = False
 
     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
         super().__init__(tokenizer, tools)

@@ -383,7 +383,9 @@ class ResponsesRequest(OpenAIBaseModel):
                     parameter="structured_outputs",
                 )
             response_format = self.text.format
-            if (
+            if response_format.type == "json_object":
+                structured_outputs = StructuredOutputsParams(json_object=True)
+            elif (
                 response_format.type == "json_schema"
                 and response_format.schema_ is not None
             ):
