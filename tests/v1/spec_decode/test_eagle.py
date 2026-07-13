@@ -115,6 +115,46 @@ def _create_proposer(
     return proposer
 
 
+@pytest.mark.parametrize(
+    "causal,expected_disable_q_quantization",
+    [(False, True), (True, False)],
+)
+def test_dflash_draft_attention_config(
+    causal: bool, expected_disable_q_quantization: bool
+):
+    model_config = ModelConfig(
+        model=dflash_target_dir,
+        runner="generate",
+        max_model_len=100,
+        trust_remote_code=True,
+    )
+    base = VllmConfig(
+        model_config=model_config,
+        attention_config=AttentionConfig(
+            use_non_causal=False,
+            disable_flashinfer_q_quantization=False,
+        ),
+    )
+    proposer = DFlashProposer.__new__(DFlashProposer)
+    proposer.dflash_causal = causal
+
+    with mock.patch(
+        "vllm.v1.spec_decode.llm_base_proposer."
+        "SpecDecodeBaseProposer._create_draft_vllm_config",
+        return_value=base,
+    ):
+        draft = proposer._create_draft_vllm_config()
+
+    assert draft.attention_config.use_non_causal is not causal
+    assert (
+        draft.attention_config.disable_flashinfer_q_quantization
+        is expected_disable_q_quantization
+    )
+    # The draft-local override must not change target attention behavior.
+    assert base.attention_config.use_non_causal is False
+    assert base.attention_config.disable_flashinfer_q_quantization is False
+
+
 def test_prepare_next_token_ids():
     """
     Test for prepare_next_token_ids_cpu and prepare_next_token_ids_padded.

@@ -83,6 +83,16 @@ class DFlashProposer(SpecDecodeBaseProposer):
             attention_config=replace(
                 base.attention_config,
                 use_non_causal=not self.dflash_causal,
+                # FlashInfer quantizes queries when FP8/NVFP4 KV cache is
+                # enabled and TRTLLM attention is available. Non-causal
+                # DFlash attention cannot use the TRTLLM path, however, so its
+                # metadata falls back to the model dtype. Disable query
+                # quantization for this draft-only fallback; otherwise the
+                # compiled graph can pass FP8 queries to a BF16 kernel.
+                disable_flashinfer_q_quantization=(
+                    base.attention_config.disable_flashinfer_q_quantization
+                    or not self.dflash_causal
+                ),
             ),
         )
 
