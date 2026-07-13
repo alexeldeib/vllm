@@ -1348,6 +1348,8 @@ class DeepseekV2Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        if self.config.num_hidden_layers in self.aux_hidden_state_layers:
+            aux_hidden_states.append(hidden_states)
         if len(aux_hidden_states) > 0:
             return hidden_states, aux_hidden_states
         return hidden_states
