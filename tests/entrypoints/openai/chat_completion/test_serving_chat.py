@@ -2134,7 +2134,17 @@ async def test_tool_choice_validation_without_parser():
 
 
 @pytest.mark.asyncio
-async def test_streaming_n_gt1_independent_tool_parsers():
+@pytest.mark.parametrize(
+    "tool_choice",
+    [
+        pytest.param("auto", id="auto"),
+        pytest.param(
+            {"type": "function", "function": {"name": "get_weather"}},
+            id="named",
+        ),
+    ],
+)
+async def test_streaming_n_gt1_independent_tool_parsers(tool_choice):
     """n>1 streaming must use independent parser instances
     and token-id histories per choice.
     """
@@ -2187,7 +2197,7 @@ async def test_streaming_n_gt1_independent_tool_parsers():
         n=num_choices,
         stream=True,
         tools=tools,
-        tool_choice="auto",
+        tool_choice=tool_choice,
     )
 
     tool_call_text = (

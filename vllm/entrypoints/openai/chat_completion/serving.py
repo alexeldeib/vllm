@@ -429,11 +429,6 @@ class OpenAIServingChat(GenerateBaseServing):
         num_cached_tokens = None
         tools_streamed = [False] * num_choices
 
-        if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
-            tool_choice_function_name = request.tool_choice.function.name
-        else:
-            tool_choice_function_name = None
-
         previous_texts = [""] * num_choices
 
         try:
@@ -691,10 +686,8 @@ class OpenAIServingChat(GenerateBaseServing):
 
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
-                        # finish_reason is:
-                        # "tool_calls" for "auto" or "required" tool calls,
-                        # and "stop" for named tool calls.
-                        if tools_streamed[i] and not tool_choice_function_name:
+                        # finish_reason is "tool_calls".
+                        if tools_streamed[i]:
                             finish_reason_ = "tool_calls"
                         else:
                             finish_reason_ = (
