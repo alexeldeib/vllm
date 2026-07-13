@@ -5,7 +5,7 @@ incremental lexing, and state-machine-driven semantic event emission."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass
 
 from vllm.parser.engine.events import EventType, SemanticEvent
@@ -148,6 +148,7 @@ class StreamingParserEngine:
         self._token_id_terminal_names: frozenset[str] = frozenset(
             resolved_token_ids.values()
         )
+        self._lexical_token_id_terminals: frozenset[str] = frozenset()
 
         self._lexer = IncrementalLexer(lexer_shape, content_terminal=CONTENT_TERMINAL)
 
@@ -159,6 +160,10 @@ class StreamingParserEngine:
 
         self.skip_tool_parsing = False
         self.reset(initial_state=initial_state)
+
+    def set_lexical_token_id_terminals(self, terminal_names: Collection[str]) -> None:
+        """Allow selected token-ID terminals to also match lexically."""
+        self._lexical_token_id_terminals = frozenset(terminal_names)
 
     def _reset_args_state(self) -> None:
         self._args_buffer: str = ""
@@ -282,7 +287,11 @@ class StreamingParserEngine:
         events: list[SemanticEvent] = []
         strict = self._token_id_terminal_names if self._ever_had_token_ids else None
         for tok in tokens:
-            if tok.terminal == CONTENT_TERMINAL or (strict and tok.terminal in strict):
+            if tok.terminal == CONTENT_TERMINAL or (
+                strict
+                and tok.terminal in strict
+                and tok.terminal not in self._lexical_token_id_terminals
+            ):
                 events.extend(self._on_content(tok.value))
             else:
                 events.extend(self._on_terminal(tok.terminal, tok.value))

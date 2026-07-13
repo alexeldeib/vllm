@@ -195,6 +195,16 @@ class Glm47MoeParser(ParserEngine):
         )
         super().__init__(tokenizer, tools, **kwargs)
 
+    def _check_skip_tool_parsing(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> None:
+        # Required-tool grammars may emit these markers as ordinary subtokens.
+        terminals = (
+            {"TOOL_START", "TOOL_END"} if request.tool_choice == "required" else ()
+        )
+        self._engine.set_lexical_token_id_terminals(terminals)
+        super()._check_skip_tool_parsing(request)
+
     def _emit_name_delta(self, idx: int, deltas, name: str | None) -> None:
         if name is not None:
             name = name.strip()

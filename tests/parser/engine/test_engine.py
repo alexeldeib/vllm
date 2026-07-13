@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from tests.parser.engine.conftest import make_mock_tokenizer
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.parser.engine.events import EventType, SemanticEvent
 from vllm.parser.engine.incremental_lexer import (
     LexerShape,
@@ -18,6 +19,7 @@ from vllm.parser.engine.parser_engine_config import (
     ParserState,
     Transition,
 )
+from vllm.parser.engine.registered_adapters import Glm47MoeParserToolAdapter
 from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 
 
@@ -409,6 +411,19 @@ class TestTokenIdFiltering:
         events.extend(engine.finish())
         assert any(e.type == EventType.TOOL_CALL_END for e in events)
 
+    def test_opted_in_terminal_matches_lexically(self):
+        """A parser can opt in when its grammar emits markers as subtokens."""
+        engine = StreamingParserEngine(_hermes_config(), _make_hermes_tokenizer())
+        engine.set_lexical_token_id_terminals({"TOOL_START", "TOOL_END"})
+
+        engine.feed("prefix ", [1])
+        events = engine.feed('<tool_call>{"name": "f"}</tool_call>', [2, 3, 4])
+        events.extend(engine.finish())
+
+        types = [e.type for e in events]
+        assert EventType.TOOL_CALL_START in types
+        assert EventType.TOOL_CALL_END in types
+
     def test_no_filtering_without_token_ids(self):
         """When no token IDs are ever provided (non-streaming),
         text matching still triggers transitions."""
@@ -439,6 +454,58 @@ class TestTokenIdFiltering:
 
         assert sum(1 for e in all_events if e.type == EventType.TOOL_CALL_START) == 1
         assert sum(1 for e in all_events if e.type == EventType.TOOL_CALL_END) == 1
+
+
+def test_glm_required_adapter_parses_lexical_tool_markers():
+    """The GLM tool adapter must configure lexical markers before feeding."""
+    pieces = [
+        "<tool",
+        "_call>",
+        "calculate",
+        "<arg_key>",
+        "expression",
+        "</arg_key>",
+        "<arg_value>",
+        "2 + 2",
+        "</arg_value>",
+        "</tool",
+        "_call>",
+    ]
+    vocab = {
+        "<think>": 100,
+        "</think>": 101,
+        "<tool_call>": 102,
+        "</tool_call>": 103,
+        **{piece: i + 200 for i, piece in enumerate(dict.fromkeys(pieces))},
+    }
+    tokenizer = make_mock_tokenizer(vocab)
+    parser = Glm47MoeParserToolAdapter(tokenizer, tools=[])
+    request = MagicMock(spec=ChatCompletionRequest)
+    request.tools = []
+    request.tool_choice = "required"
+
+    text = "".join(pieces)
+    token_ids = [vocab[piece] for piece in pieces]
+    delta = parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text=text,
+        delta_text=text,
+        previous_token_ids=[],
+        current_token_ids=token_ids,
+        delta_token_ids=token_ids,
+        request=request,
+    )
+    finish_delta = parser.finish_streaming()
+
+    tool_calls = [
+        tool_call
+        for message in (delta, finish_delta)
+        if message is not None
+        for tool_call in message.tool_calls
+    ]
+    assert tool_calls
+    assert tool_calls[0].function is not None
+    assert tool_calls[0].function.name == "calculate"
 
 
 def _func_prefix_config() -> ParserEngineConfig:
