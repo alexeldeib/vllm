@@ -113,6 +113,8 @@ g_fi_workspace = torch.zeros(
 
 
 class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
+    can_return_lse_for_decode: bool = True
+
     def __init__(
         self,
         num_heads: int,
@@ -175,8 +177,12 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             q_nope, q_pe = q
             q = torch.cat([q_nope, q_pe], dim=-1)
 
-        # trtllm API requires extra dimension q_len_per_request for MTP
-        if attn_metadata.num_decode_tokens % attn_metadata.num_decodes != 0:
+        # Tree rows are independent prefix queries. Their current-node causal
+        # suffix is computed separately and merged by the common MLA layer.
+        if attn_metadata.tree_decode is not None:
+            q = q.unsqueeze(1)
+        # trtllm API requires extra dimension q_len_per_request for MTP.
+        elif attn_metadata.num_decode_tokens % attn_metadata.num_decodes != 0:
             logger.warning_once(
                 """FlashInferMLAImpl got a query of uneven length.
                 This usually indicates an issue in batch reordering
@@ -196,7 +202,10 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             if is_quantized_kv_cache(self.kv_cache_dtype):
                 self.bmm2_scale *= layer._k_scale_float
 
-        o = trtllm_batch_decode_with_kv_cache_mla(
+        return_lse = (
+            self.need_to_return_lse_for_decode or attn_metadata.tree_decode is not None
+        )
+        result = trtllm_batch_decode_with_kv_cache_mla(
             query=q,
             kv_cache=kv_c_and_k_pe_cache.unsqueeze(1),
             workspace_buffer=self._workspace_buffer,
@@ -208,11 +217,17 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
             max_seq_len=attn_metadata.max_seq_len,
             bmm1_scale=self.bmm1_scale,
             bmm2_scale=self.bmm2_scale,
+            return_lse=return_lse,
         )
+
+        if return_lse:
+            o, lse = result
+        else:
+            o = result
+            lse = None
 
         # Flatten the output for consistent shape
         o = o.view(-1, o.shape[-2], o.shape[-1])
-
-        # TODO: Return LSE pending support from Flashinfer API:
-        # https://github.com/flashinfer-ai/flashinfer/pull/1566
-        return o, None
+        if lse is not None:
+            lse = lse.view(-1, lse.shape[-1])
+        return o, lse

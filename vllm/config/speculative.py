@@ -152,6 +152,14 @@ class SpeculativeConfig:
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
 
+    proposal_tree_verification: bool = False
+    """Enable the experimental exact proposal-tree verifier for MLA targets.
+
+    The initial implementation accepts root-inclusive trees of at most 32
+    nodes and requires eager execution. It decomposes attention into a tuned
+    paged-prefix pass plus a small root-to-node suffix pass.
+    """
+
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""
@@ -291,6 +299,7 @@ class SpeculativeConfig:
             "dflash",
         )
         factors.append(uses_aux_hidden_states)
+        factors.append(self.proposal_tree_verification)
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:

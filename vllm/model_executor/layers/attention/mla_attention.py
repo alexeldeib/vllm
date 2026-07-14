@@ -811,6 +811,53 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                 assert attn_metadata.decode is not None
             attn_out, lse = self.impl.forward_mqa(mqa_q, kv_cache, attn_metadata, self)  # type: ignore[attr-defined]
 
+            tree_decode = attn_metadata.tree_decode
+            if tree_decode is not None:
+                from vllm.v1.attention.ops.mla_tree_attention import (
+                    mla_tree_suffix_attention,
+                )
+
+                assert self.impl.dcp_world_size == 1, (
+                    "tree MLA decode does not yet support decode-context parallelism"
+                )
+                assert lse is not None, (
+                    "tree MLA decode requires prefix LSE from the attention backend"
+                )
+                tree_q = torch.cat(mqa_q, dim=-1) if isinstance(mqa_q, tuple) else mqa_q
+
+                logit_scale = self.impl.scale
+                value_scale = 1.0
+                if tree_q.element_size() == 1:
+                    logit_scale *= self._q_scale_float
+                if fp8_attention:
+                    logit_scale *= self._k_scale_float
+                    value_scale = self._k_scale_float
+
+                merged_attn_out = torch.empty_like(attn_out)
+                query_start = 0
+                for query_len in tree_decode.query_lens:
+                    query_end = query_start + query_len
+                    suffix_out, suffix_lse = mla_tree_suffix_attention(
+                        tree_q[query_start:query_end],
+                        kv_cache,
+                        tree_decode.slot_mapping[query_start:query_end],
+                        tree_decode.ancestor_masks[query_start:query_end],
+                        kv_lora_rank=self.kv_lora_rank,
+                        rope_head_dim=self.qk_rope_head_dim,
+                        logit_scale=logit_scale,
+                        value_scale=value_scale,
+                    )
+                    merge_attn_states(
+                        output=merged_attn_out[query_start:query_end],
+                        prefix_output=attn_out[query_start:query_end],
+                        prefix_lse=lse[query_start:query_end].T.contiguous(),
+                        suffix_output=suffix_out,
+                        suffix_lse=suffix_lse.T.contiguous(),
+                    )
+                    query_start = query_end
+                assert query_start == tree_q.shape[0]
+                attn_out = merged_attn_out
+
             # correct dcp attn_out with lse.
             if self.impl.dcp_world_size > 1:
                 if self.dcp_a2a:
@@ -1287,6 +1334,20 @@ D = TypeVar("D", bound=MLACommonDecodeMetadata)
 
 
 @dataclass
+class MLATreeDecodeMetadata:
+    """Root-inclusive tree data used by split prefix/suffix MLA decode.
+
+    ``query_lens`` partitions the flattened decode queries by request.
+    ``ancestor_masks`` and ``slot_mapping`` are flattened in the same order.
+    Each ancestor bit mask uses request-local node indices and includes self.
+    """
+
+    query_lens: list[int]
+    ancestor_masks: torch.Tensor
+    slot_mapping: torch.Tensor
+
+
+@dataclass
 class MLACommonMetadata(AttentionMetadata, Generic[D]):
     """Metadata for MLACommon.
 
@@ -1321,6 +1382,7 @@ class MLACommonMetadata(AttentionMetadata, Generic[D]):
 
     prefill: MLACommonPrefillMetadata | None = None
     decode: D | None = None
+    tree_decode: MLATreeDecodeMetadata | None = None
 
     def __post_init__(self):
         if self.head_dim is not None and not MLACommonBackend.supports_head_size(

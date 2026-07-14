@@ -57,6 +57,10 @@ from vllm.forward_context import (
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
+from vllm.model_executor.layers.attention.mla_attention import (
+    MLACommonMetadata,
+    MLATreeDecodeMetadata,
+)
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
@@ -138,6 +142,10 @@ from vllm.v1.attention.backends.utils import (
     create_fast_prefill_custom_backend,
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
+)
+from vllm.v1.attention.ops.mla_tree_attention import (
+    MAX_TREE_NODES,
+    build_tree_ancestor_masks,
 )
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
@@ -2213,6 +2221,112 @@ class GPUModelRunner(
             spec_decode_metadata,
         )
 
+    def _use_mla_tree_verification(self, scheduler_output: "SchedulerOutput") -> bool:
+        return bool(
+            self.speculative_config is not None
+            and self.speculative_config.proposal_tree_verification
+            and scheduler_output.scheduled_spec_decode_tokens
+        )
+
+    def _rewrite_mla_metadata_for_chain_tree(
+        self,
+        attn_metadata: PerLayerAttnMetadata,
+        slot_mapping: torch.Tensor,
+        scheduler_output: "SchedulerOutput",
+        *,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+        cudagraph_mode: CUDAGraphMode,
+    ) -> None:
+        """Exercise tree verification with the existing linear draft chain.
+
+        This is the first end-to-end correctness gate.  It changes only the
+        target attention decomposition; the existing rejection sampler and KV
+        rollback remain valid because chain nodes already occupy canonical
+        order.  Real branching metadata and KV compaction are layered on after
+        chain logits match the stock target.
+        """
+
+        if cudagraph_mode != CUDAGraphMode.NONE:
+            raise RuntimeError(
+                "proposal_tree_verification currently requires --enforce-eager"
+            )
+        if num_tokens_padded != num_tokens_unpadded:
+            raise RuntimeError("proposal_tree_verification does not support padding")
+        if self.input_batch.num_reqs != 1:
+            raise RuntimeError(
+                "proposal_tree_verification currently supports one request"
+            )
+        if isinstance(attn_metadata, list):
+            raise RuntimeError(
+                "proposal_tree_verification does not support microbatching"
+            )
+        req_id = self.input_batch.req_ids[0]
+        draft_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+        if not draft_token_ids:
+            return
+        query_len = len(draft_token_ids) + 1
+        if query_len != num_tokens_unpadded:
+            raise RuntimeError(
+                "proposal_tree_verification currently requires a decode-only batch"
+            )
+        if query_len > MAX_TREE_NODES:
+            raise RuntimeError(
+                f"proposal tree has {query_len} nodes; maximum is {MAX_TREE_NODES}"
+            )
+
+        context_len = int(self.input_batch.num_computed_tokens_cpu[0])
+        if context_len < int(self.input_batch.num_prompt_tokens[0]):
+            raise RuntimeError(
+                "proposal_tree_verification cannot run during prompt prefill"
+            )
+
+        # Root-inclusive chain: root=-1, then each node's parent is the
+        # immediately preceding query row.
+        parent_indices = [-1, *range(query_len - 1)]
+        ancestor_masks = torch.tensor(
+            build_tree_ancestor_masks(parent_indices),
+            dtype=torch.int64,
+            device=self.device,
+        )
+        tree_decode = MLATreeDecodeMetadata(
+            query_lens=[query_len],
+            ancestor_masks=ancestor_masks,
+            slot_mapping=slot_mapping[:query_len],
+        )
+
+        seen_metadata: set[int] = set()
+        for layer_metadata in attn_metadata.values():
+            metadata_id = id(layer_metadata)
+            if metadata_id in seen_metadata:
+                continue
+            seen_metadata.add(metadata_id)
+            if not isinstance(layer_metadata, MLACommonMetadata):
+                raise RuntimeError(
+                    "proposal_tree_verification currently requires an MLA-only target"
+                )
+            if layer_metadata.decode is None:
+                raise RuntimeError(
+                    "proposal_tree_verification requires decode metadata"
+                )
+
+            prefix_block_table = layer_metadata.decode.block_table[:1].expand(
+                query_len, -1
+            )
+            layer_metadata.decode.block_table = prefix_block_table.contiguous()
+            layer_metadata.decode.seq_lens = torch.full(
+                (query_len,),
+                context_len,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            layer_metadata.num_reqs = query_len
+            layer_metadata.num_decodes = query_len
+            layer_metadata.num_decode_tokens = query_len
+            layer_metadata.max_query_len = 1
+            layer_metadata.max_seq_len = context_len
+            layer_metadata.tree_decode = tree_decode
+
     def _build_attention_metadata(
         self,
         num_tokens: int,
@@ -4279,6 +4393,17 @@ class GPUModelRunner(
                     slot_mappings=slot_mappings_by_group,
                 )
             )
+
+            if self._use_mla_tree_verification(scheduler_output):
+                assert slot_mappings_by_group is not None
+                self._rewrite_mla_metadata_for_chain_tree(
+                    attn_metadata,
+                    slot_mappings_by_group[0],
+                    scheduler_output,
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    num_tokens_padded=num_tokens_padded,
+                    cudagraph_mode=cudagraph_mode,
+                )
 
             (
                 input_ids,
