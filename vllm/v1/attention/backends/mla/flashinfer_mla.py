@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 from typing import ClassVar
 
 import torch
@@ -230,4 +231,7 @@ class FlashInferMLAImpl(MLACommonImpl[MLACommonMetadata]):
         o = o.view(-1, o.shape[-2], o.shape[-1])
         if lse is not None:
             lse = lse.view(-1, lse.shape[-1])
+            # Both TRT-LLM GEN and CuteDSL expose their internal base-2 LSE.
+            # vLLM's state-merge and DCP reductions consume natural-log LSE.
+            lse.mul_(math.log(2.0))
         return o, lse
