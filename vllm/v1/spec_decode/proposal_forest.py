@@ -13,6 +13,7 @@ selection, and rollback semantics can be tested without GPUs.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import math
 from collections import defaultdict
 from collections.abc import Callable, Sequence
@@ -214,6 +215,147 @@ class ProposalForest:
         if context_length < 0:
             raise ValueError("context_length must be non-negative")
         return tuple(context_length + depth for depth in self.depths)
+
+
+@dataclass(frozen=True, slots=True)
+class LinearProposal:
+    """One proposal source's weighted causal chain.
+
+    ``mixture_weight`` is the probability of selecting this source component.
+    ``conditional_probs`` contains that component's conditional probability for
+    each proposed token.  The component can intentionally leave probability
+    mass unrepresented; target verification handles that residual exactly.
+    """
+
+    token_ids: tuple[int, ...]
+    conditional_probs: tuple[float, ...]
+    source_id: int
+    mixture_weight: float
+
+    def validate(self) -> LinearProposal:
+        if len(self.token_ids) != len(self.conditional_probs):
+            raise ProposalForestValidationError(
+                "linear proposal token and probability lengths differ"
+            )
+        if self.source_id < 0:
+            raise ProposalForestValidationError(
+                "linear proposal source_id must be non-negative"
+            )
+        if (
+            not math.isfinite(self.mixture_weight)
+            or not 0.0 <= self.mixture_weight <= 1.0
+        ):
+            raise ProposalForestValidationError(
+                "linear proposal mixture_weight must be finite and in [0, 1]"
+            )
+        for position, (token_id, conditional_prob) in enumerate(
+            zip(self.token_ids, self.conditional_probs, strict=True)
+        ):
+            if token_id < 0:
+                raise ProposalForestValidationError(
+                    f"linear proposal token {position} must be non-negative"
+                )
+            if (
+                not math.isfinite(conditional_prob)
+                or not 0.0 <= conditional_prob <= 1.0
+            ):
+                raise ProposalForestValidationError(
+                    f"linear proposal probability {position} must be finite and "
+                    "in [0, 1]"
+                )
+        return self
+
+
+def merge_linear_proposals(
+    proposals: Sequence[LinearProposal],
+    *,
+    max_nodes: int,
+    request_epoch: int,
+    context_hash: str,
+) -> ProposalForest:
+    """Merge weighted causal chains into a budgeted conditioned forest.
+
+    Shared prefixes are represented once.  Each prefix's mass is the sum of
+    its source-component path probabilities.  The resulting child
+    probabilities are therefore a coherent (possibly truncated) mixture
+    distribution.  Nodes are admitted best-first by path mass, which keeps the
+    selected set prefix-closed and spends a fixed verifier budget on the paths
+    most likely to continue.
+    """
+
+    if max_nodes < 0:
+        raise ProposalForestValidationError("max_nodes must be non-negative")
+    validated = tuple(proposal.validate() for proposal in proposals)
+    total_mixture_weight = sum(proposal.mixture_weight for proposal in validated)
+    if total_mixture_weight > 1.0 + 1e-7:
+        raise ProposalForestValidationError(
+            f"linear proposal mixture weights sum to {total_mixture_weight:.8f} > 1"
+        )
+
+    path_masses: dict[tuple[int, ...], float] = defaultdict(float)
+    path_source_masses: dict[tuple[int, ...], dict[int, float]] = defaultdict(
+        lambda: defaultdict(float)
+    )
+    children: dict[tuple[int, ...], set[tuple[int, ...]]] = defaultdict(set)
+    for proposal in validated:
+        path: tuple[int, ...] = ()
+        path_mass = proposal.mixture_weight
+        for token_id, conditional_prob in zip(
+            proposal.token_ids, proposal.conditional_probs, strict=True
+        ):
+            path_mass *= conditional_prob
+            if path_mass == 0.0:
+                break
+            parent_path = path
+            path = (*path, token_id)
+            path_masses[path] += path_mass
+            path_source_masses[path][proposal.source_id] += path_mass
+            children[parent_path].add(path)
+
+    frontier = [(-path_masses[path], path) for path in children[()]]
+    heapq.heapify(frontier)
+    selected_paths: list[tuple[int, ...]] = []
+    while frontier and len(selected_paths) < max_nodes:
+        _, path = heapq.heappop(frontier)
+        selected_paths.append(path)
+        for child_path in children[path]:
+            heapq.heappush(frontier, (-path_masses[child_path], child_path))
+
+    path_indices: dict[tuple[int, ...], int] = {}
+    token_ids: list[int] = []
+    parent_indices: list[int] = []
+    depths: list[int] = []
+    source_ids: list[int] = []
+    proposal_probs: list[float] = []
+    for node_idx, path in enumerate(selected_paths):
+        parent_path = path[:-1]
+        parent_idx = path_indices.get(parent_path, -1)
+        parent_mass = 1.0 if not parent_path else path_masses[parent_path]
+        path_indices[path] = node_idx
+        token_ids.append(path[-1])
+        parent_indices.append(parent_idx)
+        depths.append(len(path) - 1)
+        source_masses = path_source_masses[path]
+        source_ids.append(
+            max(
+                source_masses,
+                key=lambda source_id: (
+                    source_masses[source_id],
+                    -source_id,
+                ),
+            )
+        )
+        proposal_probs.append(path_masses[path] / parent_mass)
+
+    return ProposalForest(
+        token_ids=tuple(token_ids),
+        parent_indices=tuple(parent_indices),
+        depths=tuple(depths),
+        source_ids=tuple(source_ids),
+        proposal_probs=tuple(proposal_probs),
+        request_epoch=request_epoch,
+        context_hash=context_hash,
+    ).validate(max_nodes=max_nodes)
 
 
 @dataclass(frozen=True, slots=True)

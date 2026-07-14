@@ -10,6 +10,7 @@ import pytest
 
 from vllm.v1.spec_decode.proposal_forest import (
     FakeProposalService,
+    LinearProposal,
     ProposalForest,
     ProposalForestBuffer,
     ProposalForestCoordinator,
@@ -19,6 +20,7 @@ from vllm.v1.spec_decode.proposal_forest import (
     context_digest,
     duplicate_leaf_paths,
     enumerate_target_path_distribution,
+    merge_linear_proposals,
     select_greedy_path,
     select_stochastic_path,
 )
@@ -83,6 +85,126 @@ def test_validate_rejects_budget_epoch_and_context_mismatches() -> None:
         forest.validate(max_nodes=8, expected_epoch=5)
     with pytest.raises(ProposalForestValidationError, match="context hash is stale"):
         forest.validate(max_nodes=8, expected_context_hash="different")
+
+
+def test_merge_linear_sources_deduplicates_prefixes_and_preserves_mixture() -> None:
+    forest = merge_linear_proposals(
+        (
+            LinearProposal(
+                token_ids=(10, 11, 12),
+                conditional_probs=(0.8, 0.5, 0.5),
+                source_id=0,
+                mixture_weight=0.6,
+            ),
+            LinearProposal(
+                token_ids=(10, 13),
+                conditional_probs=(0.5, 0.8),
+                source_id=1,
+                mixture_weight=0.4,
+            ),
+        ),
+        max_nodes=8,
+        request_epoch=7,
+        context_hash=context_digest((3, 5, 8)),
+    )
+
+    assert forest.token_ids == (10, 11, 13, 12)
+    assert forest.parent_indices == (-1, 0, 0, 1)
+    assert forest.depths == (0, 1, 1, 2)
+    assert forest.source_ids == (0, 0, 1, 0)
+    assert forest.proposal_probs == pytest.approx((0.68, 0.24 / 0.68, 0.16 / 0.68, 0.5))
+    assert forest.paths() == ((0, 2), (0, 1, 3))
+
+
+def test_merge_linear_sources_spends_budget_on_highest_path_mass() -> None:
+    forest = merge_linear_proposals(
+        (
+            LinearProposal(
+                token_ids=(1, 2, 4),
+                conditional_probs=(1.0, 1.0, 1.0),
+                source_id=0,
+                mixture_weight=0.45,
+            ),
+            LinearProposal(
+                token_ids=(3,),
+                conditional_probs=(1.0,),
+                source_id=1,
+                mixture_weight=0.44,
+            ),
+        ),
+        max_nodes=2,
+        request_epoch=0,
+        context_hash=context_digest((9,)),
+    )
+
+    # The second node on source 0 carries 0.45 mixture path mass, slightly more
+    # than source 1's alternate root.
+    assert forest.token_ids == (1, 2)
+    assert forest.parent_indices == (-1, 0)
+    assert forest.proposal_probs == pytest.approx((0.45, 1.0))
+
+
+def test_merge_linear_sources_aggregates_duplicate_components() -> None:
+    forest = merge_linear_proposals(
+        (
+            LinearProposal((7, 8), (0.5, 0.5), 2, 0.4),
+            LinearProposal((7, 8), (1.0, 0.25), 1, 0.3),
+        ),
+        max_nodes=4,
+        request_epoch=0,
+        context_hash=context_digest((9,)),
+    )
+
+    assert forest.token_ids == (7, 8)
+    assert forest.parent_indices == (-1, 0)
+    assert forest.source_ids == (1, 2)
+    assert forest.proposal_probs == pytest.approx((0.5, 0.175 / 0.5))
+
+
+def test_merge_linear_sources_accepts_empty_or_zero_budget() -> None:
+    empty = merge_linear_proposals(
+        (),
+        max_nodes=8,
+        request_epoch=0,
+        context_hash=context_digest((9,)),
+    )
+    zero_budget = merge_linear_proposals(
+        (LinearProposal((7,), (1.0,), 0, 1.0),),
+        max_nodes=0,
+        request_epoch=0,
+        context_hash=context_digest((9,)),
+    )
+
+    assert empty.num_nodes == 0
+    assert zero_budget.num_nodes == 0
+
+
+@pytest.mark.parametrize(
+    ("proposals", "message"),
+    [
+        ((LinearProposal((1,), (), 0, 1.0),), "lengths differ"),
+        ((LinearProposal((1,), (1.1,), 0, 1.0),), "probability 0"),
+        ((LinearProposal((1,), (1.0,), -1, 1.0),), "source_id"),
+        ((LinearProposal((1,), (1.0,), 0, float("nan")),), "mixture_weight"),
+        (
+            (
+                LinearProposal((1,), (1.0,), 0, 0.6),
+                LinearProposal((2,), (1.0,), 1, 0.5),
+            ),
+            "weights sum",
+        ),
+    ],
+)
+def test_merge_linear_sources_rejects_invalid_components(
+    proposals: tuple[LinearProposal, ...], message: str
+) -> None:
+    with pytest.raises(ProposalForestValidationError, match=message):
+        merge_linear_proposals(
+            proposals,
+            max_nodes=8,
+            request_epoch=0,
+            context_hash=context_digest((9,)),
+        )
 
 
 def test_greedy_selection_follows_conditioned_branch_and_appends_bonus() -> None:
