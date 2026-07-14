@@ -14,7 +14,10 @@ from vllm.v1.spec_decode.proposal_forest import (
     ProposalForestBuffer,
     ProposalForestCoordinator,
     ProposalForestValidationError,
+    collapse_duplicated_greedy_rows,
+    collapse_duplicated_probability_rows,
     context_digest,
+    duplicate_leaf_paths,
     enumerate_target_path_distribution,
     select_greedy_path,
     select_stochastic_path,
@@ -93,6 +96,115 @@ def test_greedy_selection_follows_conditioned_branch_and_appends_bonus() -> None
     assert selected.token_ids == (20, 21, 7)
     assert selected.num_accepted_draft_tokens == 2
     assert selected.bonus_token_id == 7
+
+
+def test_duplicated_causal_paths_match_packed_greedy_selection() -> None:
+    forest = make_forest().validate(max_nodes=8)
+    batch = duplicate_leaf_paths(forest)
+
+    assert batch.node_paths == ((0, 2), (1, 3))
+    assert batch.token_paths == ((10, 11), (20, 21))
+
+    # Each path has one virtual-root row plus one row per draft token.  The
+    # duplicated virtual-root row agrees, while later rows are path-local.
+    path_next_token_ids = (
+        (20, 99, 7),
+        (20, 21, 98),
+    )
+    packed_next_token_ids = collapse_duplicated_greedy_rows(batch, path_next_token_ids)
+
+    assert packed_next_token_ids == (20, 99, 21, 7, 98)
+    selected = select_greedy_path(forest, packed_next_token_ids)
+    assert selected.node_indices == (1, 3)
+    assert selected.token_ids == (20, 21, 98)
+
+
+def test_duplicated_paths_reject_shared_prefix_divergence() -> None:
+    forest = ProposalForest(
+        token_ids=(10, 11, 12),
+        parent_indices=(-1, 0, 0),
+        depths=(0, 1, 1),
+        source_ids=(0, 0, 1),
+        proposal_probs=(0.6, 0.3, 0.2),
+        request_epoch=0,
+        context_hash=context_digest((9,)),
+    ).validate(max_nodes=8)
+    batch = duplicate_leaf_paths(forest)
+
+    assert batch.node_paths == ((0, 1), (0, 2))
+    with pytest.raises(ValueError, match="disagree at packed row 1"):
+        collapse_duplicated_greedy_rows(
+            batch,
+            (
+                (10, 21, 31),
+                (10, 22, 32),
+            ),
+        )
+
+
+def test_duplicated_probability_rows_match_packed_stochastic_oracle() -> None:
+    forest = ProposalForest(
+        token_ids=(0, 1, 0),
+        parent_indices=(-1, -1, 0),
+        depths=(0, 0, 1),
+        source_ids=(0, 0, 0),
+        proposal_probs=(0.6, 0.3, 0.2),
+        request_epoch=0,
+        context_hash=context_digest((9,)),
+    ).validate(max_nodes=8, vocab_size=3)
+    packed_probabilities = (
+        (0.6, 0.3, 0.1),
+        (0.2, 0.5, 0.3),
+        (0.4, 0.4, 0.2),
+        (0.1, 0.1, 0.8),
+    )
+    batch = duplicate_leaf_paths(forest)
+    path_probabilities = tuple(
+        (packed_probabilities[0],)
+        + tuple(packed_probabilities[node_idx + 1] for node_idx in node_path)
+        for node_path in batch.node_paths
+    )
+
+    collapsed = collapse_duplicated_probability_rows(batch, path_probabilities)
+
+    assert collapsed == packed_probabilities
+    assert enumerate_target_path_distribution(
+        forest, collapsed
+    ) == enumerate_target_path_distribution(forest, packed_probabilities)
+
+
+def test_duplicated_empty_forest_keeps_virtual_root_row() -> None:
+    forest = make_forest(
+        token_ids=(),
+        parent_indices=(),
+        depths=(),
+        source_ids=(),
+        proposal_probs=(),
+    ).validate(max_nodes=8)
+    batch = duplicate_leaf_paths(forest)
+
+    assert batch.node_paths == ((),)
+    assert batch.token_paths == ((),)
+    assert collapse_duplicated_greedy_rows(batch, ((6,),)) == (6,)
+    assert collapse_duplicated_probability_rows(batch, (((0.25, 0.75),),)) == (
+        (0.25, 0.75),
+    )
+
+
+@pytest.mark.parametrize(
+    ("path_rows", "message"),
+    [
+        (((20, 99, 7),), "1 path results, expected 2"),
+        (((20, 99), (20, 21, 98)), "path 0 has 2 target rows, expected 3"),
+    ],
+)
+def test_duplicated_paths_reject_malformed_target_shapes(
+    path_rows: tuple[tuple[int, ...], ...], message: str
+) -> None:
+    batch = duplicate_leaf_paths(make_forest().validate(max_nodes=8))
+
+    with pytest.raises(ValueError, match=message):
+        collapse_duplicated_greedy_rows(batch, path_rows)
 
 
 def test_empty_forest_falls_back_to_one_target_token() -> None:

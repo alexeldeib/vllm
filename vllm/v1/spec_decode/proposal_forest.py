@@ -15,9 +15,9 @@ from __future__ import annotations
 import hashlib
 import math
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, TypeVar, cast
 
 
 class ProposalForestValidationError(ValueError):
@@ -230,6 +230,127 @@ class PathSelection:
     @property
     def bonus_token_id(self) -> int:
         return self.token_ids[-1]
+
+
+@dataclass(frozen=True, slots=True)
+class DuplicatedPathBatch:
+    """Root-to-leaf causal paths used as a tree-verifier correctness oracle.
+
+    An ordinary causal target can score each path independently.  Shared tree
+    nodes are intentionally duplicated, and their target rows must agree when
+    collapsed back to the packed forest layout.  A future MLA tree kernel can
+    be gated against this representation before duplicated prefixes are
+    removed from the hot path.
+    """
+
+    node_paths: tuple[tuple[int, ...], ...]
+    token_paths: tuple[tuple[int, ...], ...]
+    num_nodes: int
+
+
+def duplicate_leaf_paths(forest: ProposalForest) -> DuplicatedPathBatch:
+    """Expand a packed forest into independent root-to-leaf causal paths."""
+
+    node_paths = forest.paths()
+    if not node_paths:
+        node_paths = ((),)
+    token_paths = tuple(
+        tuple(forest.token_ids[node_idx] for node_idx in path) for path in node_paths
+    )
+    return DuplicatedPathBatch(
+        node_paths=node_paths,
+        token_paths=token_paths,
+        num_nodes=forest.num_nodes,
+    )
+
+
+_T = TypeVar("_T")
+
+
+def _collapse_duplicated_rows(
+    batch: DuplicatedPathBatch,
+    path_rows: Sequence[Sequence[_T]],
+    *,
+    rows_equal: Callable[[_T, _T], bool],
+) -> tuple[_T, ...]:
+    if len(path_rows) != len(batch.node_paths):
+        raise ValueError(
+            f"received {len(path_rows)} path results, expected {len(batch.node_paths)}"
+        )
+    missing = object()
+    packed_rows: list[object] = [missing] * (batch.num_nodes + 1)
+    for path_idx, (node_path, rows) in enumerate(
+        zip(batch.node_paths, path_rows, strict=True)
+    ):
+        if len(rows) != len(node_path) + 1:
+            raise ValueError(
+                f"path {path_idx} has {len(rows)} target rows, expected "
+                f"{len(node_path) + 1}"
+            )
+        assignments = ((0, rows[0]),) + tuple(
+            (node_idx + 1, rows[path_position + 1])
+            for path_position, node_idx in enumerate(node_path)
+        )
+        for packed_idx, row in assignments:
+            existing = packed_rows[packed_idx]
+            if existing is missing:
+                packed_rows[packed_idx] = row
+            elif not rows_equal(cast(_T, existing), row):
+                raise ValueError(
+                    f"duplicated target rows disagree at packed row {packed_idx}"
+                )
+    missing_rows = [
+        row_idx for row_idx, row in enumerate(packed_rows) if row is missing
+    ]
+    if missing_rows:
+        raise ValueError(f"duplicated paths did not cover packed rows {missing_rows}")
+    return tuple(cast(_T, row) for row in packed_rows)
+
+
+def collapse_duplicated_greedy_rows(
+    batch: DuplicatedPathBatch,
+    path_next_token_ids: Sequence[Sequence[int]],
+) -> tuple[int, ...]:
+    """Collapse path-local target argmax rows to virtual-root-plus-node order."""
+
+    return _collapse_duplicated_rows(
+        batch,
+        path_next_token_ids,
+        rows_equal=lambda lhs, rhs: lhs == rhs,
+    )
+
+
+def collapse_duplicated_probability_rows(
+    batch: DuplicatedPathBatch,
+    path_probabilities: Sequence[Sequence[Sequence[float]]],
+    *,
+    abs_tol: float = 1e-7,
+) -> tuple[tuple[float, ...], ...]:
+    """Collapse path-local target distributions and check shared-prefix parity."""
+
+    if not math.isfinite(abs_tol) or abs_tol < 0:
+        raise ValueError("abs_tol must be finite and non-negative")
+    normalized_rows = tuple(
+        tuple(tuple(probabilities) for probabilities in path_rows)
+        for path_rows in path_probabilities
+    )
+
+    def rows_equal(lhs: tuple[float, ...], rhs: tuple[float, ...]) -> bool:
+        return len(lhs) == len(rhs) and all(
+            math.isclose(
+                lhs_probability,
+                rhs_probability,
+                rel_tol=0.0,
+                abs_tol=abs_tol,
+            )
+            for lhs_probability, rhs_probability in zip(lhs, rhs, strict=True)
+        )
+
+    return _collapse_duplicated_rows(
+        batch,
+        normalized_rows,
+        rows_equal=rows_equal,
+    )
 
 
 def _target_row_index(parent_idx: int) -> int:
