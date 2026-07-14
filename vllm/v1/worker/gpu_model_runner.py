@@ -2315,9 +2315,9 @@ class GPUModelRunner(
         selected-path state compaction before the next proposal epoch.
         """
 
-        if cudagraph_mode != CUDAGraphMode.NONE:
+        if cudagraph_mode == CUDAGraphMode.FULL:
             raise RuntimeError(
-                "proposal_tree_verification currently requires --enforce-eager"
+                "proposal_tree_verification cannot run inside a full CUDA graph"
             )
         if num_tokens_padded != num_tokens_unpadded:
             raise RuntimeError("proposal_tree_verification does not support padding")
@@ -4485,6 +4485,10 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
+            use_mla_tree_verification = self._use_mla_tree_verification(
+                scheduler_output
+            )
+
             (
                 cudagraph_mode,
                 batch_desc,
@@ -4498,6 +4502,11 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                # A proposal tree is not a uniform causal decode even though all
+                # of its rows belong to one request. Dispatch it through the
+                # mixed-batch PIECEWISE graph: the dense/MoE regions retain CUDA
+                # graphs while the tree-aware attention custom op stays outside.
+                force_uniform_decode=False if use_mla_tree_verification else None,
             )
 
             logger.debug(
@@ -4613,7 +4622,7 @@ class GPUModelRunner(
                 )
             )
 
-            if self._use_mla_tree_verification(scheduler_output):
+            if use_mla_tree_verification:
                 self._rewrite_mla_metadata_for_proposal_tree(
                     attn_metadata,
                     scheduler_output,
