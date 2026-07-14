@@ -289,7 +289,9 @@ def mla_tree_suffix_attention(
     )
     lse = torch.empty((num_nodes, num_heads), dtype=torch.float32, device=query.device)
 
-    block_n = triton.next_power_of_2(num_nodes)
+    # The output contraction is a tensor-core dot over the node dimension,
+    # whose K extent must be at least 16 even for a smaller proposal tree.
+    block_n = max(16, triton.next_power_of_2(num_nodes))
     block_h = min(16, triton.next_power_of_2(num_heads))
     block_l = triton.next_power_of_2(kv_lora_rank)
     block_r = triton.next_power_of_2(rope_head_dim)

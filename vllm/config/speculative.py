@@ -160,6 +160,17 @@ class SpeculativeConfig:
     paged-prefix pass plus a small root-to-node suffix pass.
     """
 
+    proposal_tree_num_branches: int = Field(default=1, ge=1, le=8)
+    """Number of root branches in the experimental DFlash proposal forest.
+
+    A value greater than one enables the GPU tree selector and selected-path
+    KV compaction. This first integration is restricted to batch-size-one,
+    greedy, eager DFlash decoding.
+    """
+
+    proposal_tree_branch_depth: int = Field(default=7, ge=1, le=31)
+    """Maximum packed depth allocated to each non-primary DFlash branch."""
+
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""
@@ -300,6 +311,8 @@ class SpeculativeConfig:
         )
         factors.append(uses_aux_hidden_states)
         factors.append(self.proposal_tree_verification)
+        factors.append(self.proposal_tree_num_branches)
+        factors.append(self.proposal_tree_branch_depth)
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
@@ -638,6 +651,24 @@ class SpeculativeConfig:
 
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
+
+        if self.proposal_tree_num_branches > 1:
+            if not self.proposal_tree_verification:
+                raise ValueError(
+                    "proposal_tree_num_branches > 1 requires proposal_tree_verification"
+                )
+            if self.method != "dflash":
+                raise ValueError(
+                    "branching proposal-tree verification currently requires DFlash"
+                )
+            if (
+                self.num_speculative_tokens is not None
+                and self.num_speculative_tokens > 31
+            ):
+                raise ValueError(
+                    "branching proposal trees support at most 31 proposal tokens"
+                )
+            self.enforce_eager = True
 
         if self.method in ("ngram", "ngram_gpu"):
             # Set default values if not provided

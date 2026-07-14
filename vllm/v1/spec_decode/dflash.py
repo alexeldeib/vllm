@@ -12,7 +12,13 @@ from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.ops.mla_tree_attention import build_tree_ancestor_masks
+from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
+from vllm.v1.spec_decode.tree_ops import (
+    MAX_PROPOSAL_NODES,
+    DeviceProposalTree,
+)
 from vllm.v1.spec_decode.utils import copy_and_expand_dflash_inputs_kernel
 
 logger = init_logger(__name__)
@@ -69,6 +75,107 @@ class DFlashProposer(SpecDecodeBaseProposer):
         self.parallel_drafting_hidden_state_tensor = None
 
         self.dflash_causal = self.dflash_config.get("causal", False)
+        self._proposal_tree_logits: torch.Tensor | None = None
+        self._proposal_tree_topology_cache: dict[
+            tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = {}
+
+    @override
+    def _sample_draft_tokens(
+        self,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if self.speculative_config.proposal_tree_num_branches == 1:
+            return super()._sample_draft_tokens(hidden_states, sampling_metadata)
+
+        # The tree builder needs the root distribution, not merely its argmax.
+        # DFlash is TP1 in the Kimi experiment, so materializing these logits
+        # adds no target-TP collective.
+        logits = self.model.compute_logits(hidden_states)
+        self._proposal_tree_logits = logits
+        return self._sample_from_logits(logits, sampling_metadata)
+
+    def build_topk_spine_forest(
+        self,
+        draft_token_ids: torch.Tensor,
+        *,
+        request_id: str,
+    ) -> DeviceProposalTree:
+        """Pack a primary DFlash spine plus alternate first-token branches.
+
+        This topology is a plumbing/correctness gate for the target tree path.
+        Alternate roots currently reuse the parallel head's original suffix;
+        the subsequent conditioned-expansion stage replaces those suffixes by
+        running the cheap drafter on each selected prefix.
+        """
+
+        if draft_token_ids.ndim != 2 or draft_token_ids.shape[0] != 1:
+            raise ValueError("DFlash proposal forests currently support one request")
+        num_nodes = draft_token_ids.shape[1]
+        if not 0 < num_nodes <= MAX_PROPOSAL_NODES:
+            raise ValueError(
+                f"DFlash proposal forests require 1..{MAX_PROPOSAL_NODES} nodes"
+            )
+        logits = self._proposal_tree_logits
+        if logits is None or logits.shape[0] != num_nodes:
+            raise RuntimeError("DFlash root logits are unavailable for forest packing")
+
+        num_branches = min(
+            self.speculative_config.proposal_tree_num_branches, num_nodes
+        )
+        alternate_depth = min(
+            self.speculative_config.proposal_tree_branch_depth,
+            num_nodes // num_branches,
+        )
+        primary_depth = num_nodes - (num_branches - 1) * alternate_depth
+        root_token_ids = logits[0].topk(num_branches).indices
+
+        spine = draft_token_ids[0]
+        token_pieces = [spine[:primary_depth]]
+        for branch_idx in range(1, num_branches):
+            token_pieces.append(
+                torch.cat(
+                    (
+                        root_token_ids[branch_idx : branch_idx + 1],
+                        spine[1:alternate_depth],
+                    )
+                )
+            )
+        packed_token_ids = torch.cat(token_pieces).view(1, num_nodes).contiguous()
+
+        topology_key = (num_nodes, num_branches, alternate_depth)
+        topology = self._proposal_tree_topology_cache.get(topology_key)
+        if topology is None:
+            path_depths = [primary_depth] + [alternate_depth] * (num_branches - 1)
+            parents: list[int] = []
+            depths: list[int] = []
+            path_start = 0
+            for path_depth in path_depths:
+                parents.extend([-1, *range(path_start, path_start + path_depth - 1)])
+                depths.extend(range(path_depth))
+                path_start += path_depth
+            query_parents = [-1] + [
+                0 if parent_idx == -1 else parent_idx + 1 for parent_idx in parents
+            ]
+            topology = (
+                torch.tensor(parents, dtype=torch.int32, device=draft_token_ids.device),
+                torch.tensor(depths, dtype=torch.int64, device=draft_token_ids.device),
+                torch.tensor(
+                    build_tree_ancestor_masks(query_parents),
+                    dtype=torch.int64,
+                    device=draft_token_ids.device,
+                ),
+            )
+            self._proposal_tree_topology_cache[topology_key] = topology
+
+        return DeviceProposalTree(
+            token_ids=packed_token_ids,
+            parent_indices=topology[0],
+            depths=topology[1],
+            query_ancestor_masks=topology[2],
+            request_id=request_id,
+        ).validate()
 
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:

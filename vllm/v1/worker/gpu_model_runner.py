@@ -137,6 +137,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
+from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerMetadata
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     create_fast_prefill_custom_backend,
@@ -200,6 +201,12 @@ from vllm.v1.spec_decode.ngram_proposer_gpu import (
 )
 from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
+from vllm.v1.spec_decode.tree_ops import (
+    DeviceProposalTree,
+    KVCacheSlotCompactor,
+    compact_tree_rows,
+    select_greedy_tree_path,
+)
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -844,6 +851,12 @@ class GPUModelRunner(
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self._draft_probs: torch.Tensor | None = None
         self._draft_prob_req_ids: list[str] | None = None
+        self._next_proposal_tree: DeviceProposalTree | None = None
+        self._active_proposal_tree: DeviceProposalTree | None = None
+        self._active_tree_query_slot_mapping: torch.Tensor | None = None
+        self._tree_selected_node_indices: torch.Tensor | None = None
+        self._tree_num_selected: torch.Tensor | None = None
+        self._tree_kv_compactor: KVCacheSlotCompactor | None = None
         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
         self._num_valid_draft_tokens: torch.Tensor | None = None
         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
@@ -2136,6 +2149,10 @@ class GPUModelRunner(
             self.query_start_loc.gpu[: num_reqs + 1],
             self.positions[:total_num_scheduled_tokens],
         )
+        self._activate_proposal_tree(
+            scheduler_output,
+            num_tokens=total_num_scheduled_tokens,
+        )
 
         # Copy the tensors to the GPU.
         self._prepare_input_ids(
@@ -2228,23 +2245,73 @@ class GPUModelRunner(
             and scheduler_output.scheduled_spec_decode_tokens
         )
 
-    def _rewrite_mla_metadata_for_chain_tree(
+    def _activate_proposal_tree(
+        self,
+        scheduler_output: "SchedulerOutput",
+        *,
+        num_tokens: int,
+    ) -> None:
+        """Bind the previous DFlash forest to the target step and set RoPE depth.
+
+        Slot mapping is computed before this method from the ordinary flat
+        positions, so every packed node retains unique KV storage.  Only the
+        model-visible positions are replaced by logical tree depth.
+        """
+
+        self._active_proposal_tree = None
+        self._active_tree_query_slot_mapping = None
+        spec_config = self.speculative_config
+        if (
+            spec_config is None
+            or not spec_config.proposal_tree_verification
+            or spec_config.proposal_tree_num_branches == 1
+            or not scheduler_output.scheduled_spec_decode_tokens
+        ):
+            return
+        if self.input_batch.num_reqs != 1:
+            raise RuntimeError("branching proposal trees currently support one request")
+        if self.use_async_scheduling:
+            raise RuntimeError(
+                "branching proposal trees currently require synchronous scheduling"
+            )
+
+        req_id = self.input_batch.req_ids[0]
+        scheduled = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+        tree = self._next_proposal_tree
+        self._next_proposal_tree = None
+        if scheduled is None or tree is None:
+            raise RuntimeError("scheduled proposal nodes have no matching DFlash tree")
+        tree.validate()
+        if tree.request_id != req_id:
+            raise RuntimeError(
+                f"proposal tree belongs to {tree.request_id}, scheduled request is "
+                f"{req_id}"
+            )
+        if len(scheduled) != tree.num_nodes or num_tokens != tree.num_nodes + 1:
+            raise RuntimeError(
+                "branching proposal trees do not yet support scheduler-side trimming"
+            )
+
+        context_len = self.num_computed_tokens[0].to(torch.int64)
+        self.positions[0] = context_len
+        self.positions[1:num_tokens] = context_len + tree.depths + 1
+        self._active_proposal_tree = tree
+
+    def _rewrite_mla_metadata_for_proposal_tree(
         self,
         attn_metadata: PerLayerAttnMetadata,
-        slot_mapping: torch.Tensor,
         scheduler_output: "SchedulerOutput",
         *,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
         cudagraph_mode: CUDAGraphMode,
     ) -> None:
-        """Exercise tree verification with the existing linear draft chain.
+        """Rewrite the target MLA metadata for a root-inclusive proposal tree.
 
-        This is the first end-to-end correctness gate.  It changes only the
-        target attention decomposition; the existing rejection sampler and KV
-        rollback remain valid because chain nodes already occupy canonical
-        order.  Real branching metadata and KV compaction are layered on after
-        chain logits match the stock target.
+        With one configured branch this remains the original chain-equivalence
+        correctness gate. With multiple DFlash branches, positions and
+        ancestor masks come from the active packed tree and sampling performs
+        selected-path state compaction before the next proposal epoch.
         """
 
         if cudagraph_mode != CUDAGraphMode.NONE:
@@ -2275,40 +2342,88 @@ class GPUModelRunner(
                 f"proposal tree has {query_len} nodes; maximum is {MAX_TREE_NODES}"
             )
 
-        context_len = int(self.input_batch.num_computed_tokens_cpu[0])
+        active_tree = self._active_proposal_tree
+        if active_tree is None:
+            # Under async speculative scheduling the CPU value is optimistic.
+            # Synchronizing is intentional for the linear correctness gate.
+            context_len = int(self.num_computed_tokens[0].item())
+        else:
+            # Branching is synchronous-scheduler-only, so the CPU value is
+            # authoritative and avoids a decode-loop GPU synchronization.
+            context_len = int(self.input_batch.num_computed_tokens_cpu[0])
         if context_len < int(self.input_batch.num_prompt_tokens[0]):
             raise RuntimeError(
                 "proposal_tree_verification cannot run during prompt prefill"
             )
 
-        # Root-inclusive chain: root=-1, then each node's parent is the
-        # immediately preceding query row.
-        parent_indices = [-1, *range(query_len - 1)]
-        ancestor_masks = torch.tensor(
-            build_tree_ancestor_masks(parent_indices),
-            dtype=torch.int64,
-            device=self.device,
-        )
-        tree_decode = MLATreeDecodeMetadata(
-            query_lens=[query_len],
-            ancestor_masks=ancestor_masks,
-            slot_mapping=slot_mapping[:query_len],
-        )
+        if active_tree is None:
+            # Root-inclusive chain: root=-1, then each node's parent is the
+            # immediately preceding query row.
+            parent_indices = [-1, *range(query_len - 1)]
+            ancestor_masks = torch.tensor(
+                build_tree_ancestor_masks(parent_indices),
+                dtype=torch.int64,
+                device=self.device,
+            )
+        else:
+            if active_tree.num_nodes + 1 != query_len:
+                raise RuntimeError("active proposal-tree query length changed")
+            ancestor_masks = active_tree.query_ancestor_masks
+        draft_layer_names = {
+            layer_name
+            for group in getattr(self.drafter, "draft_attn_groups", ())
+            for layer_name in group.layer_names
+        }
+        layer_names_by_metadata: dict[int, list[str]] = defaultdict(list)
+        for layer_name, layer_metadata in attn_metadata.items():
+            layer_names_by_metadata[id(layer_metadata)].append(layer_name)
 
         seen_metadata: set[int] = set()
+        num_mla_metadata = 0
+        target_mla_layer_names: list[str] = []
         for layer_metadata in attn_metadata.values():
             metadata_id = id(layer_metadata)
             if metadata_id in seen_metadata:
                 continue
             seen_metadata.add(metadata_id)
+            layer_names = layer_names_by_metadata[metadata_id]
+            # The target and proposer attention layers share this dictionary.
+            # Proposal-tree verification changes only the target forward; the
+            # DFlash proposer builds and consumes its own metadata later.
+            if set(layer_names).issubset(draft_layer_names):
+                continue
+            # Sparse MLA targets have a second cache group for the DSA
+            # indexer.  Stock multi-token decode metadata already gives each
+            # node in this linear-chain correctness gate the exact causal
+            # context (C + 1, ..., C + query_len), so it must remain intact.
+            # A genuinely branching forest will require a corresponding
+            # tree-aware indexer path before this restriction can be lifted.
+            if isinstance(layer_metadata, DeepseekV32IndexerMetadata):
+                if active_tree is not None:
+                    raise RuntimeError(
+                        "branching proposal-tree verification found a target sparse "
+                        f"indexer on layers {layer_names}; a tree-aware indexer is "
+                        "required"
+                    )
+                continue
             if not isinstance(layer_metadata, MLACommonMetadata):
                 raise RuntimeError(
-                    "proposal_tree_verification currently requires an MLA-only target"
+                    "proposal_tree_verification does not support attention metadata "
+                    f"of type {type(layer_metadata).__name__} for layers "
+                    f"{layer_names}"
                 )
+            num_mla_metadata += 1
+            target_mla_layer_names.extend(layer_names)
             if layer_metadata.decode is None:
                 raise RuntimeError(
                     "proposal_tree_verification requires decode metadata"
                 )
+
+            tree_decode = MLATreeDecodeMetadata(
+                query_lens=[query_len],
+                ancestor_masks=ancestor_masks,
+                slot_mapping=layer_metadata.slot_mapping[:query_len],
+            )
 
             prefix_block_table = layer_metadata.decode.block_table[:1].expand(
                 query_len, -1
@@ -2326,6 +2441,29 @@ class GPUModelRunner(
             layer_metadata.max_query_len = 1
             layer_metadata.max_seq_len = context_len
             layer_metadata.tree_decode = tree_decode
+
+        if num_mla_metadata == 0:
+            raise RuntimeError(
+                "proposal_tree_verification did not find MLA target metadata"
+            )
+        if active_tree is not None:
+            if num_mla_metadata != 1:
+                raise RuntimeError(
+                    "branching proposal-tree KV compaction currently requires one "
+                    "target MLA cache group"
+                )
+            self._active_tree_query_slot_mapping = tree_decode.slot_mapping
+            if self._tree_kv_compactor is None:
+                kv_caches: list[torch.Tensor] = []
+                for layer_name in target_mla_layer_names:
+                    layer = self.compilation_config.static_forward_context[layer_name]
+                    kv_cache = layer.kv_cache
+                    if not isinstance(kv_cache, torch.Tensor):
+                        raise RuntimeError(
+                            f"target MLA layer {layer_name} has a non-tensor KV cache"
+                        )
+                    kv_caches.append(kv_cache)
+                self._tree_kv_compactor = KVCacheSlotCompactor(kv_caches)
 
     def _build_attention_metadata(
         self,
@@ -3703,6 +3841,38 @@ class GPUModelRunner(
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
+        active_tree = self._active_proposal_tree
+        if active_tree is not None:
+            if logits is None or spec_decode_metadata is None:
+                raise RuntimeError("proposal-tree sampling requires target logits")
+            unsupported_sampling = (
+                not sampling_metadata.all_greedy
+                or not sampling_metadata.no_penalties
+                or bool(sampling_metadata.bad_words_token_ids)
+                or sampling_metadata.allowed_token_ids_mask is not None
+                or sampling_metadata.max_num_logprobs is not None
+                or sampling_metadata.thinking_budget_state_holder is not None
+            )
+            if unsupported_sampling:
+                raise RuntimeError(
+                    "branching proposal-tree sampling currently requires greedy "
+                    "decoding without penalties, masks, bad words, thinking budgets, "
+                    "or logprobs"
+                )
+            target_next_token_ids = logits.argmax(dim=-1)
+            (
+                output_token_ids,
+                self._tree_selected_node_indices,
+                self._tree_num_selected,
+            ) = select_greedy_tree_path(
+                active_tree.token_ids,
+                active_tree.parent_indices,
+                target_next_token_ids,
+            )
+            return SamplerOutput(
+                sampled_token_ids=output_token_ids,
+                logprobs_tensors=None,
+            )
         if spec_decode_metadata is None:
             return self.sampler(
                 logits=logits,
@@ -3723,6 +3893,39 @@ class GPUModelRunner(
             sampling_metadata,
         )
         return sampler_output
+
+    def _compact_active_proposal_tree_state(
+        self,
+        hidden_states: torch.Tensor,
+        aux_hidden_states: list[torch.Tensor] | None,
+    ) -> None:
+        """Canonicalize the selected branch before the next DFlash epoch."""
+
+        tree = self._active_proposal_tree
+        if tree is None:
+            return
+        selected = self._tree_selected_node_indices
+        num_selected = self._tree_num_selected
+        query_slot_mapping = self._active_tree_query_slot_mapping
+        compactor = self._tree_kv_compactor
+        if (
+            selected is None
+            or num_selected is None
+            or query_slot_mapping is None
+            or compactor is None
+        ):
+            raise RuntimeError("proposal-tree selection state is incomplete")
+
+        num_query_rows = tree.num_nodes + 1
+        compact_tree_rows(self.input_ids.gpu[:num_query_rows], selected, num_selected)
+        compact_tree_rows(self.positions[:num_query_rows], selected, num_selected)
+        compact_tree_rows(hidden_states[:num_query_rows], selected, num_selected)
+        if aux_hidden_states is not None:
+            for aux_hidden_state in aux_hidden_states:
+                compact_tree_rows(
+                    aux_hidden_state[:num_query_rows], selected, num_selected
+                )
+        compactor.compact(query_slot_mapping, selected, num_selected)
 
     def _bookkeeping_sync(
         self,
@@ -4395,10 +4598,8 @@ class GPUModelRunner(
             )
 
             if self._use_mla_tree_verification(scheduler_output):
-                assert slot_mappings_by_group is not None
-                self._rewrite_mla_metadata_for_chain_tree(
+                self._rewrite_mla_metadata_for_proposal_tree(
                     attn_metadata,
-                    slot_mappings_by_group[0],
                     scheduler_output,
                     num_tokens_unpadded=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded,
@@ -4588,12 +4789,18 @@ class GPUModelRunner(
 
         # Apply structured output bitmasks if present.
         if grammar_output is not None:
+            if self._active_proposal_tree is not None:
+                raise RuntimeError(
+                    "branching proposal trees do not yet support structured output"
+                )
             apply_grammar_bitmask(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+
+        self._compact_active_proposal_tree_state(hidden_states, aux_hidden_states)
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -5001,6 +5208,8 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
+        if spec_config.proposal_tree_num_branches > 1:
+            self._next_proposal_tree = None
         num_spec_tokens_to_schedule = scheduler_output.num_spec_tokens_to_schedule
         self._draft_probs = None
         self._draft_prob_req_ids = None
@@ -5257,6 +5466,18 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
+            if spec_config.use_dflash() and spec_config.proposal_tree_num_branches > 1:
+                assert isinstance(self.drafter, DFlashProposer)
+                if len(self.input_batch.req_ids) != 1:
+                    raise RuntimeError(
+                        "DFlash proposal forests currently support one request"
+                    )
+                proposal_tree = self.drafter.build_topk_spine_forest(
+                    draft_token_ids,
+                    request_id=self.input_batch.req_ids[0],
+                )
+                draft_token_ids = proposal_tree.token_ids
+                self._next_proposal_tree = proposal_tree
             if hasattr(self.drafter, "take_last_draft_probs"):
                 draft_probs = self.drafter.take_last_draft_probs()
                 if draft_probs is not None:
