@@ -4,6 +4,8 @@
 import functools
 import gc
 import itertools
+import json
+import os
 import threading
 import time
 from collections import defaultdict
@@ -3904,6 +3906,7 @@ class GPUModelRunner(
                 )
             spec_config = self.speculative_config
             assert spec_config is not None
+            self._dump_proposal_tree_gap_diagnostic(active_tree, logits)
             max_logit_gap = spec_config.proposal_tree_max_logit_gap
             if max_logit_gap is None:
                 target_next_token_ids = logits.argmax(dim=-1)
@@ -3951,6 +3954,45 @@ class GPUModelRunner(
             sampling_metadata,
         )
         return sampler_output
+
+    @staticmethod
+    def _dump_proposal_tree_gap_diagnostic(
+        tree: DeviceProposalTree,
+        target_logits: torch.Tensor,
+    ) -> None:
+        """Append the sufficient statistics for offline gap-threshold sweeps.
+
+        This is intentionally opt-in through an environment variable and runs
+        only on target TP rank zero.  It records target maxima and the target
+        score of every proposed child, not the full vocabulary logits.  The
+        resulting JSONL can therefore reproduce exact and bounded-regret tree
+        traversal for arbitrary thresholds without changing emitted tokens or
+        retaining multi-gigabyte logits.
+        """
+
+        output_path = os.getenv("VLLM_PROPOSAL_TREE_DIAGNOSTIC_PATH")
+        if not output_path or get_tp_group().rank_in_group != 0:
+            return
+
+        proposal_token_ids = tree.token_ids[0]
+        parent_indices = tree.parent_indices
+        target_max_logits, target_next_token_ids = target_logits.max(dim=-1)
+        parent_rows = parent_indices.to(dtype=torch.int64) + 1
+        child_logits = target_logits[
+            parent_rows,
+            proposal_token_ids.to(dtype=torch.int64),
+        ]
+        record = {
+            "request_id": tree.request_id,
+            "proposal_token_ids": proposal_token_ids.tolist(),
+            "parent_indices": parent_indices.tolist(),
+            "target_next_token_ids": target_next_token_ids.tolist(),
+            "target_max_logits": target_max_logits.float().tolist(),
+            "child_logits": child_logits.float().tolist(),
+        }
+        with open(output_path, "a", encoding="utf-8") as output_file:
+            json.dump(record, output_file, separators=(",", ":"))
+            output_file.write("\n")
 
     def _compact_active_proposal_tree_state(
         self,
