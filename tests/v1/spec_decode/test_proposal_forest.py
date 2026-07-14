@@ -9,8 +9,10 @@ from collections import Counter
 import pytest
 
 from vllm.v1.spec_decode.proposal_forest import (
+    FakeProposalService,
     ProposalForest,
     ProposalForestBuffer,
+    ProposalForestCoordinator,
     ProposalForestValidationError,
     context_digest,
     enumerate_target_path_distribution,
@@ -191,4 +193,304 @@ def test_buffer_rejects_wrong_context_and_cancellation_falls_back() -> None:
             expected_context_hash=make_forest().context_hash,
         )
         is None
+    )
+
+
+def test_coordinator_double_buffers_current_and_lookahead_epochs() -> None:
+    service = FakeProposalService()
+    coordinator = ProposalForestCoordinator(service, max_nodes=8)
+    epoch4 = make_forest(request_epoch=4)
+    epoch5 = make_forest(request_epoch=5)
+    service.plan("req", epoch4)
+    service.plan("req", epoch5, delay=1.0)
+
+    coordinator.submit(
+        "req",
+        request_epoch=4,
+        context_hash=epoch4.context_hash,
+        now=0.0,
+        timeout=2.0,
+    )
+    coordinator.submit(
+        "req",
+        request_epoch=5,
+        context_hash=epoch5.context_hash,
+        now=0.0,
+        timeout=2.0,
+    )
+
+    assert (
+        coordinator.take_or_fallback(
+            "req",
+            expected_epoch=4,
+            expected_context_hash=epoch4.context_hash,
+            now=0.0,
+        )
+        is epoch4
+    )
+    assert coordinator.num_inflight == 1
+    assert (
+        coordinator.take_or_fallback(
+            "req",
+            expected_epoch=5,
+            expected_context_hash=epoch5.context_hash,
+            now=1.0,
+        )
+        is epoch5
+    )
+    assert coordinator.num_inflight == 0
+
+
+def test_slow_current_epoch_times_out_without_discarding_ready_lookahead() -> None:
+    service = FakeProposalService(honor_cancellation=False)
+    coordinator = ProposalForestCoordinator(service, max_nodes=8)
+    current = make_forest(request_epoch=4)
+    lookahead = make_forest(request_epoch=5)
+    service.plan("req", current, delay=3.0)
+    service.plan("req", lookahead, delay=0.5)
+    coordinator.submit(
+        "req",
+        request_epoch=4,
+        context_hash=current.context_hash,
+        now=0.0,
+        timeout=1.0,
+    )
+    coordinator.submit(
+        "req",
+        request_epoch=5,
+        context_hash=lookahead.context_hash,
+        now=0.0,
+        timeout=2.0,
+    )
+
+    assert (
+        coordinator.take_or_fallback(
+            "req",
+            expected_epoch=4,
+            expected_context_hash=current.context_hash,
+            now=1.0,
+        )
+        is None
+    )
+    assert (
+        coordinator.take_or_fallback(
+            "req",
+            expected_epoch=5,
+            expected_context_hash=lookahead.context_hash,
+            now=1.0,
+        )
+        is lookahead
+    )
+    assert coordinator.timed_out_requests == 1
+
+    coordinator.poll(3.0)
+    assert coordinator.stale_completions == 1
+
+
+def test_target_rollback_rejects_late_generation_and_accepts_replacement() -> None:
+    service = FakeProposalService(honor_cancellation=False)
+    coordinator = ProposalForestCoordinator(service, max_nodes=8)
+    old = make_forest(request_epoch=4)
+    replacement = make_forest(
+        token_ids=(12, 20, 13, 21),
+        request_epoch=4,
+    )
+    service.plan("req", old, delay=2.0)
+    first_request = coordinator.submit(
+        "req",
+        request_epoch=4,
+        context_hash=old.context_hash,
+        now=0.0,
+        timeout=3.0,
+    )
+
+    coordinator.cancel_request("req")
+    service.plan("req", replacement)
+    replacement_request = coordinator.submit(
+        "req",
+        request_epoch=4,
+        context_hash=replacement.context_hash,
+        now=0.0,
+        timeout=3.0,
+    )
+
+    assert replacement_request.generation == first_request.generation + 1
+    assert (
+        coordinator.take_or_fallback(
+            "req",
+            expected_epoch=4,
+            expected_context_hash=replacement.context_hash,
+            now=0.0,
+        )
+        is replacement
+    )
+    coordinator.poll(2.0)
+    assert coordinator.stale_completions == 1
+
+
+def test_partial_and_empty_completions_are_valid_scheduler_inputs() -> None:
+    service = FakeProposalService()
+    coordinator = ProposalForestCoordinator(service, max_nodes=8)
+    partial = make_forest(
+        token_ids=(10,),
+        parent_indices=(-1,),
+        depths=(0,),
+        source_ids=(0,),
+        proposal_probs=(0.55,),
+        request_epoch=4,
+    )
+    empty = make_forest(
+        token_ids=(),
+        parent_indices=(),
+        depths=(),
+        source_ids=(),
+        proposal_probs=(),
+        request_epoch=5,
+    )
+    service.plan("req", partial)
+    service.plan("req", empty)
+    coordinator.submit(
+        "req",
+        request_epoch=4,
+        context_hash=partial.context_hash,
+        now=0.0,
+        timeout=1.0,
+    )
+    coordinator.submit(
+        "req",
+        request_epoch=5,
+        context_hash=empty.context_hash,
+        now=0.0,
+        timeout=1.0,
+    )
+
+    selected_partial = coordinator.take_or_fallback(
+        "req",
+        expected_epoch=4,
+        expected_context_hash=partial.context_hash,
+        now=0.0,
+    )
+    selected_empty = coordinator.take_or_fallback(
+        "req",
+        expected_epoch=5,
+        expected_context_hash=empty.context_hash,
+        now=0.0,
+    )
+
+    assert selected_partial is partial
+    assert selected_empty is empty
+    assert select_greedy_path(selected_empty, (6,)).token_ids == (6,)
+
+
+def test_malformed_or_wrong_context_completion_falls_back() -> None:
+    service = FakeProposalService()
+    coordinator = ProposalForestCoordinator(service, max_nodes=8)
+    malformed = make_forest(
+        token_ids=(10, 10, 11, 21),
+        proposal_probs=(0.5, 0.4, 0.7, 0.8),
+    )
+    service.plan("req", malformed)
+    coordinator.submit(
+        "req",
+        request_epoch=4,
+        context_hash=malformed.context_hash,
+        now=0.0,
+        timeout=1.0,
+    )
+
+    assert (
+        coordinator.take_or_fallback(
+            "req",
+            expected_epoch=4,
+            expected_context_hash=malformed.context_hash,
+            now=0.0,
+        )
+        is None
+    )
+    assert coordinator.rejected_completions == 1
+
+    valid = make_forest(request_epoch=5)
+    service.plan("req", valid)
+    coordinator.submit(
+        "req",
+        request_epoch=5,
+        context_hash=valid.context_hash,
+        now=1.0,
+        timeout=1.0,
+    )
+    assert (
+        coordinator.take_or_fallback(
+            "req",
+            expected_epoch=5,
+            expected_context_hash="rolled-back-context",
+            now=1.0,
+        )
+        is None
+    )
+    assert coordinator.rejected_completions == 2
+
+
+def test_coordinator_bounds_current_and_lookahead_window() -> None:
+    service = FakeProposalService()
+    coordinator = ProposalForestCoordinator(
+        service,
+        max_nodes=8,
+        max_inflight_per_request=2,
+    )
+    for epoch in (4, 5):
+        coordinator.submit(
+            "req",
+            request_epoch=epoch,
+            context_hash=make_forest().context_hash,
+            now=0.0,
+            timeout=10.0,
+        )
+
+    with pytest.raises(ValueError, match="proposal window is full"):
+        coordinator.submit(
+            "req",
+            request_epoch=6,
+            context_hash=make_forest().context_hash,
+            now=0.0,
+            timeout=10.0,
+        )
+
+
+def test_ready_forests_still_count_against_double_buffer_capacity() -> None:
+    service = FakeProposalService()
+    coordinator = ProposalForestCoordinator(service, max_nodes=8)
+    for epoch in (4, 5):
+        forest = make_forest(request_epoch=epoch)
+        service.plan("req", forest)
+        coordinator.submit(
+            "req",
+            request_epoch=epoch,
+            context_hash=forest.context_hash,
+            now=0.0,
+            timeout=10.0,
+        )
+    coordinator.poll(0.0)
+    assert coordinator.num_inflight == 0
+
+    with pytest.raises(ValueError, match="proposal window is full"):
+        coordinator.submit(
+            "req",
+            request_epoch=6,
+            context_hash=make_forest().context_hash,
+            now=0.0,
+            timeout=10.0,
+        )
+
+    coordinator.take_or_fallback(
+        "req",
+        expected_epoch=4,
+        expected_context_hash=make_forest().context_hash,
+        now=0.0,
+    )
+    coordinator.submit(
+        "req",
+        request_epoch=6,
+        context_hash=make_forest().context_hash,
+        now=0.0,
+        timeout=10.0,
     )

@@ -17,6 +17,7 @@ import math
 from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 
 class ProposalForestValidationError(ValueError):
@@ -438,3 +439,315 @@ class ProposalForestBuffer:
 
     def cancel(self, request_id: str) -> None:
         self._pending.pop(request_id, None)
+
+    def pending_epochs(self, request_id: str) -> tuple[int, ...]:
+        """Return buffered epochs for capacity checks and diagnostics."""
+
+        return tuple(sorted(self._pending.get(request_id, ())))
+
+
+@dataclass(frozen=True, slots=True)
+class ProposalRequest:
+    """One asynchronous current-epoch or look-ahead proposal request."""
+
+    request_id: str
+    request_epoch: int
+    context_hash: str
+    max_nodes: int
+    generation: int
+    submitted_at: float
+    deadline: float
+
+
+@dataclass(frozen=True, slots=True)
+class ProposalCompletion:
+    """A proposal service response tied to the submitted request generation."""
+
+    request: ProposalRequest
+    forest: ProposalForest
+
+
+class ProposalService(Protocol):
+    """Minimal transport-independent interface used by the CPU coordinator."""
+
+    def submit(self, request: ProposalRequest) -> None: ...
+
+    def poll(self, now: float) -> tuple[ProposalCompletion, ...]: ...
+
+    def cancel(
+        self,
+        request_id: str,
+        *,
+        request_epoch: int | None = None,
+        generation: int | None = None,
+    ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _PlannedCompletion:
+    delay: float
+    forest: ProposalForest
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingCompletion:
+    ready_at: float
+    completion: ProposalCompletion
+
+
+class FakeProposalService:
+    """Deterministic logical-clock service for scheduler correctness tests.
+
+    Plans are keyed by request ID, epoch, and context hash.  A request with no
+    plan intentionally remains silent, which models a stalled remote drafter.
+    Setting ``honor_cancellation=False`` models a transport where a cancelled
+    response can still arrive and must be rejected by generation metadata.
+    """
+
+    def __init__(self, *, honor_cancellation: bool = True) -> None:
+        self.honor_cancellation = honor_cancellation
+        self._plans: dict[tuple[str, int, str], list[_PlannedCompletion]] = defaultdict(
+            list
+        )
+        self._pending: list[_PendingCompletion] = []
+
+    def plan(
+        self,
+        request_id: str,
+        forest: ProposalForest,
+        *,
+        delay: float = 0.0,
+    ) -> None:
+        if not request_id:
+            raise ValueError("request_id must not be empty")
+        if not math.isfinite(delay) or delay < 0:
+            raise ValueError("delay must be finite and non-negative")
+        key = (request_id, forest.request_epoch, forest.context_hash)
+        self._plans[key].append(_PlannedCompletion(delay=delay, forest=forest))
+
+    def submit(self, request: ProposalRequest) -> None:
+        key = (request.request_id, request.request_epoch, request.context_hash)
+        plans = self._plans.get(key)
+        if not plans:
+            return
+        plan = plans.pop(0)
+        if not plans:
+            self._plans.pop(key, None)
+        self._pending.append(
+            _PendingCompletion(
+                ready_at=request.submitted_at + plan.delay,
+                completion=ProposalCompletion(request=request, forest=plan.forest),
+            )
+        )
+
+    def poll(self, now: float) -> tuple[ProposalCompletion, ...]:
+        if not math.isfinite(now):
+            raise ValueError("now must be finite")
+        ready = sorted(
+            (pending for pending in self._pending if pending.ready_at <= now),
+            key=lambda pending: (
+                pending.ready_at,
+                pending.completion.request.request_epoch,
+            ),
+        )
+        if not ready:
+            return ()
+        ready_ids = {id(pending) for pending in ready}
+        self._pending = [
+            pending for pending in self._pending if id(pending) not in ready_ids
+        ]
+        return tuple(pending.completion for pending in ready)
+
+    def cancel(
+        self,
+        request_id: str,
+        *,
+        request_epoch: int | None = None,
+        generation: int | None = None,
+    ) -> None:
+        if not self.honor_cancellation:
+            return
+
+        def keep(pending: _PendingCompletion) -> bool:
+            request = pending.completion.request
+            if request.request_id != request_id:
+                return True
+            if request_epoch is not None and request.request_epoch != request_epoch:
+                return True
+            return generation is not None and request.generation != generation
+
+        self._pending = [pending for pending in self._pending if keep(pending)]
+
+
+class ProposalForestCoordinator:
+    """Fail-closed double buffer for current and look-ahead proposal epochs.
+
+    The coordinator never waits for proposal work.  At the target scheduling
+    boundary, ``take_or_fallback`` either returns a fully validated forest for
+    the exact request epoch and context, or ``None`` so normal one-token target
+    decoding can proceed.  Rollback increments a per-request generation so a
+    late response remains stale even when the transport cannot cancel it.
+    """
+
+    def __init__(
+        self,
+        service: ProposalService,
+        *,
+        max_nodes: int,
+        max_inflight_per_request: int = 2,
+    ) -> None:
+        if max_nodes < 0:
+            raise ValueError("max_nodes must be non-negative")
+        if max_inflight_per_request <= 0:
+            raise ValueError("max_inflight_per_request must be positive")
+        self.service = service
+        self.max_nodes = max_nodes
+        self.max_inflight_per_request = max_inflight_per_request
+        self.buffer = ProposalForestBuffer(
+            max_nodes=max_nodes,
+            max_pending_per_request=max_inflight_per_request,
+        )
+        self._generations: dict[str, int] = defaultdict(int)
+        self._inflight: dict[tuple[str, int], ProposalRequest] = {}
+        self.rejected_completions = 0
+        self.stale_completions = 0
+        self.timed_out_requests = 0
+
+    @property
+    def num_inflight(self) -> int:
+        return len(self._inflight)
+
+    def submit(
+        self,
+        request_id: str,
+        *,
+        request_epoch: int,
+        context_hash: str,
+        now: float,
+        timeout: float,
+    ) -> ProposalRequest:
+        if not request_id:
+            raise ValueError("request_id must not be empty")
+        if request_epoch < 0:
+            raise ValueError("request_epoch must be non-negative")
+        if not context_hash:
+            raise ValueError("context_hash must not be empty")
+        if not math.isfinite(now):
+            raise ValueError("now must be finite")
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("timeout must be finite and non-negative")
+        key = (request_id, request_epoch)
+        if key in self._inflight:
+            raise ValueError(
+                f"request {request_id} epoch {request_epoch} is already in flight"
+            )
+        pending_epochs = self.buffer.pending_epochs(request_id)
+        if request_epoch in pending_epochs:
+            raise ValueError(
+                f"request {request_id} epoch {request_epoch} is already buffered"
+            )
+        inflight_count = sum(
+            request.request_id == request_id for request in self._inflight.values()
+        )
+        if inflight_count + len(pending_epochs) >= self.max_inflight_per_request:
+            raise ValueError(f"request {request_id} proposal window is full")
+        request = ProposalRequest(
+            request_id=request_id,
+            request_epoch=request_epoch,
+            context_hash=context_hash,
+            max_nodes=self.max_nodes,
+            generation=self._generations[request_id],
+            submitted_at=now,
+            deadline=now + timeout,
+        )
+        self._inflight[key] = request
+        try:
+            self.service.submit(request)
+        except Exception:
+            del self._inflight[key]
+            raise
+        return request
+
+    def poll(self, now: float) -> None:
+        if not math.isfinite(now):
+            raise ValueError("now must be finite")
+        for completion in self.service.poll(now):
+            completed_request = completion.request
+            key = (completed_request.request_id, completed_request.request_epoch)
+            expected_request = self._inflight.get(key)
+            if expected_request != completed_request:
+                self.stale_completions += 1
+                continue
+            del self._inflight[key]
+            if now > expected_request.deadline:
+                self.timed_out_requests += 1
+                continue
+            try:
+                completion.forest.validate(
+                    max_nodes=expected_request.max_nodes,
+                    expected_epoch=expected_request.request_epoch,
+                    expected_context_hash=expected_request.context_hash,
+                )
+                self.buffer.publish(
+                    expected_request.request_id,
+                    completion.forest,
+                )
+            except ProposalForestValidationError:
+                self.rejected_completions += 1
+
+        for key, request in tuple(self._inflight.items()):
+            if now < request.deadline:
+                continue
+            del self._inflight[key]
+            self.timed_out_requests += 1
+            self.service.cancel(
+                request.request_id,
+                request_epoch=request.request_epoch,
+                generation=request.generation,
+            )
+
+    def take_or_fallback(
+        self,
+        request_id: str,
+        *,
+        expected_epoch: int,
+        expected_context_hash: str,
+        now: float,
+    ) -> ProposalForest | None:
+        """Return ready work or cancel this epoch and let the target proceed."""
+
+        self.poll(now)
+        try:
+            forest = self.buffer.take(
+                request_id,
+                expected_epoch=expected_epoch,
+                expected_context_hash=expected_context_hash,
+            )
+        except ProposalForestValidationError:
+            self.rejected_completions += 1
+            forest = None
+        if forest is not None:
+            return forest
+
+        key = (request_id, expected_epoch)
+        request = self._inflight.pop(key, None)
+        if request is not None:
+            self.service.cancel(
+                request_id,
+                request_epoch=expected_epoch,
+                generation=request.generation,
+            )
+        return None
+
+    def cancel_request(self, request_id: str) -> None:
+        """Cancel all work and invalidate late results for target rollback."""
+
+        if not request_id:
+            raise ValueError("request_id must not be empty")
+        generation = self._generations[request_id]
+        self._generations[request_id] = generation + 1
+        self.buffer.cancel(request_id)
+        for key, request in tuple(self._inflight.items()):
+            if request.request_id == request_id:
+                del self._inflight[key]
+        self.service.cancel(request_id, generation=generation)
