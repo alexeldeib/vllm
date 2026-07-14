@@ -15,6 +15,7 @@ from vllm.v1.spec_decode.proposal_forest import (
     ProposalForestBuffer,
     ProposalForestCoordinator,
     ProposalForestValidationError,
+    build_packed_verifier_layout,
     collapse_duplicated_greedy_rows,
     collapse_duplicated_probability_rows,
     context_digest,
@@ -51,6 +52,68 @@ def test_validate_builds_positions_paths_and_ancestor_mask() -> None:
         (True, False, True, False),
         (False, True, False, True),
     )
+
+
+def test_packed_verifier_layout_adds_committed_query_root() -> None:
+    forest = make_forest().validate(max_nodes=8)
+
+    layout = build_packed_verifier_layout(
+        forest,
+        committed_token_id=8,
+        context_length=3,
+    )
+
+    assert layout.query_token_ids == (8, 10, 20, 11, 21)
+    assert layout.parent_indices == (-1, 0, 0, 1, 2)
+    assert layout.depths == (0, 1, 1, 2, 2)
+    assert layout.positions == (2, 3, 3, 4, 4)
+    assert layout.ancestor_mask == (
+        (True, False, False, False, False),
+        (True, True, False, False, False),
+        (True, False, True, False, False),
+        (True, True, False, True, False),
+        (True, False, True, False, True),
+    )
+
+
+def test_packed_verifier_layout_empty_forest_keeps_committed_query() -> None:
+    forest = make_forest(
+        token_ids=(),
+        parent_indices=(),
+        depths=(),
+        source_ids=(),
+        proposal_probs=(),
+    ).validate(max_nodes=8)
+
+    layout = build_packed_verifier_layout(
+        forest,
+        committed_token_id=8,
+        context_length=3,
+    )
+
+    assert layout.query_token_ids == (8,)
+    assert layout.parent_indices == (-1,)
+    assert layout.depths == (0,)
+    assert layout.positions == (2,)
+    assert layout.ancestor_mask == ((True,),)
+
+
+@pytest.mark.parametrize(
+    ("committed_token_id", "context_length", "message"),
+    [
+        (-1, 3, "committed_token_id"),
+        (8, 0, "context_length"),
+    ],
+)
+def test_packed_verifier_layout_rejects_invalid_root(
+    committed_token_id: int, context_length: int, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        build_packed_verifier_layout(
+            make_forest(),
+            committed_token_id=committed_token_id,
+            context_length=context_length,
+        )
 
 
 @pytest.mark.parametrize(

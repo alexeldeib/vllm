@@ -218,6 +218,60 @@ class ProposalForest:
 
 
 @dataclass(frozen=True, slots=True)
+class PackedVerifierLayout:
+    """Root-inclusive target-query layout for packed forest verification.
+
+    Query row zero contains the last logically committed token, which has been
+    emitted but is not yet present in the target KV cache.  It produces the
+    target distribution after the committed context.  Query row
+    ``node_idx + 1`` contains proposal node ``node_idx`` and produces the
+    target distribution after that node's full ancestor path.
+    """
+
+    query_token_ids: tuple[int, ...]
+    parent_indices: tuple[int, ...]
+    depths: tuple[int, ...]
+    positions: tuple[int, ...]
+    ancestor_mask: tuple[tuple[bool, ...], ...]
+
+
+def build_packed_verifier_layout(
+    forest: ProposalForest,
+    *,
+    committed_token_id: int,
+    context_length: int,
+) -> PackedVerifierLayout:
+    """Add the pending committed root and shift metadata into query space."""
+
+    forest.validate(max_nodes=forest.num_nodes)
+    if committed_token_id < 0:
+        raise ValueError("committed_token_id must be non-negative")
+    if context_length <= 0:
+        raise ValueError("context_length must include the committed token")
+
+    parent_indices = (-1,) + tuple(
+        0 if parent_idx == -1 else parent_idx + 1
+        for parent_idx in forest.parent_indices
+    )
+    depths = (0,) + tuple(depth + 1 for depth in forest.depths)
+    positions = (context_length - 1,) + forest.packed_positions(context_length)
+    forest_ancestor_mask = forest.ancestor_mask()
+    num_queries = forest.num_nodes + 1
+    ancestor_mask = ((True,) + (False,) * forest.num_nodes,) + tuple(
+        (True,) + forest_row for forest_row in forest_ancestor_mask
+    )
+    assert all(len(row) == num_queries for row in ancestor_mask)
+
+    return PackedVerifierLayout(
+        query_token_ids=(committed_token_id, *forest.token_ids),
+        parent_indices=parent_indices,
+        depths=depths,
+        positions=positions,
+        ancestor_mask=ancestor_mask,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class LinearProposal:
     """One proposal source's weighted causal chain.
 
