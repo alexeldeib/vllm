@@ -28,6 +28,15 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             use_non_causal=not causal,
             backend=speculative_config.attention_backend,
         ),
+        # The target and DSpark draft have independent KV caches. Inheriting a
+        # quantized target KV dtype can make the draft's required non-causal
+        # backend invalid (for example, FlashAttention with an FP8 target KV
+        # cache). Store draft KV in its activation dtype instead.
+        cache_config=replace(
+            vllm_config.cache_config,
+            cache_dtype="auto",
+            calculate_kv_scales=False,
+        ),
     )
 
     with set_model_tag("dspark_head"):
