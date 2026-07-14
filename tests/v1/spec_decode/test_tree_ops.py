@@ -7,10 +7,36 @@ import torch
 from vllm.platforms import current_platform
 from vllm.v1.spec_decode.tree_ops import (
     KVCacheSlotCompactor,
+    build_ddtree_from_logits,
     compact_tree_rows,
     select_greedy_tree_path,
     select_greedy_tree_path_reference,
+    select_relaxed_greedy_tree_path,
+    select_relaxed_greedy_tree_path_reference,
 )
+
+
+def test_build_ddtree_from_logits_shares_best_first_prefixes() -> None:
+    logits = torch.log(
+        torch.tensor(
+            [
+                [0.6, 0.4, 1e-6],
+                [0.9, 0.1, 1e-6],
+                [0.9, 0.1, 1e-6],
+            ]
+        )
+    )
+    # Map the compact synthetic vocabulary to distinctive token IDs by
+    # permuting columns independently at each future depth.
+    permutations = torch.tensor([[1, 2, 0], [2, 0, 1], [0, 2, 1]])
+    logits = logits.gather(1, permutations.argsort(dim=1))
+
+    tree = build_ddtree_from_logits(logits, budget=4, request_id="req")
+
+    assert tree.token_ids.tolist() == [[1, 2, 0, 2]]
+    assert tree.parent_indices.tolist() == [-1, 0, 1, -1]
+    assert tree.depths.tolist() == [0, 1, 2, 0]
+    assert tree.query_ancestor_masks.tolist() == [1, 3, 7, 15, 17]
 
 
 def test_select_greedy_tree_path_reference_follows_conditioned_branch() -> None:
@@ -34,6 +60,35 @@ def test_select_greedy_tree_path_reference_emits_full_path_bonus() -> None:
 
     assert emitted == list(range(32))
     assert selected == list(range(31))
+
+
+def test_relaxed_tree_path_reference_bounds_target_logit_gap() -> None:
+    # The exact greedy path stops on token 9. With a 0.25 gap, token 10 is a
+    # sufficiently likely deviation and unlocks the exact child token 11.
+    logits = [[-10.0] * 32 for _ in range(5)]
+    logits[0][9], logits[0][10] = 2.0, 1.8
+    logits[1][11] = 3.0
+    logits[3][7] = 4.0
+
+    emitted, selected = select_relaxed_greedy_tree_path_reference(
+        [10, 20, 11, 21],
+        [-1, -1, 0, 1],
+        logits,
+        max_logit_gap=0.25,
+    )
+
+    assert emitted == [10, 11, 7]
+    assert selected == [0, 2]
+
+    emitted, selected = select_relaxed_greedy_tree_path_reference(
+        [10, 20, 11, 21],
+        [-1, -1, 0, 1],
+        logits,
+        max_logit_gap=0.1,
+    )
+
+    assert emitted == [9]
+    assert selected == []
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
@@ -73,6 +128,26 @@ def test_select_greedy_tree_path_cuda_emits_full_path_bonus() -> None:
     assert output.cpu().tolist() == [list(range(32))]
     assert selected.cpu().tolist() == list(range(31))
     assert num_selected.item() == 31
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")
+def test_select_relaxed_greedy_tree_path_cuda() -> None:
+    device = torch.device("cuda")
+    logits = torch.full((5, 32), -10.0, device=device)
+    logits[0, 9], logits[0, 10] = 2.0, 1.8
+    logits[1, 11] = 3.0
+    logits[3, 7] = 4.0
+
+    output, selected, num_selected = select_relaxed_greedy_tree_path(
+        torch.tensor([[10, 20, 11, 21]], device=device),
+        torch.tensor([-1, -1, 0, 1], dtype=torch.int32, device=device),
+        logits,
+        max_logit_gap=0.25,
+    )
+
+    assert output.cpu().tolist() == [[10, 11, 7, -1, -1]]
+    assert selected.cpu().tolist() == [0, 2, -1, -1]
+    assert num_selected.item() == 2
 
 
 @pytest.mark.skipif(not current_platform.is_cuda(), reason="requires CUDA")

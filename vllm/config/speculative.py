@@ -69,6 +69,7 @@ SpeculativeMethod = Literal[
 ]
 RejectionSampleMethod = Literal["standard", "synthetic"]
 DraftSampleMethod = Literal["greedy", "probabilistic"]
+ProposalTreeStrategy = Literal["root_spines", "ddtree"]
 
 
 @config
@@ -170,6 +171,28 @@ class SpeculativeConfig:
 
     proposal_tree_branch_depth: int = Field(default=7, ge=1, le=31)
     """Maximum packed depth allocated to each non-primary DFlash branch."""
+
+    proposal_tree_strategy: ProposalTreeStrategy = "root_spines"
+    """Experimental DFlash proposal-tree construction strategy.
+
+    ``root_spines`` is a fixed-topology plumbing gate. ``ddtree`` applies the
+    DDTree best-first heap to all per-position DFlash marginal logits.
+    """
+
+    proposal_tree_draft_horizon: int | None = Field(default=None, ge=1, le=31)
+    """DFlash mask horizon used to construct a potentially larger DDTree budget.
+
+    When unset, the drafter horizon equals ``num_speculative_tokens``. A
+    checkpoint's trained horizon can be smaller than the target tree budget.
+    """
+
+    proposal_tree_max_logit_gap: float | None = Field(default=None, ge=0.0)
+    """Optionally continue down a proposal tree with bounded greedy regret.
+
+    When the exact greedy token is absent, select the available child with the
+    highest target logit only if it is within this gap of the greedy logit.
+    Unset preserves exact greedy decoding. Setting this is approximate.
+    """
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -313,6 +336,9 @@ class SpeculativeConfig:
         factors.append(self.proposal_tree_verification)
         factors.append(self.proposal_tree_num_branches)
         factors.append(self.proposal_tree_branch_depth)
+        factors.append(self.proposal_tree_strategy)
+        factors.append(self.proposal_tree_draft_horizon)
+        factors.append(self.proposal_tree_max_logit_gap)
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
@@ -652,10 +678,10 @@ class SpeculativeConfig:
         if self.method in ("ngram", "[ngram]"):
             self.method = "ngram"
 
-        if self.proposal_tree_num_branches > 1:
+        if self.uses_proposal_tree():
             if not self.proposal_tree_verification:
                 raise ValueError(
-                    "proposal_tree_num_branches > 1 requires proposal_tree_verification"
+                    "branching proposal trees require proposal_tree_verification"
                 )
             if self.method != "dflash":
                 raise ValueError(
@@ -669,6 +695,19 @@ class SpeculativeConfig:
                     "branching proposal trees support at most 31 proposal tokens"
                 )
             self.enforce_eager = True
+
+        if (
+            self.proposal_tree_draft_horizon is not None
+            and self.proposal_tree_strategy != "ddtree"
+        ):
+            raise ValueError("proposal_tree_draft_horizon is only supported by DDTree")
+        if (
+            self.proposal_tree_max_logit_gap is not None
+            and not self.uses_proposal_tree()
+        ):
+            raise ValueError(
+                "proposal_tree_max_logit_gap requires a branching proposal tree"
+            )
 
         if self.method in ("ngram", "ngram_gpu"):
             # Set default values if not provided
@@ -1151,6 +1190,12 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
+
+    def uses_proposal_tree(self) -> bool:
+        return (
+            self.proposal_tree_num_branches > 1
+            or self.proposal_tree_strategy == "ddtree"
+        )
 
     def uses_dynamic_speculative_decoding(self) -> bool:
         return self.num_speculative_tokens_per_batch_size is not None

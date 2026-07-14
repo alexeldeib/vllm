@@ -206,6 +206,7 @@ from vllm.v1.spec_decode.tree_ops import (
     KVCacheSlotCompactor,
     compact_tree_rows,
     select_greedy_tree_path,
+    select_relaxed_greedy_tree_path,
 )
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
@@ -2264,7 +2265,7 @@ class GPUModelRunner(
         if (
             spec_config is None
             or not spec_config.proposal_tree_verification
-            or spec_config.proposal_tree_num_branches == 1
+            or not spec_config.uses_proposal_tree()
             or not scheduler_output.scheduled_spec_decode_tokens
         ):
             return
@@ -3859,16 +3860,31 @@ class GPUModelRunner(
                     "decoding without penalties, masks, bad words, thinking budgets, "
                     "or logprobs"
                 )
-            target_next_token_ids = logits.argmax(dim=-1)
-            (
-                output_token_ids,
-                self._tree_selected_node_indices,
-                self._tree_num_selected,
-            ) = select_greedy_tree_path(
-                active_tree.token_ids,
-                active_tree.parent_indices,
-                target_next_token_ids,
-            )
+            spec_config = self.speculative_config
+            assert spec_config is not None
+            max_logit_gap = spec_config.proposal_tree_max_logit_gap
+            if max_logit_gap is None:
+                target_next_token_ids = logits.argmax(dim=-1)
+                (
+                    output_token_ids,
+                    self._tree_selected_node_indices,
+                    self._tree_num_selected,
+                ) = select_greedy_tree_path(
+                    active_tree.token_ids,
+                    active_tree.parent_indices,
+                    target_next_token_ids,
+                )
+            else:
+                (
+                    output_token_ids,
+                    self._tree_selected_node_indices,
+                    self._tree_num_selected,
+                ) = select_relaxed_greedy_tree_path(
+                    active_tree.token_ids,
+                    active_tree.parent_indices,
+                    logits,
+                    max_logit_gap,
+                )
             return SamplerOutput(
                 sampled_token_ids=output_token_ids,
                 logprobs_tensors=None,
@@ -5208,7 +5224,7 @@ class GPUModelRunner(
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
         assert spec_config is not None
-        if spec_config.proposal_tree_num_branches > 1:
+        if spec_config.uses_proposal_tree():
             self._next_proposal_tree = None
         num_spec_tokens_to_schedule = scheduler_output.num_spec_tokens_to_schedule
         self._draft_probs = None
@@ -5453,8 +5469,14 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
+            drafter_horizon = num_spec_tokens_to_schedule
+            if (
+                spec_config.proposal_tree_strategy == "ddtree"
+                and spec_config.proposal_tree_draft_horizon is not None
+            ):
+                drafter_horizon = spec_config.proposal_tree_draft_horizon
             draft_token_ids = self.drafter.propose(
-                num_speculative_tokens=num_spec_tokens_to_schedule,
+                num_speculative_tokens=drafter_horizon,
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
@@ -5466,14 +5488,15 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
-            if spec_config.use_dflash() and spec_config.proposal_tree_num_branches > 1:
+            if spec_config.use_dflash() and spec_config.uses_proposal_tree():
                 assert isinstance(self.drafter, DFlashProposer)
                 if len(self.input_batch.req_ids) != 1:
                     raise RuntimeError(
                         "DFlash proposal forests currently support one request"
                     )
-                proposal_tree = self.drafter.build_topk_spine_forest(
+                proposal_tree = self.drafter.build_proposal_forest(
                     draft_token_ids,
+                    budget=num_spec_tokens_to_schedule,
                     request_id=self.input_batch.req_ids[0],
                 )
                 draft_token_ids = proposal_tree.token_ids

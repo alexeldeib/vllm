@@ -11,13 +11,17 @@ hit does not introduce a CPU synchronization into the decode loop.
 
 from __future__ import annotations
 
+import heapq
 from dataclasses import dataclass
 
 import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
-from vllm.v1.attention.ops.mla_tree_attention import MAX_TREE_NODES
+from vllm.v1.attention.ops.mla_tree_attention import (
+    MAX_TREE_NODES,
+    build_tree_ancestor_masks,
+)
 
 MAX_PROPOSAL_NODES = MAX_TREE_NODES - 1
 
@@ -71,6 +75,110 @@ class DeviceProposalTree:
         return self
 
 
+def build_ddtree_from_logits(
+    draft_logits: torch.Tensor,
+    *,
+    budget: int,
+    request_id: str,
+) -> DeviceProposalTree:
+    """Build DDTree's best-first marginal-probability tree.
+
+    This is adapted from the reference DDTree implementation by Liran
+    Ringel and Yaniv Romano (MIT license):
+    https://github.com/liranringel/ddtree/blob/master/ddtree.py
+
+    DFlash emits one marginal distribution per future depth in parallel.
+    The heap enumerates the highest-mass paths implied by those independent
+    depth distributions while sharing common prefixes in the packed tree.
+    The small heap is intentionally a CPU reference/measurement path; the
+    expensive vocabulary top-k and normalization stay on the input device.
+    """
+
+    if draft_logits.ndim != 2:
+        raise ValueError("DDTree logits must have shape [depth, vocab]")
+    depth_limit, vocab_size = draft_logits.shape
+    if depth_limit == 0 or vocab_size == 0:
+        raise ValueError("DDTree logits must have non-empty depth and vocabulary")
+    if not 0 < budget <= MAX_PROPOSAL_NODES:
+        raise ValueError(f"DDTree budget must be in 1..{MAX_PROPOSAL_NODES}")
+    if not request_id:
+        raise ValueError("DDTree request_id must not be empty")
+
+    topk = min(budget, vocab_size)
+    logits = draft_logits.float()
+    top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
+    log_normalizers = torch.logsumexp(logits, dim=-1, keepdim=True)
+    top_log_probs = (top_logits - log_normalizers).to(device="cpu", dtype=torch.float32)
+    top_token_ids_cpu = top_token_ids.to(device="cpu", dtype=torch.int64)
+
+    # Heap entry: negative path mass, rank tuple for deterministic tie breaks,
+    # packed parent index, zero-based depth, token rank, and path log mass.
+    first_log_mass = float(top_log_probs[0, 0])
+    frontier: list[tuple[float, tuple[int, ...], int, int, int, float]] = [
+        (-first_log_mass, (0,), -1, 0, 0, first_log_mass)
+    ]
+    token_ids: list[int] = []
+    parent_indices: list[int] = []
+    depths: list[int] = []
+
+    while frontier and len(token_ids) < budget:
+        _, ranks, parent_idx, depth, rank, log_mass = heapq.heappop(frontier)
+        node_idx = len(token_ids)
+        token_ids.append(int(top_token_ids_cpu[depth, rank]))
+        parent_indices.append(parent_idx)
+        depths.append(depth)
+
+        if rank + 1 < topk:
+            sibling_ranks = ranks[:-1] + (rank + 1,)
+            sibling_log_mass = (
+                log_mass
+                - float(top_log_probs[depth, rank])
+                + float(top_log_probs[depth, rank + 1])
+            )
+            heapq.heappush(
+                frontier,
+                (
+                    -sibling_log_mass,
+                    sibling_ranks,
+                    parent_idx,
+                    depth,
+                    rank + 1,
+                    sibling_log_mass,
+                ),
+            )
+
+        if depth + 1 < depth_limit:
+            child_ranks = ranks + (0,)
+            child_log_mass = log_mass + float(top_log_probs[depth + 1, 0])
+            heapq.heappush(
+                frontier,
+                (
+                    -child_log_mass,
+                    child_ranks,
+                    node_idx,
+                    depth + 1,
+                    0,
+                    child_log_mass,
+                ),
+            )
+
+    query_parents = [-1] + [
+        0 if parent_idx == -1 else parent_idx + 1 for parent_idx in parent_indices
+    ]
+    device = draft_logits.device
+    return DeviceProposalTree(
+        token_ids=torch.tensor(token_ids, dtype=torch.int64, device=device).view(1, -1),
+        parent_indices=torch.tensor(parent_indices, dtype=torch.int32, device=device),
+        depths=torch.tensor(depths, dtype=torch.int64, device=device),
+        query_ancestor_masks=torch.tensor(
+            build_tree_ancestor_masks(query_parents),
+            dtype=torch.int64,
+            device=device,
+        ),
+        request_id=request_id,
+    ).validate()
+
+
 def select_greedy_tree_path_reference(
     token_ids: list[int],
     parent_indices: list[int],
@@ -106,17 +214,75 @@ def select_greedy_tree_path_reference(
         parent_idx = matching_child
 
 
+def select_relaxed_greedy_tree_path_reference(
+    token_ids: list[int],
+    parent_indices: list[int],
+    target_logits: list[list[float]],
+    max_logit_gap: float,
+) -> tuple[list[int], list[int]]:
+    """CPU oracle for target-score-bounded approximate tree selection."""
+
+    num_nodes = len(token_ids)
+    if len(parent_indices) != num_nodes:
+        raise ValueError("token and parent counts differ")
+    if len(target_logits) != num_nodes + 1:
+        raise ValueError("target rows must contain the root plus every proposal node")
+    if max_logit_gap < 0:
+        raise ValueError("maximum target-logit gap must be nonnegative")
+
+    emitted: list[int] = []
+    selected: list[int] = []
+    parent_idx = -1
+    while True:
+        row = target_logits[parent_idx + 1]
+        target_token_id = max(range(len(row)), key=row.__getitem__)
+        children = [
+            node_idx
+            for node_idx, node_parent in enumerate(parent_indices)
+            if node_parent == parent_idx
+        ]
+        if not children:
+            emitted.append(target_token_id)
+            return emitted, selected
+
+        matching_child = next(
+            (
+                node_idx
+                for node_idx in children
+                if token_ids[node_idx] == target_token_id
+            ),
+            None,
+        )
+        if matching_child is None:
+            matching_child = max(
+                children,
+                key=lambda node_idx: row[token_ids[node_idx]],
+            )
+            if row[target_token_id] - row[token_ids[matching_child]] > max_logit_gap:
+                emitted.append(target_token_id)
+                return emitted, selected
+
+        emitted.append(token_ids[matching_child])
+        selected.append(matching_child)
+        parent_idx = matching_child
+
+
 @triton.jit
 def _select_greedy_tree_path_kernel(
     proposal_token_ids_ptr,
     parent_indices_ptr,
     target_next_token_ids_ptr,
+    target_logits_ptr,
+    target_max_logits_ptr,
     output_token_ids_ptr,
     selected_node_indices_ptr,
     num_selected_ptr,
     num_nodes,
+    target_logits_row_stride,
+    max_logit_gap,
     BLOCK_N: tl.constexpr,
     MAX_TREE_ROWS: tl.constexpr,
+    RELAXED: tl.constexpr,
 ):
     node_offsets = tl.arange(0, BLOCK_N)
     valid_nodes = node_offsets < num_nodes
@@ -140,7 +306,48 @@ def _select_greedy_tree_path_kernel(
         matching_child = tl.min(tl.where(matches, node_offsets, MAX_TREE_ROWS))
         has_match = matching_child < num_nodes
 
-        tl.store(output_token_ids_ptr + step, target_token_id, mask=active)
+        if RELAXED:
+            row_idx = parent_idx + 1
+            child_logits = tl.load(
+                target_logits_ptr
+                + row_idx * target_logits_row_stride
+                + proposal_token_ids,
+                mask=valid_nodes,
+                other=-float("inf"),
+            )
+            child_logits = tl.where(
+                valid_nodes & (parent_indices == parent_idx),
+                child_logits,
+                -float("inf"),
+            )
+            best_child_logit = tl.max(child_logits)
+            best_child = tl.min(
+                tl.where(
+                    child_logits == best_child_logit,
+                    node_offsets,
+                    MAX_TREE_ROWS,
+                )
+            )
+            target_max_logit = tl.load(target_max_logits_ptr + row_idx)
+            has_relaxed_match = (best_child < num_nodes) & (
+                best_child_logit >= target_max_logit - max_logit_gap
+            )
+            use_relaxed_match = ~has_match & has_relaxed_match
+            matching_child = tl.where(use_relaxed_match, best_child, matching_child)
+            has_match = has_match | has_relaxed_match
+            emitted_token_id = tl.where(
+                use_relaxed_match,
+                tl.load(
+                    proposal_token_ids_ptr + best_child,
+                    mask=best_child < num_nodes,
+                    other=target_token_id,
+                ),
+                target_token_id,
+            )
+        else:
+            emitted_token_id = target_token_id
+
+        tl.store(output_token_ids_ptr + step, emitted_token_id, mask=active)
         tl.store(
             selected_node_indices_ptr + step,
             matching_child,
@@ -209,12 +416,80 @@ def select_greedy_tree_path(
         proposal_token_ids,
         parent_indices,
         target_next_token_ids,
+        target_next_token_ids,
+        target_next_token_ids,
         output_token_ids,
         selected_node_indices,
         num_selected,
         num_nodes,
+        0,
+        0.0,
         BLOCK_N=32,
         MAX_TREE_ROWS=MAX_TREE_NODES,
+        RELAXED=False,
+    )
+    return output_token_ids, selected_node_indices, num_selected
+
+
+def select_relaxed_greedy_tree_path(
+    proposal_token_ids: torch.Tensor,
+    parent_indices: torch.Tensor,
+    target_logits: torch.Tensor,
+    max_logit_gap: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select a path, allowing only target-score-bounded greedy deviations."""
+
+    if proposal_token_ids.ndim == 2:
+        if proposal_token_ids.shape[0] != 1:
+            raise ValueError("relaxed tree selection currently supports batch size one")
+        proposal_token_ids = proposal_token_ids[0]
+    if proposal_token_ids.ndim != 1 or parent_indices.ndim != 1:
+        raise ValueError("proposal tokens and parents must be one-dimensional")
+    num_nodes = proposal_token_ids.numel()
+    if not 0 < num_nodes <= MAX_PROPOSAL_NODES:
+        raise ValueError(
+            f"relaxed tree selection requires 1..{MAX_PROPOSAL_NODES} nodes"
+        )
+    if parent_indices.numel() != num_nodes:
+        raise ValueError("proposal token and parent counts differ")
+    if target_logits.ndim != 2 or target_logits.shape[0] != num_nodes + 1:
+        raise ValueError(f"target_logits must have {num_nodes + 1} rows")
+    if max_logit_gap < 0:
+        raise ValueError("maximum target-logit gap must be nonnegative")
+    if not proposal_token_ids.is_cuda:
+        raise ValueError("relaxed tree selection requires CUDA tensors")
+    if not (parent_indices.device == proposal_token_ids.device == target_logits.device):
+        raise ValueError("relaxed tree selection tensors must share one device")
+
+    target_max_logits, target_next_token_ids = target_logits.max(dim=-1)
+    output_token_ids = torch.full(
+        (1, num_nodes + 1),
+        -1,
+        dtype=target_next_token_ids.dtype,
+        device=target_logits.device,
+    )
+    selected_node_indices = torch.full(
+        (num_nodes,),
+        -1,
+        dtype=torch.int32,
+        device=target_logits.device,
+    )
+    num_selected = torch.empty((1,), dtype=torch.int32, device=target_logits.device)
+    _select_greedy_tree_path_kernel[(1,)](
+        proposal_token_ids,
+        parent_indices,
+        target_next_token_ids,
+        target_logits,
+        target_max_logits,
+        output_token_ids,
+        selected_node_indices,
+        num_selected,
+        num_nodes,
+        target_logits.stride(0),
+        max_logit_gap,
+        BLOCK_N=32,
+        MAX_TREE_ROWS=MAX_TREE_NODES,
+        RELAXED=True,
     )
     return output_token_ids, selected_node_indices, num_selected
 

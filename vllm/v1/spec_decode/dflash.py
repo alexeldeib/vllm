@@ -18,6 +18,7 @@ from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.tree_ops import (
     MAX_PROPOSAL_NODES,
     DeviceProposalTree,
+    build_ddtree_from_logits,
 )
 from vllm.v1.spec_decode.utils import copy_and_expand_dflash_inputs_kernel
 
@@ -86,7 +87,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if self.speculative_config.proposal_tree_num_branches == 1:
+        if not self.speculative_config.uses_proposal_tree():
             return super()._sample_draft_tokens(hidden_states, sampling_metadata)
 
         # The tree builder needs the root distribution, not merely its argmax.
@@ -176,6 +177,31 @@ class DFlashProposer(SpecDecodeBaseProposer):
             query_ancestor_masks=topology[2],
             request_id=request_id,
         ).validate()
+
+    def build_proposal_forest(
+        self,
+        draft_token_ids: torch.Tensor,
+        *,
+        budget: int,
+        request_id: str,
+    ) -> DeviceProposalTree:
+        """Build the configured experimental DFlash proposal topology."""
+
+        if self.speculative_config.proposal_tree_strategy == "root_spines":
+            if budget != draft_token_ids.shape[1]:
+                raise ValueError("root-spine budget must equal the DFlash horizon")
+            return self.build_topk_spine_forest(
+                draft_token_ids,
+                request_id=request_id,
+            )
+        logits = self._proposal_tree_logits
+        if logits is None:
+            raise RuntimeError("DFlash logits are unavailable for DDTree packing")
+        return build_ddtree_from_logits(
+            logits,
+            budget=budget,
+            request_id=request_id,
+        )
 
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
