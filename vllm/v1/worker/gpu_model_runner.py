@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import reduce
@@ -855,6 +855,11 @@ class GPUModelRunner(
         self._next_proposal_tree: DeviceProposalTree | None = None
         self._active_proposal_tree: DeviceProposalTree | None = None
         self._active_tree_query_slot_mapping: torch.Tensor | None = None
+        self._tree_query_ancestor_masks: torch.Tensor | None = None
+        self._tree_query_slot_mapping: torch.Tensor | None = None
+        self._tree_prefix_block_table: torch.Tensor | None = None
+        self._tree_prefix_seq_lens: torch.Tensor | None = None
+        self._tree_full_cudagraph_captured = False
         self._tree_selected_node_indices: torch.Tensor | None = None
         self._tree_num_selected: torch.Tensor | None = None
         self._tree_kv_compactor: KVCacheSlotCompactor | None = None
@@ -2315,10 +2320,6 @@ class GPUModelRunner(
         selected-path state compaction before the next proposal epoch.
         """
 
-        if cudagraph_mode == CUDAGraphMode.FULL:
-            raise RuntimeError(
-                "proposal_tree_verification cannot run inside a full CUDA graph"
-            )
         if num_tokens_padded != num_tokens_unpadded:
             raise RuntimeError("proposal_tree_verification does not support padding")
         if self.input_batch.num_reqs != 1:
@@ -2420,22 +2421,63 @@ class GPUModelRunner(
                     "proposal_tree_verification requires decode metadata"
                 )
 
-            tree_decode = MLATreeDecodeMetadata(
-                query_lens=[query_len],
-                ancestor_masks=ancestor_masks,
-                slot_mapping=layer_metadata.slot_mapping[:query_len],
+            if self._tree_query_ancestor_masks is None:
+                self._tree_query_ancestor_masks = torch.empty(
+                    MAX_TREE_NODES,
+                    dtype=torch.int64,
+                    device=self.device,
+                )
+                self._tree_query_slot_mapping = torch.empty(
+                    MAX_TREE_NODES,
+                    dtype=layer_metadata.slot_mapping.dtype,
+                    device=self.device,
+                )
+                self._tree_prefix_seq_lens = torch.empty(
+                    MAX_TREE_NODES,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+                self._tree_prefix_block_table = torch.empty(
+                    (
+                        MAX_TREE_NODES,
+                        layer_metadata.decode.block_table.shape[1],
+                    ),
+                    dtype=layer_metadata.decode.block_table.dtype,
+                    device=self.device,
+                )
+            assert self._tree_query_slot_mapping is not None
+            assert self._tree_prefix_seq_lens is not None
+            assert self._tree_prefix_block_table is not None
+            if (
+                self._tree_prefix_block_table.shape[1]
+                != layer_metadata.decode.block_table.shape[1]
+            ):
+                raise RuntimeError("proposal-tree block-table width changed")
+
+            # Full CUDA graphs capture tensor addresses, while the proposal
+            # topology and physical KV slots change on every decode step.  Copy
+            # the values into fixed-capacity runner-owned buffers so the first
+            # tree step can capture one graph and later steps can safely replay
+            # it.  Query length is still encoded in the graph key/shape.
+            self._tree_query_ancestor_masks[:query_len].copy_(ancestor_masks)
+            self._tree_query_slot_mapping[:query_len].copy_(
+                layer_metadata.slot_mapping[:query_len]
+            )
+            self._tree_prefix_seq_lens[:query_len].fill_(context_len)
+            self._tree_prefix_block_table[:query_len].copy_(
+                layer_metadata.decode.block_table[:1].expand(query_len, -1)
             )
 
-            prefix_block_table = layer_metadata.decode.block_table[:1].expand(
-                query_len, -1
+            tree_decode = MLATreeDecodeMetadata(
+                query_lens=[query_len],
+                ancestor_masks=self._tree_query_ancestor_masks[:query_len],
+                slot_mapping=self._tree_query_slot_mapping[:query_len],
             )
-            layer_metadata.decode.block_table = prefix_block_table.contiguous()
-            layer_metadata.decode.seq_lens = torch.full(
-                (query_len,),
-                context_len,
-                dtype=torch.int32,
-                device=self.device,
-            )
+
+            layer_metadata.decode.block_table = self._tree_prefix_block_table[
+                :query_len
+            ]
+            layer_metadata.decode.seq_lens = self._tree_prefix_seq_lens[:query_len]
             layer_metadata.num_reqs = query_len
             layer_metadata.num_decodes = query_len
             layer_metadata.num_decode_tokens = query_len
@@ -4502,12 +4544,17 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
-                # A proposal tree is not a uniform causal decode even though all
-                # of its rows belong to one request. Dispatch it through the
-                # mixed-batch PIECEWISE graph: the dense/MoE regions retain CUDA
-                # graphs while the tree-aware attention custom op stays outside.
-                force_uniform_decode=False if use_mla_tree_verification else None,
+                # Proposal trees have the same fixed query extent as ordinary
+                # speculative decode, so they can use a full CUDA graph once
+                # their dynamic topology is staged in graph-stable buffers.
+                force_uniform_decode=True if use_mla_tree_verification else None,
             )
+
+            if use_mla_tree_verification and cudagraph_mode == CUDAGraphMode.FULL:
+                # The ordinary uniform speculative graph contains causal MTP
+                # attention.  Give the tree verifier a distinct key so its
+                # root-inclusive split-MLA graph is captured independently.
+                batch_desc = replace(batch_desc, uniform=False)
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -4662,31 +4709,54 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
-        with (
-            set_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                cudagraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                ubatch_slices=ubatch_slices_padded,
-                slot_mapping=slot_mappings,
-                skip_compiled=has_encoder_input,
-            ),
-            record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                defer_finalize=defer_kv_connector_finalize,
-            ) as kv_connector_output,
-        ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+        capture_tree_graph = bool(
+            use_mla_tree_verification
+            and cudagraph_mode == CUDAGraphMode.FULL
+            and not self._tree_full_cudagraph_captured
+        )
+        capture_context = None
+        if capture_tree_graph:
+            set_cudagraph_capturing_enabled(True)
+        try:
+            with ExitStack() as stack:
+                if capture_tree_graph:
+                    capture_context = stack.enter_context(graph_capture(self.device))
+                stack.enter_context(
+                    set_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens_padded,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        cudagraph_runtime_mode=cudagraph_mode,
+                        batch_descriptor=batch_desc,
+                        ubatch_slices=ubatch_slices_padded,
+                        slot_mapping=slot_mappings,
+                        skip_compiled=has_encoder_input,
+                    )
+                )
+                stack.enter_context(
+                    record_function_or_nullcontext("gpu_model_runner: forward")
+                )
+                kv_connector_output = stack.enter_context(
+                    self.maybe_get_kv_connector_output(
+                        scheduler_output,
+                        defer_finalize=defer_kv_connector_finalize,
+                    )
+                )
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+        finally:
+            if capture_tree_graph:
+                set_cudagraph_capturing_enabled(False)
+        if capture_tree_graph:
+            assert capture_context is not None
+            torch.cuda.current_stream().wait_stream(capture_context.stream)
+            self._tree_full_cudagraph_captured = True
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
