@@ -4,10 +4,17 @@
 import json
 
 import pytest
+from openai.types.responses import FunctionTool, NamespaceTool
 
+from vllm.entrypoints.openai.chat_completion.protocol import (
+    ChatCompletionToolsParam,
+    FunctionDefinition,
+)
 from vllm.tool_parsers.utils import (
     coerce_to_schema_type,
     extract_types_from_schema,
+    find_tool_properties,
+    get_json_schema_from_tools,
 )
 
 
@@ -279,3 +286,185 @@ class TestExtractTypesFromSchema:
         }
         result = set(extract_types_from_schema(schema))
         assert result == {"integer", "null", "string"}
+
+
+def _make_tool(name: str, parameters: dict) -> ChatCompletionToolsParam:
+    return ChatCompletionToolsParam(
+        type="function",
+        function=FunctionDefinition(name=name, parameters=parameters),
+    )
+
+
+class TestFindToolPropertiesRefResolution:
+    """find_tool_properties resolves local refs before type coercion."""
+
+    PARAMS_WITH_DEFS: dict = {
+        "type": "object",
+        "$defs": {
+            "PeriodSpec": {
+                "type": "object",
+                "properties": {"kind": {"type": "string"}},
+                "required": ["kind"],
+            },
+        },
+        "properties": {
+            "period": {"$ref": "#/$defs/PeriodSpec"},
+            "name": {"type": "string"},
+        },
+        "required": ["period"],
+    }
+
+    def test_chat_ref_resolved_to_object_type(self):
+        props = find_tool_properties(
+            [_make_tool("sales", self.PARAMS_WITH_DEFS)], "sales"
+        )
+        assert props["period"]["type"] == "object"
+
+    def test_non_ref_property_unchanged(self):
+        props = find_tool_properties(
+            [_make_tool("sales", self.PARAMS_WITH_DEFS)], "sales"
+        )
+        assert props["name"] == {"type": "string"}
+
+    def test_extract_types_sees_resolved_type(self):
+        props = find_tool_properties(
+            [_make_tool("sales", self.PARAMS_WITH_DEFS)], "sales"
+        )
+        types = extract_types_from_schema(props["period"])
+        assert "object" in types
+        assert "string" not in types
+
+    def test_ref_inside_anyof_resolved(self):
+        params = {
+            "type": "object",
+            "$defs": {
+                "Foo": {
+                    "type": "object",
+                    "properties": {"x": {"type": "integer"}},
+                },
+            },
+            "properties": {
+                "bar": {
+                    "anyOf": [
+                        {"$ref": "#/$defs/Foo"},
+                        {"type": "null"},
+                    ]
+                },
+            },
+        }
+        props = find_tool_properties([_make_tool("fn", params)], "fn")
+        types = set(extract_types_from_schema(props["bar"]))
+        assert types == {"object", "null"}
+
+    def test_legacy_definitions_ref_resolved(self):
+        params = {
+            "type": "object",
+            "definitions": {"Count": {"type": "integer"}},
+            "properties": {"count": {"$ref": "#/definitions/Count"}},
+        }
+        props = find_tool_properties([_make_tool("fn", params)], "fn")
+        assert props["count"] == {"type": "integer"}
+
+    def test_escaped_json_pointer_definition_name_resolved(self):
+        params = {
+            "type": "object",
+            "$defs": {"Metric/Value~v1": {"type": "number"}},
+            "properties": {
+                "metric": {"$ref": "#/$defs/Metric~1Value~0v1"},
+            },
+        }
+        props = find_tool_properties([_make_tool("fn", params)], "fn")
+        assert props["metric"] == {"type": "number"}
+
+    def test_cyclic_ref_preserves_recursive_edge(self):
+        params = {
+            "type": "object",
+            "$defs": {"Node": {"$ref": "#/$defs/Node"}},
+            "properties": {"node": {"$ref": "#/$defs/Node"}},
+        }
+        props = find_tool_properties([_make_tool("fn", params)], "fn")
+        assert props["node"] == {"$ref": "#/$defs/Node"}
+
+    def test_ref_definition_wins_over_sibling_collision(self):
+        params = {
+            "type": "object",
+            "$defs": {"Payload": {"type": "object"}},
+            "properties": {
+                "payload": {
+                    "$ref": "#/$defs/Payload",
+                    "type": "string",
+                    "description": "Referenced payload.",
+                },
+            },
+        }
+        props = find_tool_properties([_make_tool("fn", params)], "fn")
+        assert props["payload"] == {
+            "type": "object",
+            "description": "Referenced payload.",
+        }
+
+    def test_ref_like_metadata_is_not_traversed(self):
+        params = {
+            "type": "object",
+            "$defs": {"Payload": {"type": "object"}},
+            "properties": {
+                "payload": {
+                    "type": "object",
+                    "default": {"$ref": "#/$defs/Payload"},
+                },
+            },
+        }
+        props = find_tool_properties([_make_tool("fn", params)], "fn")
+        assert props["payload"]["default"] == {"$ref": "#/$defs/Payload"}
+
+    def test_coercion_works_after_ref_resolution(self):
+        props = find_tool_properties(
+            [_make_tool("sales", self.PARAMS_WITH_DEFS)], "sales"
+        )
+        types = extract_types_from_schema(props["period"])
+        result = coerce_to_schema_type('{"kind": "week"}', types)
+        assert result == {"kind": "week"}
+        assert isinstance(result, dict)
+
+    def test_responses_function_ref_resolved_to_object_type(self):
+        tool = FunctionTool.model_validate(
+            {
+                "type": "function",
+                "name": "sales",
+                "parameters": self.PARAMS_WITH_DEFS,
+            }
+        )
+        props = find_tool_properties([tool], "sales")
+        assert props["period"]["type"] == "object"
+
+    def test_responses_namespace_ref_resolved_to_object_type(self):
+        tool = NamespaceTool.model_validate(
+            {
+                "type": "namespace",
+                "name": "reporting",
+                "description": "Reporting tools.",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "sales",
+                        "parameters": self.PARAMS_WITH_DEFS,
+                    }
+                ],
+            }
+        )
+        props = find_tool_properties([tool], "reporting__sales")
+        assert props["period"]["type"] == "object"
+
+    def test_required_schema_generation_preserves_defs_for_coercion(self):
+        tools = [_make_tool("sales", self.PARAMS_WITH_DEFS)]
+
+        schema = get_json_schema_from_tools("required", tools)
+
+        assert isinstance(schema, dict)
+        assert "$defs" in schema
+        assert "$defs" in tools[0].function.parameters
+
+        props = find_tool_properties(tools, "sales")
+        types = extract_types_from_schema(props["period"])
+        result = coerce_to_schema_type('{"kind": "week"}', types)
+        assert result == {"kind": "week"}
