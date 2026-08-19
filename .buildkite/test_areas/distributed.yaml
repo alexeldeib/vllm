@@ -242,6 +242,7 @@ steps:
   working_dir: "/vllm-workspace/"
   num_devices: 2
   commands:
+    - pytest -v -s tests/distributed/test_custom_all_reduce.py -k mnnvl_lamport
     - pytest -v -s tests/distributed/test_context_parallel.py
     - pytest -v -s tests/distributed/test_nccl_symm_mem.py
     - pytest -v -s tests/kernels/test_kimi_k3_gemm_rs.py
