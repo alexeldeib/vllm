@@ -46,7 +46,8 @@ class LruKeyReplicatedSenderCache(BaseMultiModalProcessorCache):
 
     @override
     def is_cached_item(self, mm_hash: str) -> bool:
-        return mm_hash in self._cache
+        item = self._cache.peek(mm_hash)
+        return item is not None and item.prompt_updates is not None
 
     @override
     def get_and_update_item(
@@ -55,14 +56,16 @@ class LruKeyReplicatedSenderCache(BaseMultiModalProcessorCache):
         mm_hash: str,
     ) -> MultiModalProcessorCacheOutItem:
         if (cached_item := self._cache.get(mm_hash)) is not None:
-            return None, cached_item.prompt_updates
+            if cached_item.prompt_updates is None and mm_item is not None:
+                cached_item.prompt_updates = mm_item[1]
+            return None, cached_item.prompt_updates or []
 
         assert mm_item is not None, f"Expected a cached item for {mm_hash=}"
 
         self.cache_if_fits(
             self._cache, mm_hash, MultiModalProcessorCacheItemMetadata(*mm_item)
         )
-        return mm_item
+        return mm_item[0], mm_item[1] or []
 
     @override
     def touch_sender_cache_item(self, mm_hash: str) -> None:

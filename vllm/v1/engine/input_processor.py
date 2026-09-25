@@ -278,8 +278,9 @@ class InputProcessor:
         accurately and avoids redundant processing on subsequent requests
         with the same images.
 
-        Uses ``get_and_update_item()`` with an empty prompt_updates list,
-        since token expansion has already been handled externally.
+        Uses ``get_and_update_item()`` with unknown prompt_updates (None),
+        since token expansion has already been handled externally. Raw-media
+        fallback must compute those updates before reusing this cache entry.
         """
         cache = self.renderer.mm_processor_cache
         if cache is None:
@@ -293,7 +294,7 @@ class InputProcessor:
                         # Use the returned item (may be an address for SHM
                         # cache or the original item for LRU cache).
                         items[i], _ = cache.get_and_update_item(
-                            (items[i], []),
+                            (items[i], None),
                             mm_hash,
                         )
             # Update cache stats to reflect the externally processed items

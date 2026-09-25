@@ -3,10 +3,13 @@
 import multiprocessing as mp
 from types import SimpleNamespace
 from unittest.mock import Mock
+from uuid import uuid4
 
 import numpy as np
 import pytest
 import torch
+from PIL import Image
+from transformers import BatchFeature
 
 from vllm.config import ModelConfig, ParallelConfig, VllmConfig
 from vllm.config.multimodal import MultiModalConfig
@@ -31,17 +34,24 @@ from vllm.multimodal.cache.base import (
 from vllm.multimodal.hasher import MultiModalHasher
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
+    MultiModalFieldConfig,
     MultiModalFieldElem,
     MultiModalKwargsItem,
     MultiModalKwargsItems,
     MultiModalSharedField,
     PlaceholderRange,
 )
-from vllm.multimodal.processing import PromptInsertion
+from vllm.multimodal.parse import ImageProcessorItems, MultiModalDataItems
+from vllm.multimodal.processing import (
+    BaseMultiModalProcessor,
+    PromptInsertion,
+    PromptReplacement,
+)
 from vllm.renderers import renderer_from_config
 from vllm.utils.async_utils import make_async
 from vllm.utils.mem_constants import GiB_bytes, MiB_bytes
 from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.llm_engine import LLMEngine
 
 from ..models.utils import build_model_context
@@ -915,3 +925,136 @@ def test_sleep_wake_preserves_mm_cache_consistency():
     llm.wake_up()
     output2 = llm.generate([prompt], sampling_params)
     assert output2[0].outputs[0].text
+
+
+_FORWARDED_IMAGE_FIELDS = {"pixel_values": MultiModalFieldConfig.batched("image")}
+
+
+class _ForwardedImageProcessor(BaseMultiModalProcessor):
+    """Stub only HF/model work; exercise vLLM's real cache and prompt pipeline."""
+
+    requires_tokenizer = False
+
+    def __init__(self):
+        self.processed_images = 0
+        info = SimpleNamespace(
+            model_id="test-model",
+            ctx=SimpleNamespace(
+                get_mm_config=lambda: SimpleNamespace(mm_hasher_algorithm="sha256")
+            ),
+            get_data_parser=lambda: None,
+            parse_mm_data=lambda data, **kwargs: MultiModalDataItems(
+                {
+                    modality: ImageProcessorItems(items)
+                    for modality, items in data.items()
+                }
+            ),
+            get_tokenizer=lambda: SimpleNamespace(
+                decode=lambda ids: "image", encode=lambda text, **kwargs: [9]
+            ),
+        )
+        super().__init__(info, None)
+
+    def _get_mm_fields_config(self, hf_inputs, hf_processor_mm_kwargs):
+        return _FORWARDED_IMAGE_FIELDS
+
+    def _get_prompt_updates(self, mm_items, hf_processor_mm_kwargs, out_mm_kwargs):
+        return [PromptReplacement("image", [9], [10, 10])]
+
+    def _apply_hf_processor_main(self, mm_items, hf_kwargs):
+        count = mm_items.get_all_counts().get("image", 0)
+        self.processed_images += count
+        return BatchFeature({"pixel_values": torch.zeros((count, 4))})
+
+
+@pytest.fixture(params=["processor", "sender", "shm"])
+def forwarded_cache(request, monkeypatch):
+    model_config = _StubModelConfig(mm_processor_cache_gb=0.001)
+    if request.param == "shm":
+        # Isolate each real SHM cache; short names also work on macOS.
+        monkeypatch.setenv("VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME", uuid4().hex[:16])
+        result = ShmObjectStoreSenderCache(
+            SimpleNamespace(
+                model_config=model_config,
+                parallel_config=SimpleNamespace(world_size=1),
+            )
+        )
+    else:
+        cls = (
+            MultiModalProcessorOnlyCache
+            if request.param == "processor"
+            else LruKeyReplicatedSenderCache
+        )
+        result = cls(model_config)
+    yield result
+    result.close()
+
+
+def _inject_forwarded_image(cache):
+    tensor_items = MultiModalKwargsItems.from_hf_inputs(
+        BatchFeature({"pixel_values": torch.zeros((1, 4))}), _FORWARDED_IMAGE_FIELDS
+    )
+    processor = SimpleNamespace(
+        renderer=SimpleNamespace(
+            mm_processor_cache=cache, update_mm_cache_stats=lambda: None
+        )
+    )
+    InputProcessor.inject_into_mm_cache(
+        processor, {"image": ["same-image"]}, tensor_items
+    )
+    return tensor_items["image"][0]
+
+
+def test_transfer_then_raw_fallback_then_uuid_only(forwarded_cache):
+    cache = forwarded_cache
+    # Successful transfer uses already expanded tokens; cache insertion lacks
+    # the prompt metadata needed by the next request's raw-media fallback.
+    first = _inject_forwarded_image(cache)
+    before = cache.make_stats()
+    second = _inject_forwarded_image(cache)
+    after = cache.make_stats()
+    assert after.hits == before.hits + 1
+    assert after.total == before.total + 1
+    if isinstance(cache, LruKeyReplicatedSenderCache):
+        assert first is not None and second is None
+    elif isinstance(cache, MultiModalProcessorOnlyCache):
+        assert second is first
+
+    processor = _ForwardedImageProcessor()
+    image = Image.new("RGB", (2, 2))
+    for data in ([image], [None]):
+        result = processor(
+            [1, 9, 2],
+            MultiModalDataItems({"image": ImageProcessorItems(data)}),
+            {"image": ["same-image"]},
+            cache=cache,
+        )
+        assert result["prompt_token_ids"] == [1, 10, 10, 2]
+        placeholder = result["mm_placeholders"]["image"][0]
+        assert (placeholder.offset, placeholder.length) == (1, 2)
+        assert result["mm_hashes"] == {"image": ["same-image"]}
+        assert processor.processed_images == 1
+
+    # Another transfer must retain the now-complete prompt metadata.
+    _inject_forwarded_image(cache)
+    assert cache.is_cached_item("same-image")
+
+
+def test_cache_probe_preserves_order_stats_and_known_empty_updates(forwarded_cache):
+    cache = forwarded_cache
+    _inject_forwarded_image(cache)
+    item = MultiModalKwargsItems.from_hf_inputs(
+        BatchFeature({"pixel_values": torch.zeros((1, 4))}), _FORWARDED_IMAGE_FIELDS
+    )["image"][0]
+    cache.get_and_update_item((item, []), "known-empty")
+    before = cache.make_stats()
+    if hasattr(cache, "_cache"):
+        order = list(cache._cache.order)
+    assert cache.is_cached(["same-image", "known-empty", "missing"]) == [
+        False,
+        True,
+        False,
+    ]
+    assert cache.make_stats() == before
+    if hasattr(cache, "_cache"):
+        assert list(cache._cache.order) == order

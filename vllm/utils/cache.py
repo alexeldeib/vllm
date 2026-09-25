@@ -120,6 +120,12 @@ class LRUCache(cachetools.LRUCache[_K, _V]):
         if key in self:
             self._LRUCache__order.move_to_end(key)  # type: ignore
 
+    def peek(self, key: _K) -> _V | None:
+        """Read a value without changing eviction order or cache statistics."""
+        if key in self:
+            return cachetools.Cache.__getitem__(self, key)
+        return None
+
     @overload
     def get(self, key: _K, /) -> _V | None: ...
 

@@ -67,7 +67,7 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
             serde_class=MsgpackSerde,
         )
         # cache prompt_updates for P0 only
-        self._p0_cache: dict[str, Sequence[ResolvedPromptUpdate]] = {}
+        self._p0_cache: dict[str, Sequence[ResolvedPromptUpdate] | None] = {}
 
         self._hits = 0
         self._total = 0
@@ -85,7 +85,9 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
 
     @override
     def is_cached_item(self, mm_hash: str) -> bool:
-        return self._shm_cache.is_cached(mm_hash)
+        return (
+            self._shm_cache.is_cached(mm_hash) and self._p0_cache[mm_hash] is not None
+        )
 
     @override
     def get_and_update_item(
@@ -99,7 +101,9 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
 
             address, monotonic_id = self._shm_cache.get_cached(mm_hash)
             prompt_updates = self._p0_cache[mm_hash]
-            return self.address_as_item(address, monotonic_id), prompt_updates
+            if prompt_updates is None and mm_item is not None:
+                prompt_updates = self._p0_cache[mm_hash] = mm_item[1]
+            return self.address_as_item(address, monotonic_id), prompt_updates or []
 
         assert mm_item is not None, f"Expected a cached item for {mm_hash=}"
         item, prompt_updates = mm_item
@@ -113,7 +117,7 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
                 self.remove_dangling_items()
 
             self._p0_cache[mm_hash] = prompt_updates
-            return self.address_as_item(address, monotonic_id), prompt_updates
+            return self.address_as_item(address, monotonic_id), prompt_updates or []
         except ValueError as e:
             # `put` raises ValueError either for an oversize item or for a
             # duplicate key (concurrent insert); the latter is benign so we
@@ -126,7 +130,7 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
                     mm_hash,
                     str(e),
                 )
-            return mm_item
+            return item, prompt_updates or []
         except MemoryError as e:
             # Cache full and protected items prevent eviction.
             logger.debug(
@@ -135,7 +139,7 @@ class ShmObjectStoreSenderCache(BaseMultiModalProcessorCache):
                 mm_hash,
                 str(e),
             )
-            return mm_item
+            return item, prompt_updates or []
 
     @override
     def touch_sender_cache_item(self, mm_hash: str) -> None:

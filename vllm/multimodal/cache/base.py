@@ -58,14 +58,15 @@ class MultiModalProcessorCacheItem:
 
     Args:
         item: The processed tensor data corresponding to a multi-modal item.
-        prompt_updates: The prompt updates corresponding to `item`.
+        prompt_updates: The prompt updates corresponding to `item`, or None
+            for externally processed tensors whose prompt updates are unknown.
 
     """
 
     def __init__(
         self,
         item: MultiModalKwargsItem,
-        prompt_updates: Sequence["ResolvedPromptUpdate"],
+        prompt_updates: Sequence["ResolvedPromptUpdate"] | None,
     ) -> None:
         super().__init__()
 
@@ -81,7 +82,8 @@ class MultiModalProcessorCacheItemMetadata:
             Since P1 already stores the tensor data, we only store its size
             metadata in P0 to reduce memory usage. The size metadata is still
             needed to keep the same cache eviction policy as P0.
-        prompt_updates: The prompt updates corresponding to `item`.
+        prompt_updates: The prompt updates corresponding to `item`, or None
+            for externally processed tensors whose prompt updates are unknown.
             This needs to stay on P0 because for some models, they are
             dependent on the processed tensor data (cached on P1).
 
@@ -90,7 +92,7 @@ class MultiModalProcessorCacheItemMetadata:
     def __init__(
         self,
         item: MultiModalKwargsItem,
-        prompt_updates: Sequence["ResolvedPromptUpdate"],
+        prompt_updates: Sequence["ResolvedPromptUpdate"] | None,
     ) -> None:
         super().__init__()
 
@@ -300,7 +302,7 @@ class BaseMultiModalCache(ABC, Generic[_I, _O]):
 
 
 MultiModalProcessorCacheInItem: TypeAlias = (
-    tuple[MultiModalKwargsItem, Sequence["ResolvedPromptUpdate"]] | None
+    tuple[MultiModalKwargsItem, Sequence["ResolvedPromptUpdate"] | None] | None
 )
 
 
@@ -317,7 +319,10 @@ class BaseMultiModalProcessorCache(
     @abstractmethod
     def is_cached_item(self, mm_hash: str) -> bool:
         """Check whether a multi-modal item is
-        in the underlying cache.
+        in the underlying cache with prompt-update metadata.
+
+        Externally processed tensors cannot satisfy raw preprocessing until
+        their prompt updates have been computed.
 
         This **DOES NOT** update the cache eviction order.
 
@@ -402,7 +407,8 @@ class MultiModalProcessorOnlyCache(BaseMultiModalProcessorCache):
 
     @override
     def is_cached_item(self, mm_hash: str) -> bool:
-        return mm_hash in self._cache
+        item = self._cache.peek(mm_hash)
+        return item is not None and item.prompt_updates is not None
 
     @override
     def get_and_update_item(
@@ -411,12 +417,14 @@ class MultiModalProcessorOnlyCache(BaseMultiModalProcessorCache):
         mm_hash: str,
     ) -> MultiModalProcessorCacheOutItem:
         if (cached_item := self._cache.get(mm_hash)) is not None:
-            return cached_item.item, cached_item.prompt_updates
+            if cached_item.prompt_updates is None and mm_item is not None:
+                cached_item.prompt_updates = mm_item[1]
+            return cached_item.item, cached_item.prompt_updates or []
 
         assert mm_item is not None, f"Expected a cached item for {mm_hash=}"
 
         self.cache_if_fits(self._cache, mm_hash, MultiModalProcessorCacheItem(*mm_item))
-        return mm_item
+        return mm_item[0], mm_item[1] or []
 
     @override
     def touch_sender_cache_item(self, mm_hash: str) -> None:
